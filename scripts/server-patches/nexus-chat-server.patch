@@ -2080,7 +2080,7 @@ index 0000000..d9b6b19
 +  )
 +}
 diff --git a/frontend/src/components/Sidebar.jsx b/frontend/src/components/Sidebar.jsx
-index 560b084..a772996 100644
+index 560b084..e196ab1 100644
 --- a/frontend/src/components/Sidebar.jsx
 +++ b/frontend/src/components/Sidebar.jsx
 @@ -3,7 +3,7 @@ import {
@@ -2088,7 +2088,7 @@ index 560b084..a772996 100644
    Wrench, Trash2, Paperclip, MessageSquarePlus,
    Database, Server, RefreshCw, ChevronDown, ChevronRight, Image,
 -  MessageCircle, BarChart3, Eye,
-+  MessageCircle, BarChart3, Eye, Shield,
++  MessageCircle, BarChart3, Eye, Shield, Plus,
  } from 'lucide-react'
  import NexusLogoIcon from './NexusLogoIcon'
  
@@ -2812,10 +2812,10 @@ index 2268fa1..27577c0 100644
  chromadb==0.5.5
 diff --git a/scripts/update-from-upstream.sh b/scripts/update-from-upstream.sh
 new file mode 100755
-index 0000000..d5dfeb3
+index 0000000..78dab7d
 --- /dev/null
 +++ b/scripts/update-from-upstream.sh
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,58 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -2836,6 +2836,19 @@ index 0000000..d5dfeb3
 +
 +echo "[INFO] Fetching upstream/main..."
 +git fetch upstream main
++
++# Warn if there are server-side commits not yet captured as a patch
++LAST_PATCH_COMMIT=$(git log --oneline --grep="Re-apply server patches" -1 | awk '{print $1}')
++if [ -n "$LAST_PATCH_COMMIT" ]; then
++    UNPATCHED=$(git log --oneline "$LAST_PATCH_COMMIT"..HEAD -- . ':!scripts/server-patches' | wc -l)
++else
++    UNPATCHED=$(git log --oneline 553e80c..HEAD -- . ':!scripts/server-patches' | wc -l)
++fi
++if [ "$UNPATCHED" -gt 0 ]; then
++    echo "[WARN] $UNPATCHED server-side commit(s) since the last patch re-apply are not in $PATCH_DIR/nexus-chat-server.patch."
++    echo "       Consider regenerating the patch before merging:"
++    echo "       git diff 553e80c..HEAD -- . ':!scripts/server-patches' > $PATCH_DIR/nexus-chat-server.patch"
++fi
 +
 +echo "[INFO] Merging upstream/main into current branch (preferring upstream changes)..."
 +if ! git merge -X theirs upstream/main --no-edit; then
@@ -2858,4 +2871,6 @@ index 0000000..d5dfeb3
 +git diff --cached --quiet || git commit -m "Re-apply server patches after upstream merge" || true
 +
 +echo "[SUCCESS] Upstream updates merged and server patches applied."
++echo "          If new server-only changes were made since the last update, regenerate the patch:"
++echo "          git diff 553e80c..HEAD -- . ':!scripts/server-patches' > $PATCH_DIR/nexus-chat-server.patch"
 +echo "          Run 'docker compose build' and 'docker compose up -d' to deploy."
