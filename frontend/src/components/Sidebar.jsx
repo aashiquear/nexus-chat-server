@@ -3,7 +3,7 @@ import {
   Check, Calculator, Search, Code2, Clock, FileText,
   Wrench, Trash2, Paperclip, MessageSquarePlus,
   Database, Server, RefreshCw, ChevronDown, ChevronRight, Image,
-  MessageCircle, BarChart3, Eye, Shield,
+  MessageCircle, BarChart3, Eye, Shield, Plus,
 } from 'lucide-react'
 import NexusLogoIcon from './NexusLogoIcon'
 
