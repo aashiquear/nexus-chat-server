@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react'
-import { X, KeyRound, Trash2, AlertTriangle } from 'lucide-react'
+import { X, KeyRound, Trash2, AlertTriangle, LogOut } from 'lucide-react'
 
 export default function AccountPopup({ user, onClose, onLogout }) {
   const [tab, setTab] = useState('info')
@@ -100,7 +100,7 @@ export default function AccountPopup({ user, onClose, onLogout }) {
         top: 52,
         right: 12,
         width: 320,
-        background: 'var(--surface)',
+        background: 'var(--bg-panel)',
         border: '1px solid var(--border)',
         borderRadius: 12,
         boxShadow: '0 8px 24px rgba(0,0,0,0.12)',
@@ -146,9 +146,17 @@ export default function AccountPopup({ user, onClose, onLogout }) {
           <div style={{ fontSize: 14, marginBottom: 4 }}>
             <strong>Username:</strong> {user.username}
           </div>
-          <div style={{ fontSize: 14, color: 'var(--text-secondary)' }}>
+          <div style={{ fontSize: 14, color: 'var(--text-secondary)', marginBottom: 12 }}>
             <strong>Role:</strong> {user.is_admin ? 'Administrator' : 'User'}
           </div>
+          <button
+            className="splash-start-btn"
+            style={{ width: '100%', fontSize: 13 }}
+            onClick={onLogout}
+          >
+            <LogOut size={14} />
+            Log Out
+          </button>
         </div>
       )}
 

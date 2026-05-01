@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react'
-import { X, Plus, Trash2, Shield, Users } from 'lucide-react'
+import { X, Plus, Trash2, Shield, Users, LogOut } from 'lucide-react'
 
-export default function AdminPanel({ onClose }) {
+export default function AdminPanel({ onClose, onLogout }) {
   const [users, setUsers] = useState([])
   const [newUsername, setNewUsername] = useState('')
   const [newPassword, setNewPassword] = useState('')
@@ -79,9 +79,19 @@ export default function AdminPanel({ onClose }) {
           <Users size={16} />
           Admin Panel
         </h3>
-        <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
-          <X size={16} />
-        </button>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button
+            className="splash-start-btn"
+            style={{ fontSize: 12, padding: '4px 8px' }}
+            onClick={onLogout}
+          >
+            <LogOut size={12} />
+            Log Out
+          </button>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
+            <X size={16} />
+          </button>
+        </div>
       </div>
 
       <form onSubmit={handleCreate} style={{ marginBottom: 16 }}>

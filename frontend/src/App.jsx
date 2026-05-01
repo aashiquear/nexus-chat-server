@@ -5,6 +5,7 @@ import ChatMessage, { TypingIndicator } from './components/ChatMessage'
 import ChatInput from './components/ChatInput'
 import CanvasPanel from './components/CanvasPanel'
 import SignInScreen from './components/SignInScreen'
+import SplashScreen from './components/SplashScreen'
 import AccountPopup from './components/AccountPopup'
 import AdminPanel from './components/AdminPanel'
 import { useChat } from './hooks/useChat'
@@ -22,6 +23,7 @@ export default function App() {
   const [authChecked, setAuthChecked] = useState(false)
   const [showAccount, setShowAccount] = useState(false)
   const [showAdmin, setShowAdmin] = useState(false)
+  const [showSplash, setShowSplash] = useState(false)
 
   // State
   const [models, setModels] = useState([])
@@ -68,6 +70,7 @@ export default function App() {
           const me = await fetchAuthMe()
           if (me) {
             setUser(me)
+            setShowSplash(true)
             connect()
             loadData()
           } else {
@@ -597,6 +600,10 @@ export default function App() {
     return <SignInScreen onSignIn={(u) => { setUser(u); connect(); loadData(); }} />
   }
 
+  if (showSplash) {
+    return <SplashScreen user={user} onStart={() => setShowSplash(false)} />
+  }
+
   return (
     <div className="app-layout">
       <Sidebar
@@ -673,7 +680,7 @@ export default function App() {
               top: 52,
               left: 12,
               width: 360,
-              background: 'var(--surface)',
+              background: 'var(--bg-panel)',
               border: '1px solid var(--border)',
               borderRadius: 12,
               boxShadow: '0 8px 24px rgba(0,0,0,0.12)',
@@ -681,7 +688,7 @@ export default function App() {
               padding: 16,
             }}
           >
-            <AdminPanel onClose={() => setShowAdmin(false)} />
+            <AdminPanel onClose={() => setShowAdmin(false)} onLogout={handleLogout} />
           </div>
         )}
 
