@@ -1,7 +1,7 @@
 """
 Conversation persistence — stores chat threads as JSON files locally.
 
-Each conversation is a JSON file in data/conversations/:
+Each conversation is a JSON file in data/conversations/{username}/:
   {
     "id": "abc123",
     "title": "First user message (truncated)",
@@ -21,8 +21,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-CONVERSATIONS_DIR = Path("./data/conversations")
-CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
+CONVERSATIONS_ROOT = Path("./data/conversations")
 
 # Common English stopwords filtered out when summarising the first user
 # prompt down to a 3-word sidebar title. Kept short on purpose — we want
@@ -38,8 +37,14 @@ _TITLE_STOPWORDS = {
 }
 
 
-def _path(conversation_id: str) -> Path:
-    return CONVERSATIONS_DIR / f"{conversation_id}.json"
+def _user_dir(username: str) -> Path:
+    d = CONVERSATIONS_ROOT / username
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _path(conversation_id: str, username: str) -> Path:
+    return _user_dir(username) / f"{conversation_id}.json"
 
 
 def _derive_title(messages: list[dict]) -> str:
@@ -72,10 +77,11 @@ def _derive_title(messages: list[dict]) -> str:
     return "New conversation"
 
 
-def list_conversations() -> list[dict]:
-    """Return all conversations sorted by updated_at descending."""
+def list_conversations(username: str) -> list[dict]:
+    """Return all conversations for a user sorted by updated_at descending."""
+    user_dir = _user_dir(username)
     convos = []
-    for f in CONVERSATIONS_DIR.glob("*.json"):
+    for f in user_dir.glob("*.json"):
         try:
             data = json.loads(f.read_text())
             convos.append({
@@ -92,9 +98,9 @@ def list_conversations() -> list[dict]:
     return convos
 
 
-def get_conversation(conversation_id: str) -> dict | None:
-    """Load a full conversation by ID."""
-    path = _path(conversation_id)
+def get_conversation(conversation_id: str, username: str) -> dict | None:
+    """Load a full conversation by ID for a user."""
+    path = _path(conversation_id, username)
     if not path.exists():
         return None
     try:
@@ -109,12 +115,13 @@ def save_conversation(
     messages: list[dict],
     model: str = "",
     token_usage: list[dict] | None = None,
+    username: str = "",
 ) -> dict:
-    """Create or update a conversation. Returns the saved metadata."""
+    """Create or update a conversation for a user. Returns the saved metadata."""
     now = datetime.now(timezone.utc).isoformat()
 
     if conversation_id:
-        existing = get_conversation(conversation_id)
+        existing = get_conversation(conversation_id, username)
     else:
         existing = None
 
@@ -139,7 +146,7 @@ def save_conversation(
         if token_usage is not None:
             data["token_usage"] = token_usage
 
-    path = _path(data["id"])
+    path = _path(data["id"], username)
     path.write_text(json.dumps(data, indent=2))
 
     return {
@@ -152,9 +159,9 @@ def save_conversation(
     }
 
 
-def delete_conversation(conversation_id: str) -> bool:
-    """Delete a conversation file. Returns True if deleted."""
-    path = _path(conversation_id)
+def delete_conversation(conversation_id: str, username: str) -> bool:
+    """Delete a conversation file for a user. Returns True if deleted."""
+    path = _path(conversation_id, username)
     if path.exists():
         path.unlink()
         return True

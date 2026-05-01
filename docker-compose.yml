@@ -9,18 +9,21 @@ networks:
 services:
   nexus-chat:
     build: .
-    container_name: nexus-chat
+    container_name: nexus-chat-server
     networks:
       - nexus-net
     ports:
       - "8000:8000"
-    env_file:
-      - .env
+    environment:
+      - NEXUS_ADMIN_PASSWORD=${NEXUS_ADMIN_PASSWORD:?err}
+      - NEXUS_JWT_SECRET=${NEXUS_JWT_SECRET:-change-me-in-production}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_API_KEY=${OLLAMA_API_KEY:-}
     volumes:
       # Mount config for easy editing without rebuild
       - ./config:/app/config:ro
-      # Persist uploaded files and vector store
-      - ./data:/app/data
+      # Persist data (conversations, uploads, vector store)
+      - nexus-data:/app/data
     extra_hosts:
       # Allow container to reach Ollama on the host machine
       - "host.docker.internal:host-gateway"
@@ -53,4 +56,5 @@ services:
       retries: 3
 
 volumes:
+  nexus-data:
   mcp-db-data:

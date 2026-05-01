@@ -9,7 +9,9 @@ export function useChat() {
     if (wsRef.current?.readyState === WebSocket.OPEN) return
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/chat`)
+    const token = localStorage.getItem('nexus_token') || ''
+    const wsUrl = `${protocol}//${window.location.host}/ws/chat?token=${encodeURIComponent(token)}`
+    const ws = new WebSocket(wsUrl)
 
     ws.onopen = () => setIsConnected(true)
     ws.onclose = () => {

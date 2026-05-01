@@ -1,0 +1,14 @@
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -29,9 +29,7 @@
+ from backend.config import load_config, get_config
+ from backend.orchestrator import ChatOrchestrator
+ from backend import conversations
+
+-# Import providers and tools to trigger registration
+-import backend.providers.anthropic_provider
+-import backend.providers.openai_provider
++# Import providers and tools to trigger registration (server: ollama only)
+ import backend.providers.ollama_provider
+ import backend.tools.builtin
+ import backend.tools.example_tool

@@ -1,0 +1,23 @@
+# ============================================================
+# Nexus Chat Server — Config Override
+# This file is deep-merged over config/settings.yaml.
+# It survives upstream updates and overrides only the keys it sets.
+# ============================================================
+
+app:
+  name: "Nexus Chat Server"
+
+auth:
+  jwt_secret: "${NEXUS_JWT_SECRET:-change-me-in-production}"
+  token_expire_days: 7
+
+providers:
+  anthropic:
+    enabled: false
+  openai:
+    enabled: false
+  ollama:
+    enabled: true
+    base_url: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
+    api_key: ""
+    models: []   # empty = dynamic discovery from /api/tags only

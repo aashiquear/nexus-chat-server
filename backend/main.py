@@ -12,7 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import uuid
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request, BackgroundTasks, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -26,10 +26,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from backend.config import load_config, get_config
 from backend.orchestrator import ChatOrchestrator
 from backend import conversations
+import backend.auth as auth
 
-# Import providers and tools to trigger registration
-import backend.providers.anthropic_provider
-import backend.providers.openai_provider
+# Import providers and tools to trigger registration (server: ollama only)
 import backend.providers.ollama_provider
 import backend.tools.builtin
 import backend.tools.example_tool
@@ -72,7 +71,8 @@ upload_dir.mkdir(parents=True, exist_ok=True)
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize MCP connections and sync uploaded files into the vector store."""
+    """Initialize auth, MCP connections and sync uploaded files into the vector store."""
+    await auth.init_admin_user()
     await orchestrator.init_mcp()
     # Re-ingest any uploaded files missing from the vector store (e.g. after restart)
     if orchestrator.rag_engine:
@@ -84,6 +84,77 @@ async def startup_event():
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "name": app_config.get("name")}
+
+
+# ------ Auth Endpoints ------
+
+@app.post("/api/auth/login")
+async def login(request: Request):
+    body = await request.json()
+    username = body.get("username", "").strip()
+    password = body.get("password", "")
+    users = auth._load_users()
+    user = users.get(username)
+    if not user or not auth.verify_password(password, user["password_hash"]):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    token = auth.create_access_token(username)
+    return {
+        "token": token,
+        "user": {
+            "username": user["username"],
+            "is_admin": user.get("is_admin", False),
+        },
+    }
+
+
+@app.get("/api/auth/me")
+async def me(current_user: dict = Depends(auth.get_current_user)):
+    return {
+        "username": current_user["username"],
+        "is_admin": current_user.get("is_admin", False),
+    }
+
+
+@app.post("/api/auth/change-password")
+async def change_password(request: Request, current_user: dict = Depends(auth.get_current_user)):
+    body = await request.json()
+    current_password = body.get("current_password", "")
+    new_password = body.get("new_password", "")
+    if not new_password or len(new_password) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    await auth.change_password(current_user["username"], current_password, new_password)
+    return {"status": "ok"}
+
+
+@app.delete("/api/auth/account")
+async def delete_account(request: Request, current_user: dict = Depends(auth.get_current_user)):
+    body = await request.json()
+    password = body.get("password", "")
+    await auth.delete_user_account(current_user["username"], password)
+    return {"deleted": current_user["username"]}
+
+
+# ------ Admin Endpoints ------
+
+@app.get("/api/admin/users")
+async def admin_list_users(_admin: dict = Depends(auth.get_current_admin_user)):
+    return {"users": await auth.list_users()}
+
+
+@app.post("/api/admin/users")
+async def admin_create_user(request: Request, _admin: dict = Depends(auth.get_current_admin_user)):
+    body = await request.json()
+    username = body.get("username", "").strip()
+    password = body.get("password", "")
+    is_admin = bool(body.get("is_admin", False))
+    result = await auth.create_user(username, password, is_admin)
+    return result
+
+
+@app.delete("/api/admin/users/{username}")
+async def admin_delete_user(username: str, _admin: dict = Depends(auth.get_current_admin_user)):
+    await auth.delete_user(username)
+    return {"deleted": username}
 
 
 @app.get("/api/models")
@@ -108,7 +179,7 @@ UPLOAD_STREAM_CHUNK = 1024 * 1024  # 1 MiB per read — bounded memory
 
 
 @app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...), current_user: dict = Depends(auth.get_current_user)):
     """Upload a file for RAG and tool use.
 
     The request body is streamed to disk in 1 MiB chunks so multi-GB
@@ -193,7 +264,7 @@ async def upload_progress(filename: str):
 
 
 @app.get("/api/files")
-async def list_files():
+async def list_files(current_user: dict = Depends(auth.get_current_user)):
     """List uploaded files and resync any new files into the RAG vector store."""
     # Re-ingest any files placed directly in the uploads directory (not via upload API)
     if orchestrator.rag_engine:
@@ -211,7 +282,7 @@ async def list_files():
 
 
 @app.delete("/api/files/{filename}")
-async def delete_file(filename: str):
+async def delete_file(filename: str, current_user: dict = Depends(auth.get_current_user)):
     """Delete an uploaded file."""
     filepath = upload_dir / filename
     if not filepath.exists():
@@ -296,37 +367,38 @@ from starlette.requests import Request as StarletteRequest
 
 
 @app.get("/api/conversations")
-async def list_conversations_endpoint():
-    """List all saved conversations."""
-    return {"conversations": conversations.list_conversations()}
+async def list_conversations_endpoint(current_user: dict = Depends(auth.get_current_user)):
+    """List all saved conversations for the current user."""
+    return {"conversations": conversations.list_conversations(current_user["username"])}
 
 
 @app.get("/api/conversations/{conversation_id}")
-async def get_conversation_endpoint(conversation_id: str):
-    """Load a specific conversation."""
-    data = conversations.get_conversation(conversation_id)
+async def get_conversation_endpoint(conversation_id: str, current_user: dict = Depends(auth.get_current_user)):
+    """Load a specific conversation for the current user."""
+    data = conversations.get_conversation(conversation_id, current_user["username"])
     if not data:
         raise HTTPException(404, "Conversation not found")
     return data
 
 
 @app.post("/api/conversations")
-async def save_conversation_post(request: StarletteRequest):
-    """Create or update a conversation."""
+async def save_conversation_post(request: StarletteRequest, current_user: dict = Depends(auth.get_current_user)):
+    """Create or update a conversation for the current user."""
     body = await request.json()
     result = conversations.save_conversation(
         conversation_id=body.get("id"),
         messages=body.get("messages", []),
         model=body.get("model", ""),
         token_usage=body.get("token_usage"),
+        username=current_user["username"],
     )
     return result
 
 
 @app.delete("/api/conversations/{conversation_id}")
-async def delete_conversation_endpoint(conversation_id: str):
-    """Delete a conversation."""
-    ok = conversations.delete_conversation(conversation_id)
+async def delete_conversation_endpoint(conversation_id: str, current_user: dict = Depends(auth.get_current_user)):
+    """Delete a conversation for the current user."""
+    ok = conversations.delete_conversation(conversation_id, current_user["username"])
     if not ok:
         raise HTTPException(404, "Conversation not found")
     return {"deleted": conversation_id}
@@ -336,7 +408,14 @@ async def delete_conversation_endpoint(conversation_id: str):
 
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
-    """WebSocket endpoint for streaming chat."""
+    """WebSocket endpoint for streaming chat. Authenticates via ?token=..."""
+    token = websocket.query_params.get("token")
+    try:
+        user = auth.get_ws_user(token)
+    except Exception as e:
+        await websocket.close(code=1008, reason=str(e))
+        return
+
     await websocket.accept()
 
     try:

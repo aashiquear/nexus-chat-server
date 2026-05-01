@@ -3,7 +3,7 @@ import {
   Check, Calculator, Search, Code2, Clock, FileText,
   Wrench, Trash2, Paperclip, MessageSquarePlus,
   Database, Server, RefreshCw, ChevronDown, ChevronRight, Image,
-  MessageCircle, BarChart3, Eye,
+  MessageCircle, BarChart3, Eye, Shield,
 } from 'lucide-react'
 import NexusLogoIcon from './NexusLogoIcon'
 
@@ -122,6 +122,8 @@ export default function Sidebar({
   onNewChat,
   isOpen,
   onClose,
+  user,
+  onOpenAdmin,
 }) {
   const fileInputRef = React.useRef(null)
 
@@ -244,6 +246,19 @@ export default function Sidebar({
             ))}
           </select>
         </div>
+
+        {user?.is_admin && (
+          <div style={{ padding: '8px 16px', borderTop: '1px solid var(--border-subtle)' }}>
+            <button
+              className="new-chat-btn"
+              style={{ width: '100%', margin: 0, fontSize: 13 }}
+              onClick={onOpenAdmin}
+            >
+              <Shield size={14} />
+              Admin Panel
+            </button>
+          </div>
+        )}
 
         <div className="sidebar-body">
           {/* Built-in Tools */}

@@ -50,10 +50,7 @@ class OllamaProvider(BaseLLMProvider):
             return False
 
     def list_models(self) -> list[dict]:
-        """Return configured models (or query Ollama for installed models)."""
-        configured = self.config.get("models", [])
-        if configured:
-            return configured
+        """Query Ollama for installed models dynamically. Always live."""
         try:
             with httpx.Client(timeout=5) as client:
                 resp = client.get(f"{self.base_url}/api/tags", headers=self._headers)
