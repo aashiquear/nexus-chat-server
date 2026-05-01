@@ -121,9 +121,8 @@ class ChatOrchestrator:
     async def init_mcp(self):
         """Initialize MCP server connections (must be awaited)."""
         mcp_config = get_enabled_mcp_servers()
-        if mcp_config:
-            await self._mcp.init_from_config(mcp_config)
-            logger.info("MCP manager initialized with %d server(s)", len(mcp_config))
+        await self._mcp.init_from_config(mcp_config)
+        logger.info("MCP manager initialized")
 
     def get_available_tools(self) -> list[dict]:
         """Return all available tools (built-in + MCP)."""
@@ -149,6 +148,14 @@ class ChatOrchestrator:
     async def reconnect_mcp(self, server_id: str) -> bool:
         """Reconnect a specific MCP server."""
         return await self._mcp.reconnect(server_id)
+
+    async def add_mcp_server(self, server_id: str, cfg: dict) -> dict | None:
+        """Add and connect a new MCP server."""
+        return await self._mcp.add_server(server_id, cfg)
+
+    def remove_mcp_server(self, server_id: str) -> bool:
+        """Remove an MCP server."""
+        return self._mcp.remove_server(server_id)
 
     def _resolve_provider(self, model_id: str) -> tuple[str, BaseLLMProvider] | None:
         """Find which provider hosts the given model."""

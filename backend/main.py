@@ -37,6 +37,7 @@ import backend.tools.graph_plotter
 import backend.tools.image_analyzer
 import backend.tools.image_synthesizer
 import backend.mcp  # noqa: F401 – MCP client module
+from backend.mcp.client import _load_user_mcp_servers, _save_user_mcp_servers
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -359,6 +360,71 @@ async def reconnect_mcp_server(server_id: str):
     if not ok:
         raise HTTPException(404, f"MCP server '{server_id}' not found or unreachable")
     return {"status": "connected", "server": server_id}
+
+
+@app.post("/api/mcp/servers/discover")
+async def discover_mcp_server(payload: dict):
+    """Probe an MCP server URL without persisting it."""
+    url = payload.get("url", "").strip().rstrip("/")
+    if not url:
+        raise HTTPException(400, "URL is required")
+    from backend.mcp.client import MCPClient
+    temp_id = "discover_" + url.replace("://", "_").replace("/", "_").replace(":", "_")
+    client = MCPClient(temp_id, {"url": url, "timeout": payload.get("timeout", 30)})
+    connected = await client.connect()
+    if not connected:
+        raise HTTPException(502, f"Could not connect to MCP server at {url}")
+    tools = client.tools
+    return {
+        "server": {
+            "id": temp_id,
+            "name": client.name,
+            "description": client.description,
+            "url": client.url,
+            "icon": client.icon,
+            "connected": True,
+            "tools": [t["name"] for t in tools],
+        },
+        "tools": tools,
+    }
+
+
+@app.post("/api/mcp/servers")
+async def add_mcp_server(payload: dict):
+    """Add a new MCP server by URL and persist it."""
+    url = payload.get("url", "").strip().rstrip("/")
+    if not url:
+        raise HTTPException(400, "URL is required")
+    # Generate a stable server_id from the URL
+    server_id = payload.get("id") or url.replace("://", "_").replace("/", "_").replace(":", "_")
+    cfg = {
+        "url": url,
+        "name": payload.get("name", server_id),
+        "description": payload.get("description", ""),
+        "icon": payload.get("icon", "server"),
+        "timeout": payload.get("timeout", 30),
+        "enabled": True,
+    }
+    info = await orchestrator.add_mcp_server(server_id, cfg)
+    if not info:
+        raise HTTPException(502, f"Could not connect to MCP server at {url}")
+    # Persist
+    user_servers = _load_user_mcp_servers()
+    user_servers[server_id] = cfg
+    _save_user_mcp_servers(user_servers)
+    return {"status": "added", "server": info}
+
+
+@app.delete("/api/mcp/servers/{server_id}")
+async def remove_mcp_server(server_id: str):
+    """Remove a persisted MCP server."""
+    ok = orchestrator.remove_mcp_server(server_id)
+    if not ok:
+        raise HTTPException(404, f"MCP server '{server_id}' not found")
+    user_servers = _load_user_mcp_servers()
+    user_servers.pop(server_id, None)
+    _save_user_mcp_servers(user_servers)
+    return {"status": "removed", "server": server_id}
 
 
 # ------ Conversation Endpoints ------

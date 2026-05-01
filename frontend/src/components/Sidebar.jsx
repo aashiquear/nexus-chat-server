@@ -109,6 +109,8 @@ export default function Sidebar({
   onToggleTool,
   mcpServers,
   onReconnectMCP,
+  onAddMCP,
+  onRemoveMCP,
   files,
   selectedFiles,
   onToggleFile,
@@ -291,103 +293,128 @@ export default function Sidebar({
           </AccordionSection>
 
           {/* MCP Servers */}
-          {mcpServers && mcpServers.length > 0 && (
-            <AccordionSection
-              label="MCP Servers"
-              count={mcpToolCount}
-              isOpen={openSection === 'mcp'}
-              onToggle={() => toggleSection('mcp')}
-            >
-              {mcpServers.map((srv) => {
-                const mcpTools = tools.filter(
-                  (t) => t.source === 'mcp' && t.server === srv.id
-                )
-                const allSelected = mcpTools.length > 0 && mcpTools.every((t) => selectedTools.includes(t.id))
-                const someSelected = mcpTools.some((t) => selectedTools.includes(t.id))
-                return (
-                  <div key={srv.id} style={{ marginBottom: 4 }}>
+          <AccordionSection
+            label="MCP Servers"
+            count={mcpToolCount}
+            isOpen={openSection === 'mcp'}
+            onToggle={() => toggleSection('mcp')}
+          >
+            <div style={{ padding: '4px 16px', marginBottom: 4 }}>
+              <button
+                className="thread-item"
+                style={{ width: '100%', justifyContent: 'center', fontSize: 12 }}
+                onClick={onAddMCP}
+                title="Add MCP server"
+              >
+                <Plus size={13} style={{ marginRight: 4 }} />
+                Add Server
+              </button>
+            </div>
+            {mcpServers.map((srv) => {
+              const mcpTools = tools.filter(
+                (t) => t.source === 'mcp' && t.server === srv.id
+              )
+              const allSelected = mcpTools.length > 0 && mcpTools.every((t) => selectedTools.includes(t.id))
+              const someSelected = mcpTools.some((t) => selectedTools.includes(t.id))
+              return (
+                <div key={srv.id} style={{ marginBottom: 4 }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      padding: '4px 16px',
+                      fontSize: 12,
+                    }}
+                  >
                     <div
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 6,
-                        padding: '4px 16px',
-                        fontSize: 12,
+                      className={`toggle-check ${allSelected ? 'active' : ''} ${someSelected && !allSelected ? 'partial' : ''}`}
+                      style={{ cursor: 'pointer' }}
+                      onClick={() => {
+                        const toolIds = mcpTools.map((t) => t.id)
+                        if (allSelected) {
+                          // Deselect all tools from this server
+                          toolIds.forEach((id) => onToggleTool(id))
+                        } else {
+                          // Select all tools from this server
+                          toolIds.forEach((id) => {
+                            if (!selectedTools.includes(id)) onToggleTool(id)
+                          })
+                        }
                       }}
+                      title={allSelected ? 'Deselect all' : 'Select all'}
                     >
-                      <div
-                        className={`toggle-check ${allSelected ? 'active' : ''} ${someSelected && !allSelected ? 'partial' : ''}`}
-                        style={{ cursor: 'pointer' }}
-                        onClick={() => {
-                          const toolIds = mcpTools.map((t) => t.id)
-                          if (allSelected) {
-                            // Deselect all tools from this server
-                            toolIds.forEach((id) => onToggleTool(id))
-                          } else {
-                            // Select all tools from this server
-                            toolIds.forEach((id) => {
-                              if (!selectedTools.includes(id)) onToggleTool(id)
-                            })
-                          }
-                        }}
-                        title={allSelected ? 'Deselect all' : 'Select all'}
-                      >
-                        {allSelected && <Check size={11} color="#fff" strokeWidth={3} />}
-                        {someSelected && !allSelected && <span style={{ color: '#fff', fontSize: 10, fontWeight: 700 }}>–</span>}
-                      </div>
-                      <Server size={13} style={{ opacity: 0.6 }} />
-                      <span style={{ fontWeight: 500, flex: 1 }}>{srv.name}</span>
-                      <span
-                        style={{
-                          width: 7,
-                          height: 7,
-                          borderRadius: '50%',
-                          background: srv.connected ? 'var(--success)' : 'var(--error)',
-                          display: 'inline-block',
-                        }}
-                        title={srv.connected ? 'Connected' : 'Disconnected'}
-                      />
-                      {!srv.connected && (
-                        <button
-                          style={{
-                            background: 'none',
-                            border: 'none',
-                            cursor: 'pointer',
-                            color: 'var(--text-tertiary)',
-                            padding: 2,
-                          }}
-                          onClick={() => onReconnectMCP(srv.id)}
-                          title="Reconnect"
-                        >
-                          <RefreshCw size={12} />
-                        </button>
-                      )}
+                      {allSelected && <Check size={11} color="#fff" strokeWidth={3} />}
+                      {someSelected && !allSelected && <span style={{ color: '#fff', fontSize: 10, fontWeight: 700 }}>–</span>}
                     </div>
-                    {mcpTools.map((tool) => {
-                      const active = selectedTools.includes(tool.id)
-                      const Icon = ICON_MAP[tool.icon] || Database
-                      return (
-                        <div
-                          key={tool.id}
-                          className="toggle-item"
-                          onClick={() => onToggleTool(tool.id)}
-                        >
-                          <div className={`toggle-check ${active ? 'active' : ''}`}>
-                            {active && <Check size={11} color="#fff" strokeWidth={3} />}
-                          </div>
-                          <Icon size={15} className="toggle-icon" />
-                          <div className="toggle-text">
-                            <div className="toggle-label">{tool.name}</div>
-                            <ToolDescription text={tool.description} />
-                          </div>
-                        </div>
-                      )
-                    })}
+                    <Server size={13} style={{ opacity: 0.6 }} />
+                    <span style={{ fontWeight: 500, flex: 1 }}>{srv.name}</span>
+                    <span
+                      style={{
+                        width: 7,
+                        height: 7,
+                        borderRadius: '50%',
+                        background: srv.connected ? 'var(--success)' : 'var(--error)',
+                        display: 'inline-block',
+                      }}
+                      title={srv.connected ? 'Connected' : 'Disconnected'}
+                    />
+                    {!srv.connected && (
+                      <button
+                        style={{
+                          background: 'none',
+                          border: 'none',
+                          cursor: 'pointer',
+                          color: 'var(--text-tertiary)',
+                          padding: 2,
+                        }}
+                        onClick={() => onReconnectMCP(srv.id)}
+                        title="Reconnect"
+                      >
+                        <RefreshCw size={12} />
+                      </button>
+                    )}
+                    <button
+                      style={{
+                        background: 'none',
+                        border: 'none',
+                        cursor: 'pointer',
+                        color: 'var(--error)',
+                        padding: 2,
+                      }}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onRemoveMCP(srv.id)
+                      }}
+                      title="Remove server"
+                    >
+                      <Trash2 size={12} />
+                    </button>
                   </div>
-                )
-              })}
-            </AccordionSection>
-          )}
+                  {mcpTools.map((tool) => {
+                    const active = selectedTools.includes(tool.id)
+                    const Icon = ICON_MAP[tool.icon] || Database
+                    return (
+                      <div
+                        key={tool.id}
+                        className="toggle-item"
+                        onClick={() => onToggleTool(tool.id)}
+                      >
+                        <div className={`toggle-check ${active ? 'active' : ''}`}>
+                          {active && <Check size={11} color="#fff" strokeWidth={3} />}
+                        </div>
+                        <Icon size={15} className="toggle-icon" />
+                        <div className="toggle-text">
+                          <div className="toggle-label">{tool.name}</div>
+                          <ToolDescription text={tool.description} />
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )
+            })}
+          </AccordionSection>
 
           {/* Files */}
           <AccordionSection

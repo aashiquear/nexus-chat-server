@@ -108,6 +108,43 @@ export async function reconnectMCPServer(serverId) {
   return res.json()
 }
 
+export async function discoverMCPServer(url, timeout = 30) {
+  const res = await authFetch(`${BASE}/api/mcp/servers/discover`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, timeout }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || `Discovery failed: ${res.status}`)
+  }
+  return res.json()
+}
+
+export async function addMCPServer(cfg) {
+  const res = await authFetch(`${BASE}/api/mcp/servers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(cfg),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || `Failed to add server: ${res.status}`)
+  }
+  return res.json()
+}
+
+export async function removeMCPServer(serverId) {
+  const res = await authFetch(`${BASE}/api/mcp/servers/${encodeURIComponent(serverId)}`, {
+    method: 'DELETE',
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || `Failed to remove server: ${res.status}`)
+  }
+  return res.json()
+}
+
 // ---- Auth ----
 
 export async function fetchAuthMe() {

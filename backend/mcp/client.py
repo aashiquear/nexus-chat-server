@@ -13,11 +13,33 @@ MCPClient wraps a single server; MCPManager owns all configured servers.
 import json
 import logging
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+USER_MCP_SERVERS_PATH = Path("./data/user_mcp_servers.json")
+
+
+def _load_user_mcp_servers() -> dict:
+    """Load user-added MCP servers from persistent JSON."""
+    if not USER_MCP_SERVERS_PATH.exists():
+        return {}
+    try:
+        with open(USER_MCP_SERVERS_PATH) as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning("Failed to load user MCP servers: %s", e)
+        return {}
+
+
+def _save_user_mcp_servers(servers: dict) -> None:
+    """Persist user-added MCP servers to JSON."""
+    USER_MCP_SERVERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(USER_MCP_SERVERS_PATH, "w") as f:
+        json.dump(servers, f, indent=2)
 
 
 class MCPClient:
@@ -128,7 +150,7 @@ class MCPManager:
         self._clients: dict[str, MCPClient] = {}
 
     async def init_from_config(self, mcp_config: dict):
-        """Create clients for every enabled MCP server in the config."""
+        """Create clients for every enabled MCP server in the config and user registry."""
         for server_id, cfg in mcp_config.items():
             if not cfg.get("enabled", False):
                 continue
@@ -139,6 +161,50 @@ class MCPManager:
                 logger.info("MCP server '%s' ready (%d tools)", server_id, len(client.tools))
             else:
                 logger.warning("MCP server '%s' not reachable – will retry on demand", server_id)
+        # Also load user-added servers
+        user_servers = _load_user_mcp_servers()
+        for server_id, cfg in user_servers.items():
+            if not cfg.get("enabled", True):
+                continue
+            if server_id in self._clients:
+                continue
+            client = MCPClient(server_id, cfg)
+            connected = await client.connect()
+            self._clients[server_id] = client
+            if connected:
+                logger.info("User MCP server '%s' ready (%d tools)", server_id, len(client.tools))
+            else:
+                logger.warning("User MCP server '%s' not reachable – will retry on demand", server_id)
+
+    async def add_server(self, server_id: str, cfg: dict) -> dict | None:
+        """Connect to a new MCP server and register it. Returns server info or None on failure."""
+        if server_id in self._clients:
+            # reconnect / refresh existing
+            client = self._clients[server_id]
+            await client.connect()
+        else:
+            client = MCPClient(server_id, cfg)
+            connected = await client.connect()
+            if not connected:
+                return None
+            self._clients[server_id] = client
+        return {
+            "id": server_id,
+            "name": client.name,
+            "description": client.description,
+            "url": client.url,
+            "icon": client.icon,
+            "connected": client.is_connected,
+            "tools": [t["name"] for t in client.tools],
+        }
+
+    def remove_server(self, server_id: str) -> bool:
+        """Remove a registered MCP server."""
+        client = self._clients.pop(server_id, None)
+        if client is None:
+            return False
+        # No persistent connection to close; just drop the reference
+        return True
 
     # ------------------------------------------------------------------
     # Tool discovery

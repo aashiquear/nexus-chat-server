@@ -8,11 +8,13 @@ import SignInScreen from './components/SignInScreen'
 import SplashScreen from './components/SplashScreen'
 import AccountPopup from './components/AccountPopup'
 import AdminPanel from './components/AdminPanel'
+import MCPDiscoveryPanel from './components/MCPDiscoveryPanel'
 import { useChat } from './hooks/useChat'
 import {
   fetchModels, fetchTools, fetchFiles, uploadFile, deleteFile,
   fetchUploadProgress,
   fetchMCPServers, reconnectMCPServer,
+  addMCPServer, removeMCPServer,
   fetchConversations, fetchConversation, saveConversation, deleteConversation,
   fetchAuthMe,
 } from './hooks/api'
@@ -24,6 +26,7 @@ export default function App() {
   const [showAccount, setShowAccount] = useState(false)
   const [showAdmin, setShowAdmin] = useState(false)
   const [showSplash, setShowSplash] = useState(false)
+  const [showMcpDiscovery, setShowMcpDiscovery] = useState(false)
 
   // State
   const [models, setModels] = useState([])
@@ -106,6 +109,14 @@ export default function App() {
       setFiles(f)
       setMcpServers(mcp)
       setConversations(convos)
+
+      // Select all tools by default on first load
+      setSelectedTools((prev) => {
+        if (prev.length === 0) {
+          return t.map((tool) => tool.id)
+        }
+        return prev
+      })
 
       const isUsable = (x) =>
         x.available && (x.remote_available === null || x.remote_available === undefined || x.remote_available)
@@ -216,6 +227,33 @@ export default function App() {
       setMcpServers(mcp)
     } catch (err) {
       console.error('MCP reconnect failed:', err)
+    }
+  }
+
+  const handleAddMCP = async (cfg) => {
+    try {
+      await addMCPServer(cfg)
+      const [t, mcp] = await Promise.all([fetchTools(), fetchMCPServers()])
+      setTools(t)
+      setMcpServers(mcp)
+    } catch (err) {
+      console.error('MCP add failed:', err)
+      alert(`Failed to add MCP server: ${err.message}`)
+    }
+  }
+
+  const handleRemoveMCP = async (serverId) => {
+    if (!window.confirm('Remove this MCP server?')) return
+    try {
+      await removeMCPServer(serverId)
+      const [t, mcp] = await Promise.all([fetchTools(), fetchMCPServers()])
+      setTools(t)
+      setMcpServers(mcp)
+      // Also deselect any tools that belonged to this server
+      setSelectedTools((prev) => prev.filter((id) => !id.startsWith(`mcp:${serverId}:`)))
+    } catch (err) {
+      console.error('MCP remove failed:', err)
+      alert(`Failed to remove MCP server: ${err.message}`)
     }
   }
 
@@ -615,6 +653,8 @@ export default function App() {
         onToggleTool={toggleTool}
         mcpServers={mcpServers}
         onReconnectMCP={handleReconnectMCP}
+        onAddMCP={() => setShowMcpDiscovery(true)}
+        onRemoveMCP={handleRemoveMCP}
         files={files}
         selectedFiles={selectedFiles}
         onToggleFile={toggleFile}
@@ -692,6 +732,16 @@ export default function App() {
           >
             <AdminPanel onClose={() => setShowAdmin(false)} onLogout={handleLogout} />
           </div>
+        )}
+
+        {showMcpDiscovery && (
+          <MCPDiscoveryPanel
+            onClose={() => setShowMcpDiscovery(false)}
+            onAdded={() => {
+              setShowMcpDiscovery(false)
+              loadData()
+            }}
+          />
         )}
 
         {/* Chat Area */}
