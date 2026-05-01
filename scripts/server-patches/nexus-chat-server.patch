@@ -1,0 +1,2861 @@
+diff --git a/.env.example b/.env.example
+index c6b7dd2..aaf3064 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,23 +1,15 @@
+ # ============================================================
+-# Nexus Chat - Environment Variables
++# Nexus Chat Server - Environment Variables
+ # ============================================================
+-# Copy this file to .env and fill in your API keys.
++# Copy this file to .env and fill in required values.
+ # ============================================================
+ 
+-# --- LLM Provider API Keys ---
+-ANTHROPIC_API_KEY=your-anthropic-key-here
+-OPENAI_API_KEY=your-openai-key-here
++# Required on first run — used to bootstrap the admin account
++NEXUS_ADMIN_PASSWORD=your-secure-password-here
+ 
+-# --- Ollama (local or cloud) ---
+-# Local: point to your local Ollama instance
++# Optional but strongly recommended in production
++NEXUS_JWT_SECRET=your-random-secret-here
++
++# Ollama server address (from inside Docker, host.docker.internal reaches the host)
+ OLLAMA_BASE_URL=http://host.docker.internal:11434
+-# Cloud: set to https://ollama.com/api and provide your API key
+-# OLLAMA_BASE_URL=https://ollama.com/api
+ OLLAMA_API_KEY=
+-
+-# --- Tool API Keys ---
+-SEARCH_API_KEY=
+-
+-# --- App Settings ---
+-APP_SECRET_KEY=change-me-in-production
+-APP_DEBUG=false
+diff --git a/Dockerfile b/Dockerfile
+index aa6b3a7..b0e4b62 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -32,7 +32,7 @@ COPY config/ ./config/
+ COPY --from=frontend-build /app/frontend/dist ./frontend/dist
+ 
+ # Create data directories
+-RUN mkdir -p data/uploads data/vector_store
++RUN mkdir -p data/uploads data/vector_store data/conversations
+ 
+ # Expose port
+ EXPOSE 8000
+diff --git a/backend/auth.py b/backend/auth.py
+new file mode 100644
+index 0000000..656b00e
+--- /dev/null
++++ b/backend/auth.py
+@@ -0,0 +1,214 @@
++"""
++Authentication and user management for Nexus Chat Server.
++Stores users in data/users.json (lightweight, no extra DB dependency).
++Uses bcrypt for passwords and JWT for session tokens.
++"""
++
++import asyncio
++import json
++import logging
++import os
++import shutil
++from datetime import datetime, timezone, timedelta
++from pathlib import Path
++from typing import Any
++
++import bcrypt
++import jwt
++from fastapi import Depends, HTTPException, WebSocketException, status
++from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
++
++logger = logging.getLogger(__name__)
++
++USERS_FILE = Path("./data/users.json")
++CONVERSATIONS_ROOT = Path("./data/conversations")
++
++# Lock to prevent concurrent writes to users.json
++_users_lock = asyncio.Lock()
++
++security = HTTPBearer(auto_error=False)
++
++
++def _load_users() -> dict[str, dict]:
++    if not USERS_FILE.exists():
++        return {}
++    try:
++        data = json.loads(USERS_FILE.read_text())
++        return {u["username"]: u for u in data.get("users", [])}
++    except Exception as e:
++        logger.error("Failed to load users: %s", e)
++        return {}
++
++
++async def _save_users(users: dict[str, dict]):
++    async with _users_lock:
++        USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
++        USERS_FILE.write_text(json.dumps({"users": list(users.values())}, indent=2))
++
++
++def hash_password(password: str) -> str:
++    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
++
++
++def verify_password(password: str, hashed: str) -> bool:
++    return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
++
++
++def _jwt_secret() -> str:
++    from backend.config import get_config
++    cfg = get_config()
++    return cfg.get("auth", {}).get("jwt_secret", cfg.get("app", {}).get("secret_key", "change-me"))
++
++
++def _token_expire_days() -> int:
++    from backend.config import get_config
++    cfg = get_config()
++    return cfg.get("auth", {}).get("token_expire_days", 7)
++
++
++def create_access_token(username: str) -> str:
++    secret = _jwt_secret()
++    expire = datetime.now(timezone.utc) + timedelta(days=_token_expire_days())
++    payload = {"sub": username, "exp": expire}
++    return jwt.encode(payload, secret, algorithm="HS256")
++
++
++def decode_access_token(token: str) -> dict:
++    secret = _jwt_secret()
++    try:
++        return jwt.decode(token, secret, algorithms=["HS256"])
++    except jwt.ExpiredSignatureError:
++        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
++    except jwt.InvalidTokenError:
++        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
++
++
++async def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
++    if not credentials:
++        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
++    payload = decode_access_token(credentials.credentials)
++    username = payload.get("sub")
++    if not username:
++        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
++    users = _load_users()
++    user = users.get(username)
++    if not user:
++        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
++    return user
++
++
++async def get_current_admin_user(user: dict = Depends(get_current_user)) -> dict:
++    if not user.get("is_admin"):
++        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
++    return user
++
++
++async def init_admin_user():
++    """Bootstrap the admin user from env var on first startup."""
++    users = _load_users()
++    if users:
++        return
++
++    admin_password = os.environ.get("NEXUS_ADMIN_PASSWORD")
++    if not admin_password:
++        logger.error("=" * 60)
++        logger.error("NEXUS_ADMIN_PASSWORD is not set!")
++        logger.error("Set it in your .env and restart the container.")
++        logger.error("=" * 60)
++        raise RuntimeError("NEXUS_ADMIN_PASSWORD must be set to bootstrap the admin account")
++
++    users["admin"] = {
++        "username": "admin",
++        "password_hash": hash_password(admin_password),
++        "is_admin": True,
++        "created_at": datetime.now(timezone.utc).isoformat(),
++    }
++    await _save_users(users)
++    logger.info("Admin user 'admin' created from NEXUS_ADMIN_PASSWORD")
++
++
++async def create_user(username: str, password: str, is_admin: bool = False) -> dict:
++    if not username or not password:
++        raise HTTPException(status_code=400, detail="Username and password are required")
++    users = _load_users()
++    if username in users:
++        raise HTTPException(status_code=409, detail="Username already exists")
++    users[username] = {
++        "username": username,
++        "password_hash": hash_password(password),
++        "is_admin": is_admin,
++        "created_at": datetime.now(timezone.utc).isoformat(),
++    }
++    await _save_users(users)
++    # Create private conversation directory
++    user_dir = CONVERSATIONS_ROOT / username
++    user_dir.mkdir(parents=True, exist_ok=True)
++    return {"username": username, "is_admin": is_admin, "created_at": users[username]["created_at"]}
++
++
++async def delete_user(username: str) -> bool:
++    users = _load_users()
++    if username not in users:
++        raise HTTPException(status_code=404, detail="User not found")
++    del users[username]
++    await _save_users(users)
++    # Clean up conversation directory
++    user_dir = CONVERSATIONS_ROOT / username
++    if user_dir.exists():
++        shutil.rmtree(user_dir)
++    return True
++
++
++async def list_users() -> list[dict]:
++    users = _load_users()
++    return [
++        {
++            "username": u["username"],
++            "is_admin": u.get("is_admin", False),
++            "created_at": u.get("created_at", ""),
++        }
++        for u in users.values()
++    ]
++
++
++async def change_password(username: str, current_password: str, new_password: str):
++    users = _load_users()
++    user = users.get(username)
++    if not user:
++        raise HTTPException(status_code=404, detail="User not found")
++    if not verify_password(current_password, user["password_hash"]):
++        raise HTTPException(status_code=401, detail="Current password is incorrect")
++    user["password_hash"] = hash_password(new_password)
++    await _save_users(users)
++
++
++async def delete_user_account(username: str, password: str):
++    users = _load_users()
++    user = users.get(username)
++    if not user:
++        raise HTTPException(status_code=404, detail="User not found")
++    if not verify_password(password, user["password_hash"]):
++        raise HTTPException(status_code=401, detail="Password is incorrect")
++    del users[username]
++    await _save_users(users)
++    # Clean up conversation directory
++    user_dir = CONVERSATIONS_ROOT / username
++    if user_dir.exists():
++        shutil.rmtree(user_dir)
++
++
++def get_ws_user(token: str | None) -> dict:
++    if not token:
++        raise WebSocketException(code=1008, reason="Missing token")
++    try:
++        payload = decode_access_token(token)
++    except HTTPException:
++        raise WebSocketException(code=1008, reason="Invalid token")
++    username = payload.get("sub")
++    if not username:
++        raise WebSocketException(code=1008, reason="Invalid token")
++    users = _load_users()
++    user = users.get(username)
++    if not user:
++        raise WebSocketException(code=1008, reason="User not found")
++    return user
+diff --git a/backend/config.py b/backend/config.py
+index 4f6f858..9c4b9f6 100644
+--- a/backend/config.py
++++ b/backend/config.py
+@@ -12,6 +12,18 @@ from typing import Any
+ _config: dict | None = None
+ 
+ CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.yaml"
++SERVER_CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.server.yaml"
++
++
++def _deep_merge(base: dict, override: dict) -> dict:
++    """Recursively merge override into base. Lists are replaced."""
++    result = dict(base)
++    for key, val in override.items():
++        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
++            result[key] = _deep_merge(result[key], val)
++        else:
++            result[key] = val
++    return result
+ 
+ 
+ def _substitute_env_vars(value: Any) -> Any:
+@@ -33,7 +45,7 @@ def _substitute_env_vars(value: Any) -> Any:
+ 
+ 
+ def load_config(config_path: Path | None = None) -> dict:
+-    """Load and cache configuration from YAML file."""
++    """Load and cache configuration from YAML file(s)."""
+     global _config
+     if _config is not None:
+         return _config
+@@ -45,6 +57,13 @@ def load_config(config_path: Path | None = None) -> dict:
+     with open(path) as f:
+         raw = yaml.safe_load(f)
+ 
++    # Merge server override if present
++    if SERVER_CONFIG_PATH.exists():
++        with open(SERVER_CONFIG_PATH) as f:
++            override = yaml.safe_load(f)
++        if override:
++            raw = _deep_merge(raw or {}, override)
++
+     _config = _substitute_env_vars(raw)
+     return _config
+ 
+diff --git a/backend/conversations.py b/backend/conversations.py
+index 2e436be..09cf57e 100644
+--- a/backend/conversations.py
++++ b/backend/conversations.py
+@@ -1,7 +1,7 @@
+ """
+ Conversation persistence — stores chat threads as JSON files locally.
+ 
+-Each conversation is a JSON file in data/conversations/:
++Each conversation is a JSON file in data/conversations/{username}/:
+   {
+     "id": "abc123",
+     "title": "First user message (truncated)",
+@@ -21,8 +21,7 @@ from pathlib import Path
+ 
+ logger = logging.getLogger(__name__)
+ 
+-CONVERSATIONS_DIR = Path("./data/conversations")
+-CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
++CONVERSATIONS_ROOT = Path("./data/conversations")
+ 
+ # Common English stopwords filtered out when summarising the first user
+ # prompt down to a 3-word sidebar title. Kept short on purpose — we want
+@@ -38,8 +37,14 @@ _TITLE_STOPWORDS = {
+ }
+ 
+ 
+-def _path(conversation_id: str) -> Path:
+-    return CONVERSATIONS_DIR / f"{conversation_id}.json"
++def _user_dir(username: str) -> Path:
++    d = CONVERSATIONS_ROOT / username
++    d.mkdir(parents=True, exist_ok=True)
++    return d
++
++
++def _path(conversation_id: str, username: str) -> Path:
++    return _user_dir(username) / f"{conversation_id}.json"
+ 
+ 
+ def _derive_title(messages: list[dict]) -> str:
+@@ -72,10 +77,11 @@ def _derive_title(messages: list[dict]) -> str:
+     return "New conversation"
+ 
+ 
+-def list_conversations() -> list[dict]:
+-    """Return all conversations sorted by updated_at descending."""
++def list_conversations(username: str) -> list[dict]:
++    """Return all conversations for a user sorted by updated_at descending."""
++    user_dir = _user_dir(username)
+     convos = []
+-    for f in CONVERSATIONS_DIR.glob("*.json"):
++    for f in user_dir.glob("*.json"):
+         try:
+             data = json.loads(f.read_text())
+             convos.append({
+@@ -92,9 +98,9 @@ def list_conversations() -> list[dict]:
+     return convos
+ 
+ 
+-def get_conversation(conversation_id: str) -> dict | None:
+-    """Load a full conversation by ID."""
+-    path = _path(conversation_id)
++def get_conversation(conversation_id: str, username: str) -> dict | None:
++    """Load a full conversation by ID for a user."""
++    path = _path(conversation_id, username)
+     if not path.exists():
+         return None
+     try:
+@@ -109,12 +115,13 @@ def save_conversation(
+     messages: list[dict],
+     model: str = "",
+     token_usage: list[dict] | None = None,
++    username: str = "",
+ ) -> dict:
+-    """Create or update a conversation. Returns the saved metadata."""
++    """Create or update a conversation for a user. Returns the saved metadata."""
+     now = datetime.now(timezone.utc).isoformat()
+ 
+     if conversation_id:
+-        existing = get_conversation(conversation_id)
++        existing = get_conversation(conversation_id, username)
+     else:
+         existing = None
+ 
+@@ -139,7 +146,7 @@ def save_conversation(
+         if token_usage is not None:
+             data["token_usage"] = token_usage
+ 
+-    path = _path(data["id"])
++    path = _path(data["id"], username)
+     path.write_text(json.dumps(data, indent=2))
+ 
+     return {
+@@ -152,9 +159,9 @@ def save_conversation(
+     }
+ 
+ 
+-def delete_conversation(conversation_id: str) -> bool:
+-    """Delete a conversation file. Returns True if deleted."""
+-    path = _path(conversation_id)
++def delete_conversation(conversation_id: str, username: str) -> bool:
++    """Delete a conversation file for a user. Returns True if deleted."""
++    path = _path(conversation_id, username)
+     if path.exists():
+         path.unlink()
+         return True
+diff --git a/backend/main.py b/backend/main.py
+index 117bd51..0e1a12a 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -12,7 +12,7 @@ from pathlib import Path
+ from dotenv import load_dotenv
+ import uuid
+ 
+-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request, BackgroundTasks
++from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request, BackgroundTasks, Depends, status
+ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.staticfiles import StaticFiles
+ from fastapi.responses import FileResponse, JSONResponse
+@@ -26,10 +26,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
+ from backend.config import load_config, get_config
+ from backend.orchestrator import ChatOrchestrator
+ from backend import conversations
++import backend.auth as auth
+ 
+-# Import providers and tools to trigger registration
+-import backend.providers.anthropic_provider
+-import backend.providers.openai_provider
++# Import providers and tools to trigger registration (server: ollama only)
+ import backend.providers.ollama_provider
+ import backend.tools.builtin
+ import backend.tools.example_tool
+@@ -38,6 +37,7 @@ import backend.tools.graph_plotter
+ import backend.tools.image_analyzer
+ import backend.tools.image_synthesizer
+ import backend.mcp  # noqa: F401 – MCP client module
++from backend.mcp.client import _load_user_mcp_servers, _save_user_mcp_servers
+ 
+ logging.basicConfig(level=logging.INFO)
+ logger = logging.getLogger(__name__)
+@@ -72,7 +72,8 @@ upload_dir.mkdir(parents=True, exist_ok=True)
+ 
+ @app.on_event("startup")
+ async def startup_event():
+-    """Initialize MCP connections and sync uploaded files into the vector store."""
++    """Initialize auth, MCP connections and sync uploaded files into the vector store."""
++    await auth.init_admin_user()
+     await orchestrator.init_mcp()
+     # Re-ingest any uploaded files missing from the vector store (e.g. after restart)
+     if orchestrator.rag_engine:
+@@ -86,6 +87,77 @@ async def health():
+     return {"status": "ok", "name": app_config.get("name")}
+ 
+ 
++# ------ Auth Endpoints ------
++
++@app.post("/api/auth/login")
++async def login(request: Request):
++    body = await request.json()
++    username = body.get("username", "").strip()
++    password = body.get("password", "")
++    users = auth._load_users()
++    user = users.get(username)
++    if not user or not auth.verify_password(password, user["password_hash"]):
++        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
++    token = auth.create_access_token(username)
++    return {
++        "token": token,
++        "user": {
++            "username": user["username"],
++            "is_admin": user.get("is_admin", False),
++        },
++    }
++
++
++@app.get("/api/auth/me")
++async def me(current_user: dict = Depends(auth.get_current_user)):
++    return {
++        "username": current_user["username"],
++        "is_admin": current_user.get("is_admin", False),
++    }
++
++
++@app.post("/api/auth/change-password")
++async def change_password(request: Request, current_user: dict = Depends(auth.get_current_user)):
++    body = await request.json()
++    current_password = body.get("current_password", "")
++    new_password = body.get("new_password", "")
++    if not new_password or len(new_password) < 4:
++        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
++    await auth.change_password(current_user["username"], current_password, new_password)
++    return {"status": "ok"}
++
++
++@app.delete("/api/auth/account")
++async def delete_account(request: Request, current_user: dict = Depends(auth.get_current_user)):
++    body = await request.json()
++    password = body.get("password", "")
++    await auth.delete_user_account(current_user["username"], password)
++    return {"deleted": current_user["username"]}
++
++
++# ------ Admin Endpoints ------
++
++@app.get("/api/admin/users")
++async def admin_list_users(_admin: dict = Depends(auth.get_current_admin_user)):
++    return {"users": await auth.list_users()}
++
++
++@app.post("/api/admin/users")
++async def admin_create_user(request: Request, _admin: dict = Depends(auth.get_current_admin_user)):
++    body = await request.json()
++    username = body.get("username", "").strip()
++    password = body.get("password", "")
++    is_admin = bool(body.get("is_admin", False))
++    result = await auth.create_user(username, password, is_admin)
++    return result
++
++
++@app.delete("/api/admin/users/{username}")
++async def admin_delete_user(username: str, _admin: dict = Depends(auth.get_current_admin_user)):
++    await auth.delete_user(username)
++    return {"deleted": username}
++
++
+ @app.get("/api/models")
+ async def list_models():
+     """Return all configured LLM models, annotated with whether each is
+@@ -108,7 +180,7 @@ UPLOAD_STREAM_CHUNK = 1024 * 1024  # 1 MiB per read — bounded memory
+ 
+ 
+ @app.post("/api/upload")
+-async def upload_file(file: UploadFile = File(...)):
++async def upload_file(file: UploadFile = File(...), current_user: dict = Depends(auth.get_current_user)):
+     """Upload a file for RAG and tool use.
+ 
+     The request body is streamed to disk in 1 MiB chunks so multi-GB
+@@ -193,7 +265,7 @@ async def upload_progress(filename: str):
+ 
+ 
+ @app.get("/api/files")
+-async def list_files():
++async def list_files(current_user: dict = Depends(auth.get_current_user)):
+     """List uploaded files and resync any new files into the RAG vector store."""
+     # Re-ingest any files placed directly in the uploads directory (not via upload API)
+     if orchestrator.rag_engine:
+@@ -211,7 +283,7 @@ async def list_files():
+ 
+ 
+ @app.delete("/api/files/{filename}")
+-async def delete_file(filename: str):
++async def delete_file(filename: str, current_user: dict = Depends(auth.get_current_user)):
+     """Delete an uploaded file."""
+     filepath = upload_dir / filename
+     if not filepath.exists():
+@@ -290,43 +362,109 @@ async def reconnect_mcp_server(server_id: str):
+     return {"status": "connected", "server": server_id}
+ 
+ 
++@app.post("/api/mcp/servers/discover")
++async def discover_mcp_server(payload: dict):
++    """Probe an MCP server URL without persisting it."""
++    url = payload.get("url", "").strip().rstrip("/")
++    if not url:
++        raise HTTPException(400, "URL is required")
++    from backend.mcp.client import MCPClient
++    temp_id = "discover_" + url.replace("://", "_").replace("/", "_").replace(":", "_")
++    client = MCPClient(temp_id, {"url": url, "timeout": payload.get("timeout", 30)})
++    connected = await client.connect()
++    if not connected:
++        raise HTTPException(502, f"Could not connect to MCP server at {url}")
++    tools = client.tools
++    return {
++        "server": {
++            "id": temp_id,
++            "name": client.name,
++            "description": client.description,
++            "url": client.url,
++            "icon": client.icon,
++            "connected": True,
++            "tools": [t["name"] for t in tools],
++        },
++        "tools": tools,
++    }
++
++
++@app.post("/api/mcp/servers")
++async def add_mcp_server(payload: dict):
++    """Add a new MCP server by URL and persist it."""
++    url = payload.get("url", "").strip().rstrip("/")
++    if not url:
++        raise HTTPException(400, "URL is required")
++    # Generate a stable server_id from the URL
++    server_id = payload.get("id") or url.replace("://", "_").replace("/", "_").replace(":", "_")
++    cfg = {
++        "url": url,
++        "name": payload.get("name", server_id),
++        "description": payload.get("description", ""),
++        "icon": payload.get("icon", "server"),
++        "timeout": payload.get("timeout", 30),
++        "enabled": True,
++    }
++    info = await orchestrator.add_mcp_server(server_id, cfg)
++    if not info:
++        raise HTTPException(502, f"Could not connect to MCP server at {url}")
++    # Persist
++    user_servers = _load_user_mcp_servers()
++    user_servers[server_id] = cfg
++    _save_user_mcp_servers(user_servers)
++    return {"status": "added", "server": info}
++
++
++@app.delete("/api/mcp/servers/{server_id}")
++async def remove_mcp_server(server_id: str):
++    """Remove a persisted MCP server."""
++    ok = orchestrator.remove_mcp_server(server_id)
++    if not ok:
++        raise HTTPException(404, f"MCP server '{server_id}' not found")
++    user_servers = _load_user_mcp_servers()
++    user_servers.pop(server_id, None)
++    _save_user_mcp_servers(user_servers)
++    return {"status": "removed", "server": server_id}
++
++
+ # ------ Conversation Endpoints ------
+ 
+ from starlette.requests import Request as StarletteRequest
+ 
+ 
+ @app.get("/api/conversations")
+-async def list_conversations_endpoint():
+-    """List all saved conversations."""
+-    return {"conversations": conversations.list_conversations()}
++async def list_conversations_endpoint(current_user: dict = Depends(auth.get_current_user)):
++    """List all saved conversations for the current user."""
++    return {"conversations": conversations.list_conversations(current_user["username"])}
+ 
+ 
+ @app.get("/api/conversations/{conversation_id}")
+-async def get_conversation_endpoint(conversation_id: str):
+-    """Load a specific conversation."""
+-    data = conversations.get_conversation(conversation_id)
++async def get_conversation_endpoint(conversation_id: str, current_user: dict = Depends(auth.get_current_user)):
++    """Load a specific conversation for the current user."""
++    data = conversations.get_conversation(conversation_id, current_user["username"])
+     if not data:
+         raise HTTPException(404, "Conversation not found")
+     return data
+ 
+ 
+ @app.post("/api/conversations")
+-async def save_conversation_post(request: StarletteRequest):
+-    """Create or update a conversation."""
++async def save_conversation_post(request: StarletteRequest, current_user: dict = Depends(auth.get_current_user)):
++    """Create or update a conversation for the current user."""
+     body = await request.json()
+     result = conversations.save_conversation(
+         conversation_id=body.get("id"),
+         messages=body.get("messages", []),
+         model=body.get("model", ""),
+         token_usage=body.get("token_usage"),
++        username=current_user["username"],
+     )
+     return result
+ 
+ 
+ @app.delete("/api/conversations/{conversation_id}")
+-async def delete_conversation_endpoint(conversation_id: str):
+-    """Delete a conversation."""
+-    ok = conversations.delete_conversation(conversation_id)
++async def delete_conversation_endpoint(conversation_id: str, current_user: dict = Depends(auth.get_current_user)):
++    """Delete a conversation for the current user."""
++    ok = conversations.delete_conversation(conversation_id, current_user["username"])
+     if not ok:
+         raise HTTPException(404, "Conversation not found")
+     return {"deleted": conversation_id}
+@@ -336,7 +474,14 @@ async def delete_conversation_endpoint(conversation_id: str):
+ 
+ @app.websocket("/ws/chat")
+ async def websocket_chat(websocket: WebSocket):
+-    """WebSocket endpoint for streaming chat."""
++    """WebSocket endpoint for streaming chat. Authenticates via ?token=..."""
++    token = websocket.query_params.get("token")
++    try:
++        user = auth.get_ws_user(token)
++    except Exception as e:
++        await websocket.close(code=1008, reason=str(e))
++        return
++
+     await websocket.accept()
+ 
+     try:
+diff --git a/backend/mcp/client.py b/backend/mcp/client.py
+index 469cc95..5f2b6d5 100644
+--- a/backend/mcp/client.py
++++ b/backend/mcp/client.py
+@@ -13,12 +13,34 @@ MCPClient wraps a single server; MCPManager owns all configured servers.
+ import json
+ import logging
+ from collections import defaultdict
++from pathlib import Path
+ from typing import Any
+ 
+ import httpx
+ 
+ logger = logging.getLogger(__name__)
+ 
++USER_MCP_SERVERS_PATH = Path("./data/user_mcp_servers.json")
++
++
++def _load_user_mcp_servers() -> dict:
++    """Load user-added MCP servers from persistent JSON."""
++    if not USER_MCP_SERVERS_PATH.exists():
++        return {}
++    try:
++        with open(USER_MCP_SERVERS_PATH) as f:
++            return json.load(f)
++    except Exception as e:
++        logger.warning("Failed to load user MCP servers: %s", e)
++        return {}
++
++
++def _save_user_mcp_servers(servers: dict) -> None:
++    """Persist user-added MCP servers to JSON."""
++    USER_MCP_SERVERS_PATH.parent.mkdir(parents=True, exist_ok=True)
++    with open(USER_MCP_SERVERS_PATH, "w") as f:
++        json.dump(servers, f, indent=2)
++
+ 
+ class MCPClient:
+     """Client for a single MCP server."""
+@@ -128,7 +150,7 @@ class MCPManager:
+         self._clients: dict[str, MCPClient] = {}
+ 
+     async def init_from_config(self, mcp_config: dict):
+-        """Create clients for every enabled MCP server in the config."""
++        """Create clients for every enabled MCP server in the config and user registry."""
+         for server_id, cfg in mcp_config.items():
+             if not cfg.get("enabled", False):
+                 continue
+@@ -139,6 +161,50 @@ class MCPManager:
+                 logger.info("MCP server '%s' ready (%d tools)", server_id, len(client.tools))
+             else:
+                 logger.warning("MCP server '%s' not reachable – will retry on demand", server_id)
++        # Also load user-added servers
++        user_servers = _load_user_mcp_servers()
++        for server_id, cfg in user_servers.items():
++            if not cfg.get("enabled", True):
++                continue
++            if server_id in self._clients:
++                continue
++            client = MCPClient(server_id, cfg)
++            connected = await client.connect()
++            self._clients[server_id] = client
++            if connected:
++                logger.info("User MCP server '%s' ready (%d tools)", server_id, len(client.tools))
++            else:
++                logger.warning("User MCP server '%s' not reachable – will retry on demand", server_id)
++
++    async def add_server(self, server_id: str, cfg: dict) -> dict | None:
++        """Connect to a new MCP server and register it. Returns server info or None on failure."""
++        if server_id in self._clients:
++            # reconnect / refresh existing
++            client = self._clients[server_id]
++            await client.connect()
++        else:
++            client = MCPClient(server_id, cfg)
++            connected = await client.connect()
++            if not connected:
++                return None
++            self._clients[server_id] = client
++        return {
++            "id": server_id,
++            "name": client.name,
++            "description": client.description,
++            "url": client.url,
++            "icon": client.icon,
++            "connected": client.is_connected,
++            "tools": [t["name"] for t in client.tools],
++        }
++
++    def remove_server(self, server_id: str) -> bool:
++        """Remove a registered MCP server."""
++        client = self._clients.pop(server_id, None)
++        if client is None:
++            return False
++        # No persistent connection to close; just drop the reference
++        return True
+ 
+     # ------------------------------------------------------------------
+     # Tool discovery
+diff --git a/backend/orchestrator.py b/backend/orchestrator.py
+index 9c794ec..1e0f98d 100644
+--- a/backend/orchestrator.py
++++ b/backend/orchestrator.py
+@@ -121,9 +121,8 @@ class ChatOrchestrator:
+     async def init_mcp(self):
+         """Initialize MCP server connections (must be awaited)."""
+         mcp_config = get_enabled_mcp_servers()
+-        if mcp_config:
+-            await self._mcp.init_from_config(mcp_config)
+-            logger.info("MCP manager initialized with %d server(s)", len(mcp_config))
++        await self._mcp.init_from_config(mcp_config)
++        logger.info("MCP manager initialized")
+ 
+     def get_available_tools(self) -> list[dict]:
+         """Return all available tools (built-in + MCP)."""
+@@ -150,6 +149,14 @@ class ChatOrchestrator:
+         """Reconnect a specific MCP server."""
+         return await self._mcp.reconnect(server_id)
+ 
++    async def add_mcp_server(self, server_id: str, cfg: dict) -> dict | None:
++        """Add and connect a new MCP server."""
++        return await self._mcp.add_server(server_id, cfg)
++
++    def remove_mcp_server(self, server_id: str) -> bool:
++        """Remove an MCP server."""
++        return self._mcp.remove_server(server_id)
++
+     def _resolve_provider(self, model_id: str) -> tuple[str, BaseLLMProvider] | None:
+         """Find which provider hosts the given model."""
+         for name, provider in self._providers.items():
+diff --git a/backend/providers/ollama_provider.py b/backend/providers/ollama_provider.py
+index 5e572f1..ff6246e 100644
+--- a/backend/providers/ollama_provider.py
++++ b/backend/providers/ollama_provider.py
+@@ -50,10 +50,7 @@ class OllamaProvider(BaseLLMProvider):
+             return False
+ 
+     def list_models(self) -> list[dict]:
+-        """Return configured models (or query Ollama for installed models)."""
+-        configured = self.config.get("models", [])
+-        if configured:
+-            return configured
++        """Query Ollama for installed models dynamically. Always live."""
+         try:
+             with httpx.Client(timeout=5) as client:
+                 resp = client.get(f"{self.base_url}/api/tags", headers=self._headers)
+diff --git a/config/settings.server.yaml b/config/settings.server.yaml
+new file mode 100644
+index 0000000..4197d68
+--- /dev/null
++++ b/config/settings.server.yaml
+@@ -0,0 +1,23 @@
++# ============================================================
++# Nexus Chat Server — Config Override
++# This file is deep-merged over config/settings.yaml.
++# It survives upstream updates and overrides only the keys it sets.
++# ============================================================
++
++app:
++  name: "Nexus Chat Server"
++
++auth:
++  jwt_secret: "${NEXUS_JWT_SECRET:-change-me-in-production}"
++  token_expire_days: 7
++
++providers:
++  anthropic:
++    enabled: false
++  openai:
++    enabled: false
++  ollama:
++    enabled: true
++    base_url: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
++    api_key: ""
++    models: []   # empty = dynamic discovery from /api/tags only
+diff --git a/config/settings.yaml b/config/settings.yaml
+index 48cc099..10484db 100644
+--- a/config/settings.yaml
++++ b/config/settings.yaml
+@@ -309,41 +309,11 @@ tools:
+ # ------------------------------------------------------------
+ # MCP Servers (Model Context Protocol)
+ # ------------------------------------------------------------
+-# External services that expose tools via the MCP protocol.
+-# Each server runs independently (e.g. in a Docker container)
+-# and Nexus Chat connects to it over HTTP JSON-RPC.
+-# To add a new MCP server:
+-#   1. Deploy the server (Docker, bare-metal, etc.)
+-#   2. Add an entry here with its URL
+-#   3. Restart Nexus Chat — its tools appear in the sidebar
++# MCP servers are now added dynamically via the UI.
++# Use the "+" button in the MCP Servers sidebar panel to
++# discover and add a server by its URL.
+ # ------------------------------------------------------------
+-mcp_servers:
+-  # Example: SQLite database server (see examples/mcp-database-server)
+-  database:
+-    enabled: true
+-    name: "Database"
+-    description: "Query and manage a SQLite database"
+-    url: "http://mcp-database:8100"   # Docker service name
+-    icon: "database"
+-    timeout: 30
+-
+-  moose:
+-    enabled: true
+-    name: "MOOSE Simulator"
+-    description: "Build, run, and post-process MOOSE framework simulations"
+-    # Native mode: use host.docker.internal to reach the host from Docker
+-    url: "http://host.docker.internal:8200"
+-    # Docker mode: use the container name instead
+-    # url: "http://mcp-moose:8200"
+-    icon: "atom"
+-    timeout: 120
+-
+-  statflow:
+-    enabled: true
+-    name: "StatFlow - Statistical Analysis"
+-    url: "http://statflow-mcp:9000"  # container name on nexus-net
+-    icon: "chart-bar"
+-    timeout: 120  # longer timeout for complex analyses
++mcp_servers: {}
+ 
+ # ------------------------------------------------------------
+ # RAG (Retrieval-Augmented Generation)
+diff --git a/docker-compose.yml b/docker-compose.yml
+index b8ad2bf..fa6ce28 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -9,18 +9,21 @@ networks:
+ services:
+   nexus-chat:
+     build: .
+-    container_name: nexus-chat
++    container_name: nexus-chat-server
+     networks:
+       - nexus-net
+     ports:
+       - "8000:8000"
+-    env_file:
+-      - .env
++    environment:
++      - NEXUS_ADMIN_PASSWORD=${NEXUS_ADMIN_PASSWORD:?err}
++      - NEXUS_JWT_SECRET=${NEXUS_JWT_SECRET:-change-me-in-production}
++      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
++      - OLLAMA_API_KEY=${OLLAMA_API_KEY:-}
+     volumes:
+       # Mount config for easy editing without rebuild
+       - ./config:/app/config:ro
+-      # Persist uploaded files and vector store
+-      - ./data:/app/data
++      # Persist data (conversations, uploads, vector store)
++      - nexus-data:/app/data
+     extra_hosts:
+       # Allow container to reach Ollama on the host machine
+       - "host.docker.internal:host-gateway"
+@@ -53,4 +56,5 @@ services:
+       retries: 3
+ 
+ volumes:
++  nexus-data:
+   mcp-db-data:
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 2862fbb..9fd7450 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -1,32 +1,32 @@
+ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+-import { Menu, MessageCircle, Wifi, WifiOff } from 'lucide-react'
++import { Menu, MessageCircle, Wifi, WifiOff, UserCircle, LogOut } from 'lucide-react'
+ import Sidebar from './components/Sidebar'
+ import ChatMessage, { TypingIndicator } from './components/ChatMessage'
+ import ChatInput from './components/ChatInput'
+ import CanvasPanel from './components/CanvasPanel'
++import SignInScreen from './components/SignInScreen'
+ import SplashScreen from './components/SplashScreen'
++import AccountPopup from './components/AccountPopup'
++import AdminPanel from './components/AdminPanel'
++import MCPDiscoveryPanel from './components/MCPDiscoveryPanel'
+ import { useChat } from './hooks/useChat'
+ import {
+   fetchModels, fetchTools, fetchFiles, uploadFile, deleteFile,
+   fetchUploadProgress,
+   fetchMCPServers, reconnectMCPServer,
++  addMCPServer, removeMCPServer,
+   fetchConversations, fetchConversation, saveConversation, deleteConversation,
++  fetchAuthMe,
+ } from './hooks/api'
+ 
+ export default function App() {
+-  // Splash / title screen - dismissed after user clicks "Start Chat"
+-  const [showSplash, setShowSplash] = useState(() => {
+-    try {
+-      return sessionStorage.getItem('nexus:splashDismissed') !== '1'
+-    } catch {
+-      return true
+-    }
+-  })
+-
+-  const dismissSplash = useCallback(() => {
+-    try { sessionStorage.setItem('nexus:splashDismissed', '1') } catch {}
+-    setShowSplash(false)
+-  }, [])
++  // Auth state
++  const [user, setUser] = useState(null)
++  const [authChecked, setAuthChecked] = useState(false)
++  const [showAccount, setShowAccount] = useState(false)
++  const [showAdmin, setShowAdmin] = useState(false)
++  const [showSplash, setShowSplash] = useState(false)
++  const [showMcpDiscovery, setShowMcpDiscovery] = useState(false)
+ 
+   // State
+   const [models, setModels] = useState([])
+@@ -41,28 +41,20 @@ export default function App() {
+   const [isTyping, setIsTyping] = useState(false)
+   const [sidebarOpen, setSidebarOpen] = useState(false)
+ 
+-  // LLM response status — drives the floating pop-up above the chat input.
+-  // Shape: { stage: 'initiated'|'thinking'|'responding'|'tool_calling'|'tool_executing'|'idle'|'error', detail?: string }
+   const [llmStatus, setLlmStatus] = useState({ stage: 'idle' })
+ 
+-  // Conversation state
+   const [conversations, setConversations] = useState([])
+   const [activeConversationId, setActiveConversationId] = useState(null)
+ 
+-  // Canvas panel state (right-side panel for graphs)
+   const [canvasData, setCanvasData] = useState(null)
+-  const [canvasWidth, setCanvasWidth] = useState(null) // null = auto-calculate initial
++  const [canvasWidth, setCanvasWidth] = useState(null)
+   const isDraggingRef = useRef(false)
+ 
+-  // Upload progress state: { filename, stage, percent (0-100) } or null
+-  // Stages: 'uploading' (bytes -> server) then 'embedding' (server -> vector store)
+   const [uploadProgress, setUploadProgress] = useState(null)
+ 
+-  // Token usage tracking: array of { prompt_tokens, completion_tokens, total_tokens } per response
+   const [tokenUsageHistory, setTokenUsageHistory] = useState([])
+   const tokenUsageRef = useRef([])
+ 
+-  // Live last-response stats — only populated during active conversation, not from saved data
+   const [lastResponseStats, setLastResponseStats] = useState(null)
+ 
+   const chatEndRef = useRef(null)
+@@ -72,12 +64,40 @@ export default function App() {
+   const userScrolledRef = useRef(false)
+   const { connect, sendMessage, isConnected, isStreaming } = useChat()
+ 
+-  // Initialize
++  // Validate auth on mount
+   useEffect(() => {
+-    connect()
+-    loadData()
++    const init = async () => {
++      const token = localStorage.getItem('nexus_token')
++      if (token) {
++        try {
++          const me = await fetchAuthMe()
++          if (me) {
++            setUser(me)
++            setShowSplash(true)
++            connect()
++            loadData()
++          } else {
++            handleLogout()
++          }
++        } catch {
++          handleLogout()
++        }
++      }
++      setAuthChecked(true)
++    }
++    init()
+   }, [connect])
+ 
++  const handleLogout = () => {
++    localStorage.removeItem('nexus_token')
++    localStorage.removeItem('nexus_user')
++    setUser(null)
++    setMessages([])
++    setActiveConversationId(null)
++    setConversations([])
++    window.location.reload()
++  }
++
+   const loadData = async () => {
+     try {
+       const [m, t, f, mcp, convos] = await Promise.all([
+@@ -90,9 +110,14 @@ export default function App() {
+       setMcpServers(mcp)
+       setConversations(convos)
+ 
+-      // Default-select a model that is both provider-configured *and*
+-      // confirmed on the remote (when probe info is available). Fall
+-      // back to any configured model if no probe data was returned.
++      // Select all tools by default on first load
++      setSelectedTools((prev) => {
++        if (prev.length === 0) {
++          return t.map((tool) => tool.id)
++        }
++        return prev
++      })
++
+       const isUsable = (x) =>
+         x.available && (x.remote_available === null || x.remote_available === undefined || x.remote_available)
+       const preferred = m.find(isUsable) || m.find((x) => x.available)
+@@ -102,7 +127,6 @@ export default function App() {
+     }
+   }
+ 
+-  // Smart auto-scroll: only auto-scroll if user is near the bottom
+   const handleScroll = useCallback(() => {
+     const el = chatAreaRef.current
+     if (!el) return
+@@ -118,26 +142,21 @@ export default function App() {
+     return () => el.removeEventListener('scroll', handleScroll)
+   }, [handleScroll])
+ 
+-  // Auto-scroll when new content arrives (only if user hasn't scrolled up)
+   useEffect(() => {
+     if (!userScrolledRef.current) {
+       chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+     }
+   }, [messages, isTyping])
+ 
+-  // Toggle helpers
+   const toggleTool = (id) => {
+-    // Check if this tool is a toolkit with grouped children
+     const tool = tools.find((t) => t.id === id)
+     const childIds = tool?.children || []
+ 
+     setSelectedTools((prev) => {
+       if (prev.includes(id)) {
+-        // Deactivating: remove toolkit and all its children
+         const toRemove = new Set([id, ...childIds])
+         return prev.filter((x) => !toRemove.has(x))
+       } else {
+-        // Activating: add toolkit and all its children
+         const toAdd = [id, ...childIds].filter((x) => !prev.includes(x))
+         return [...prev, ...toAdd]
+       }
+@@ -154,17 +173,13 @@ export default function App() {
+     setSelectedFiles((prev) => prev.filter((x) => x !== name))
+   }
+ 
+-  // Upload
+   const handleUpload = async (file) => {
+     try {
+-      // Stage 1: bytes leaving the browser
+       setUploadProgress({ filename: file.name, stage: 'uploading', percent: 0 })
+       await uploadFile(file, (percent) => {
+         setUploadProgress({ filename: file.name, stage: 'uploading', percent })
+       })
+ 
+-      // Stage 2: server-side embedding (chunks → vector store).
+-      // Backend returns immediately; poll for embedding progress.
+       setUploadProgress({ filename: file.name, stage: 'embedding', percent: 0 })
+ 
+       let done = false
+@@ -173,7 +188,6 @@ export default function App() {
+         attempts += 1
+         const progress = await fetchUploadProgress(file.name)
+         if (!progress || progress.stage === 'unknown') {
+-          // Backend hasn't recorded progress yet — keep polling briefly
+           await new Promise((r) => setTimeout(r, 250))
+           continue
+         }
+@@ -216,6 +230,33 @@ export default function App() {
+     }
+   }
+ 
++  const handleAddMCP = async (cfg) => {
++    try {
++      await addMCPServer(cfg)
++      const [t, mcp] = await Promise.all([fetchTools(), fetchMCPServers()])
++      setTools(t)
++      setMcpServers(mcp)
++    } catch (err) {
++      console.error('MCP add failed:', err)
++      alert(`Failed to add MCP server: ${err.message}`)
++    }
++  }
++
++  const handleRemoveMCP = async (serverId) => {
++    if (!window.confirm('Remove this MCP server?')) return
++    try {
++      await removeMCPServer(serverId)
++      const [t, mcp] = await Promise.all([fetchTools(), fetchMCPServers()])
++      setTools(t)
++      setMcpServers(mcp)
++      // Also deselect any tools that belonged to this server
++      setSelectedTools((prev) => prev.filter((id) => !id.startsWith(`mcp:${serverId}:`)))
++    } catch (err) {
++      console.error('MCP remove failed:', err)
++      alert(`Failed to remove MCP server: ${err.message}`)
++    }
++  }
++
+   const handleDeleteFile = async (filename) => {
+     try {
+       await deleteFile(filename)
+@@ -226,8 +267,6 @@ export default function App() {
+     }
+   }
+ 
+-  // ---- Conversation persistence ----
+-
+   const persistConversation = useCallback(async (msgs, convId, tokenUsage) => {
+     if (!msgs || msgs.length === 0) return null
+     try {
+@@ -237,7 +276,6 @@ export default function App() {
+         model: selectedModel,
+         token_usage: tokenUsage || undefined,
+       })
+-      // Refresh the sidebar list
+       const convos = await fetchConversations()
+       setConversations(convos)
+       return result.id
+@@ -277,13 +315,11 @@ export default function App() {
+     }
+   }
+ 
+-  // Open canvas panel for a graph
+   const handleOpenCanvas = useCallback((data) => {
+     setCanvasData(data)
+-    setCanvasWidth(null) // reset to auto-calculate on each new open
++    setCanvasWidth(null)
+   }, [])
+ 
+-  // Canvas divider drag-to-resize
+   const resizeCanvas = useCallback((delta) => {
+     setCanvasWidth((prev) => {
+       const current = prev || window.innerWidth * 0.4
+@@ -330,7 +366,6 @@ export default function App() {
+     }
+   }, [resizeCanvas])
+ 
+-  // Compute conversation statistics from messages and token history
+   const conversationStats = useMemo(() => {
+     const countWords = (text) => text ? text.trim().split(/\s+/).filter(Boolean).length : 0
+ 
+@@ -371,7 +406,6 @@ export default function App() {
+     }
+   }, [messages, tokenUsageHistory])
+ 
+-  // Send message
+   const handleSend = useCallback(() => {
+     const text = inputValue.trim()
+     if (!text || !selectedModel) return
+@@ -384,19 +418,16 @@ export default function App() {
+     setLlmStatus({ stage: 'initiated' })
+     streamBufferRef.current = ''
+     responseStartRef.current = Date.now()
+-    userScrolledRef.current = false  // Reset scroll on new message
++    userScrolledRef.current = false
+ 
+-    // Build message history for the API
+     const apiMessages = newMessages.map((m) => ({
+       role: m.role,
+       content: m.content,
+     }))
+ 
+-    // Track tool events for the current response
+     const toolCalls = []
+     const toolResults = []
+ 
+-    // Save reference to current conversation id
+     let currentConvId = activeConversationId
+ 
+     sendMessage(
+@@ -409,8 +440,6 @@ export default function App() {
+       async (event) => {
+         switch (event.type) {
+           case 'status':
+-            // Backend-emitted lifecycle marker (e.g. "initiated"). The
+-            // remaining stages are inferred from text/tool events below.
+             if (event.stage) {
+               setLlmStatus({ stage: event.stage })
+             }
+@@ -441,13 +470,10 @@ export default function App() {
+               return updated
+             })
+             setIsTyping(false)
+-            // A <think>…</think> block that hasn't closed yet means the
+-            // model is still mid-reasoning. Anything else counts as the
+-            // visible response.
+             {
+               const buf = streamBufferRef.current
+-              const lastOpen = Math.max(buf.lastIndexOf('<think>'), buf.lastIndexOf('<thinking>'))
+-              const lastClose = Math.max(buf.lastIndexOf('</think>'), buf.lastIndexOf('</thinking>'))
++              const lastOpen = Math.max(buf.lastIndexOf('<thinking>'), buf.lastIndexOf('<thinking>'))
++              const lastClose = Math.max(buf.lastIndexOf('</thinking>'), buf.lastIndexOf('</thinking>'))
+               const inThink = lastOpen > lastClose
+               setLlmStatus({ stage: inThink ? 'thinking' : 'responding' })
+             }
+@@ -498,15 +524,6 @@ export default function App() {
+               }
+               return updated
+             })
+-            // Note: do NOT reset streamBufferRef here. The agentic loop
+-            // sends another round of streamed text after this tool call,
+-            // and that text needs to *append* to the prior round (whose
+-            // thinking block we want to keep visible). Resetting would
+-            // overwrite the message content and erase that earlier
+-            // thinking. The buffer is reset at the start of each new
+-            // user turn (in handleSend) instead.
+-
+-            // Auto-open canvas panel for graph plots
+             try {
+               const parsed = JSON.parse(event.result)
+               if (parsed && parsed.plot_image) {
+@@ -528,7 +545,6 @@ export default function App() {
+           case 'done':
+             setIsTyping(false)
+             setLlmStatus({ stage: 'idle' })
+-            // Freeze the response timer on the last assistant message.
+             {
+               const start = responseStartRef.current
+               if (start) {
+@@ -548,7 +564,6 @@ export default function App() {
+               }
+               responseStartRef.current = null
+             }
+-            // Track token usage if provided
+             if (event.usage) {
+               setTokenUsageHistory((prev) => {
+                 const updated = [...prev, event.usage]
+@@ -556,7 +571,6 @@ export default function App() {
+                 return updated
+               })
+             }
+-            // Compute last response stats from the streamed content
+             {
+               const lastWords = streamBufferRef.current
+                 ? streamBufferRef.current.trim().split(/\s+/).filter(Boolean).length
+@@ -569,9 +583,7 @@ export default function App() {
+                 promptTokens: lastPromptTokens,
+               })
+             }
+-            // Auto-save conversation when response is complete
+             setMessages((prev) => {
+-              // Use a timeout to ensure state is settled
+               setTimeout(async () => {
+                 const savedId = await persistConversation(prev, currentConvId, tokenUsageRef.current)
+                 if (savedId && !currentConvId) {
+@@ -591,7 +603,7 @@ export default function App() {
+               ...prev,
+               {
+                 role: 'assistant',
+-                content: `\u26a0\ufe0f ${event.content}`,
++                content: `⚠️ ${event.content}`,
+               },
+             ])
+             break
+@@ -600,7 +612,6 @@ export default function App() {
+     )
+   }, [inputValue, messages, selectedModel, selectedTools, selectedFiles, sendMessage, activeConversationId, persistConversation])
+ 
+-  // New chat
+   const handleNewChat = () => {
+     setMessages([])
+     setActiveConversationId(null)
+@@ -613,9 +624,26 @@ export default function App() {
+     setLlmStatus({ stage: 'idle' })
+   }
+ 
++  if (!authChecked) {
++    return (
++      <div className="splash-screen">
++        <div className="splash-content">
++          <div style={{ fontSize: 14, color: 'var(--text-secondary)' }}>Loading…</div>
++        </div>
++      </div>
++    )
++  }
++
++  if (!user) {
++    return <SignInScreen onSignIn={(u) => { setUser(u); connect(); loadData(); }} />
++  }
++
++  if (showSplash) {
++    return <SplashScreen user={user} onStart={() => setShowSplash(false)} onLogout={handleLogout} />
++  }
++
+   return (
+     <div className="app-layout">
+-      {showSplash && <SplashScreen onStart={dismissSplash} />}
+       <Sidebar
+         models={models}
+         selectedModel={selectedModel}
+@@ -625,6 +653,8 @@ export default function App() {
+         onToggleTool={toggleTool}
+         mcpServers={mcpServers}
+         onReconnectMCP={handleReconnectMCP}
++        onAddMCP={() => setShowMcpDiscovery(true)}
++        onRemoveMCP={handleRemoveMCP}
+         files={files}
+         selectedFiles={selectedFiles}
+         onToggleFile={toggleFile}
+@@ -638,6 +668,8 @@ export default function App() {
+         onNewChat={handleNewChat}
+         isOpen={sidebarOpen}
+         onClose={() => setSidebarOpen(false)}
++        user={user}
++        onOpenAdmin={() => setShowAdmin(true)}
+       />
+ 
+       <div className="main-content">
+@@ -655,12 +687,63 @@ export default function App() {
+               <span className="header-model-badge">{selectedModel}</span>
+             )}
+           </div>
+-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: isConnected ? 'var(--success)' : 'var(--error)', fontSize: 12 }}>
+-            {isConnected ? <Wifi size={14} /> : <WifiOff size={14} />}
+-            {isConnected ? 'Connected' : 'Disconnected'}
++          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
++            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: isConnected ? 'var(--success)' : 'var(--error)', fontSize: 12 }}>
++              {isConnected ? <Wifi size={14} /> : <WifiOff size={14} />}
++              {isConnected ? 'Connected' : 'Disconnected'}
++            </div>
++            <button
++              className="sidebar-toggle"
++              onClick={() => setShowAccount((v) => !v)}
++              title="Account"
++              style={{ display: 'flex' }}
++            >
++              <UserCircle size={18} />
++            </button>
++            <button
++              className="sidebar-toggle"
++              onClick={handleLogout}
++              title="Log out"
++              style={{ display: 'flex' }}
++            >
++              <LogOut size={18} />
++            </button>
+           </div>
+         </div>
+ 
++        {showAccount && (
++          <AccountPopup user={user} onClose={() => setShowAccount(false)} onLogout={handleLogout} />
++        )}
++
++        {showAdmin && (
++          <div
++            style={{
++              position: 'absolute',
++              top: 52,
++              left: 12,
++              width: 360,
++              background: 'var(--bg-panel)',
++              border: '1px solid var(--border)',
++              borderRadius: 12,
++              boxShadow: '0 8px 24px rgba(0,0,0,0.12)',
++              zIndex: 200,
++              padding: 16,
++            }}
++          >
++            <AdminPanel onClose={() => setShowAdmin(false)} onLogout={handleLogout} />
++          </div>
++        )}
++
++        {showMcpDiscovery && (
++          <MCPDiscoveryPanel
++            onClose={() => setShowMcpDiscovery(false)}
++            onAdded={() => {
++              setShowMcpDiscovery(false)
++              loadData()
++            }}
++          />
++        )}
++
+         {/* Chat Area */}
+         <div className="chat-area" ref={chatAreaRef}>
+           <div className="chat-container">
+diff --git a/frontend/src/components/AccountPopup.jsx b/frontend/src/components/AccountPopup.jsx
+new file mode 100644
+index 0000000..39e9fbc
+--- /dev/null
++++ b/frontend/src/components/AccountPopup.jsx
+@@ -0,0 +1,223 @@
++import React, { useState, useEffect, useRef } from 'react'
++import { X, KeyRound, Trash2, AlertTriangle, LogOut } from 'lucide-react'
++
++export default function AccountPopup({ user, onClose, onLogout }) {
++  const [tab, setTab] = useState('info')
++  const [currentPassword, setCurrentPassword] = useState('')
++  const [newPassword, setNewPassword] = useState('')
++  const [confirmPassword, setConfirmPassword] = useState('')
++  const [deletePassword, setDeletePassword] = useState('')
++  const [error, setError] = useState('')
++  const [success, setSuccess] = useState('')
++  const [isLoading, setIsLoading] = useState(false)
++  const popupRef = useRef(null)
++
++  useEffect(() => {
++    const handleClickOutside = (e) => {
++      if (popupRef.current && !popupRef.current.contains(e.target)) {
++        onClose()
++      }
++    }
++    const handleEsc = (e) => {
++      if (e.key === 'Escape') onClose()
++    }
++    document.addEventListener('mousedown', handleClickOutside)
++    document.addEventListener('keydown', handleEsc)
++    return () => {
++      document.removeEventListener('mousedown', handleClickOutside)
++      document.removeEventListener('keydown', handleEsc)
++    }
++  }, [onClose])
++
++  const handleChangePassword = async (e) => {
++    e.preventDefault()
++    setError('')
++    setSuccess('')
++    if (newPassword !== confirmPassword) {
++      setError('New passwords do not match')
++      return
++    }
++    if (newPassword.length < 4) {
++      setError('Password must be at least 4 characters')
++      return
++    }
++    setIsLoading(true)
++    try {
++      const token = localStorage.getItem('nexus_token')
++      const res = await fetch('/api/auth/change-password', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
++        body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
++      })
++      if (!res.ok) {
++        const data = await res.json()
++        setError(data.detail || 'Failed to change password')
++      } else {
++        setSuccess('Password changed successfully')
++        setCurrentPassword('')
++        setNewPassword('')
++        setConfirmPassword('')
++      }
++    } catch {
++      setError('Network error')
++    } finally {
++      setIsLoading(false)
++    }
++  }
++
++  const handleDeleteAccount = async (e) => {
++    e.preventDefault()
++    setError('')
++    if (!window.confirm('Are you sure you want to permanently delete your account and all conversations?')) {
++      return
++    }
++    setIsLoading(true)
++    try {
++      const token = localStorage.getItem('nexus_token')
++      const res = await fetch('/api/auth/account', {
++        method: 'DELETE',
++        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
++        body: JSON.stringify({ password: deletePassword }),
++      })
++      if (!res.ok) {
++        const data = await res.json()
++        setError(data.detail || 'Failed to delete account')
++      } else {
++        onLogout()
++      }
++    } catch {
++      setError('Network error')
++    } finally {
++      setIsLoading(false)
++    }
++  }
++
++  return (
++    <div
++      ref={popupRef}
++      style={{
++        position: 'absolute',
++        top: 52,
++        right: 12,
++        width: 320,
++        background: 'var(--bg-panel)',
++        border: '1px solid var(--border)',
++        borderRadius: 12,
++        boxShadow: '0 8px 24px rgba(0,0,0,0.12)',
++        zIndex: 200,
++        padding: 16,
++      }}
++    >
++      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
++        <h3 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Account</h3>
++        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
++          <button
++            className="sidebar-toggle"
++            onClick={onLogout}
++            title="Log out"
++            style={{ color: 'var(--error)' }}
++          >
++            <LogOut size={16} />
++          </button>
++          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
++            <X size={16} />
++          </button>
++        </div>
++      </div>
++
++      <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
++        <button
++          className={`thread-item ${tab === 'info' ? 'active' : ''}`}
++          onClick={() => { setTab('info'); setError(''); setSuccess('') }}
++          style={{ flex: 1, justifyContent: 'center', fontSize: 12 }}
++        >
++          Info
++        </button>
++        <button
++          className={`thread-item ${tab === 'password' ? 'active' : ''}`}
++          onClick={() => { setTab('password'); setError(''); setSuccess('') }}
++          style={{ flex: 1, justifyContent: 'center', fontSize: 12 }}
++        >
++          <KeyRound size={12} style={{ marginRight: 4 }} />
++          Password
++        </button>
++        <button
++          className={`thread-item ${tab === 'delete' ? 'active' : ''}`}
++          onClick={() => { setTab('delete'); setError(''); setSuccess('') }}
++          style={{ flex: 1, justifyContent: 'center', fontSize: 12, color: 'var(--error)' }}
++        >
++          <Trash2 size={12} style={{ marginRight: 4 }} />
++          Delete
++        </button>
++      </div>
++
++      {tab === 'info' && (
++        <div>
++          <div style={{ fontSize: 14, marginBottom: 4 }}>
++            <strong>Username:</strong> {user.username}
++          </div>
++          <div style={{ fontSize: 14, color: 'var(--text-secondary)' }}>
++            <strong>Role:</strong> {user.is_admin ? 'Administrator' : 'User'}
++          </div>
++        </div>
++      )}
++
++      {tab === 'password' && (
++        <form onSubmit={handleChangePassword}>
++          <input
++            type="password"
++            placeholder="Current password"
++            value={currentPassword}
++            onChange={(e) => setCurrentPassword(e.target.value)}
++            className="chat-input-field"
++            style={{ width: '100%', marginBottom: 8, padding: '8px 10px', borderRadius: 6, border: '1px solid var(--border)', fontSize: 13 }}
++          />
++          <input
++            type="password"
++            placeholder="New password"
++            value={newPassword}
++            onChange={(e) => setNewPassword(e.target.value)}
++            className="chat-input-field"
++            style={{ width: '100%', marginBottom: 8, padding: '8px 10px', borderRadius: 6, border: '1px solid var(--border)', fontSize: 13 }}
++          />
++          <input
++            type="password"
++            placeholder="Confirm new password"
++            value={confirmPassword}
++            onChange={(e) => setConfirmPassword(e.target.value)}
++            className="chat-input-field"
++            style={{ width: '100%', marginBottom: 8, padding: '8px 10px', borderRadius: 6, border: '1px solid var(--border)', fontSize: 13 }}
++          />
++          {error && <div style={{ color: 'var(--error)', fontSize: 12, marginBottom: 8 }}>{error}</div>}
++          {success && <div style={{ color: 'var(--success)', fontSize: 12, marginBottom: 8 }}>{success}</div>}
++          <button type="submit" className="splash-start-btn" disabled={isLoading} style={{ width: '100%', fontSize: 13 }}>
++            <KeyRound size={14} />
++            {isLoading ? 'Updating…' : 'Change Password'}
++          </button>
++        </form>
++      )}
++
++      {tab === 'delete' && (
++        <form onSubmit={handleDeleteAccount}>
++          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, color: 'var(--error)', fontSize: 13 }}>
++            <AlertTriangle size={14} />
++            This action cannot be undone.
++          </div>
++          <input
++            type="password"
++            placeholder="Enter your password to confirm"
++            value={deletePassword}
++            onChange={(e) => setDeletePassword(e.target.value)}
++            className="chat-input-field"
++            style={{ width: '100%', marginBottom: 8, padding: '8px 10px', borderRadius: 6, border: '1px solid var(--border)', fontSize: 13 }}
++          />
++          {error && <div style={{ color: 'var(--error)', fontSize: 12, marginBottom: 8 }}>{error}</div>}
++          <button type="submit" className="splash-start-btn" disabled={isLoading} style={{ width: '100%', fontSize: 13, background: 'var(--error)', borderColor: 'var(--error)' }}>
++            <Trash2 size={14} />
++            {isLoading ? 'Deleting…' : 'Delete My Account'}
++          </button>
++        </form>
++      )}
++    </div>
++  )
++}
+diff --git a/frontend/src/components/AdminPanel.jsx b/frontend/src/components/AdminPanel.jsx
+new file mode 100644
+index 0000000..5933966
+--- /dev/null
++++ b/frontend/src/components/AdminPanel.jsx
+@@ -0,0 +1,161 @@
++import React, { useState, useEffect } from 'react'
++import { X, Plus, Trash2, Shield, Users, LogOut } from 'lucide-react'
++
++export default function AdminPanel({ onClose, onLogout }) {
++  const [users, setUsers] = useState([])
++  const [newUsername, setNewUsername] = useState('')
++  const [newPassword, setNewPassword] = useState('')
++  const [newIsAdmin, setNewIsAdmin] = useState(false)
++  const [error, setError] = useState('')
++  const [isLoading, setIsLoading] = useState(false)
++
++  const token = localStorage.getItem('nexus_token')
++
++  const loadUsers = async () => {
++    try {
++      const res = await fetch('/api/admin/users', {
++        headers: { 'Authorization': `Bearer ${token}` },
++      })
++      if (!res.ok) throw new Error('Failed to load users')
++      const data = await res.json()
++      setUsers(data.users || [])
++    } catch (err) {
++      console.error(err)
++    }
++  }
++
++  useEffect(() => {
++    loadUsers()
++  }, [])
++
++  const handleCreate = async (e) => {
++    e.preventDefault()
++    setError('')
++    setIsLoading(true)
++    try {
++      const res = await fetch('/api/admin/users', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
++        body: JSON.stringify({ username: newUsername, password: newPassword, is_admin: newIsAdmin }),
++      })
++      const data = await res.json()
++      if (!res.ok) {
++        setError(data.detail || 'Failed to create user')
++      } else {
++        setNewUsername('')
++        setNewPassword('')
++        setNewIsAdmin(false)
++        await loadUsers()
++      }
++    } catch {
++      setError('Network error')
++    } finally {
++      setIsLoading(false)
++    }
++  }
++
++  const handleDelete = async (username) => {
++    if (!window.confirm(`Delete user "${username}" and all their conversations?`)) return
++    try {
++      const res = await fetch(`/api/admin/users/${encodeURIComponent(username)}`, {
++        method: 'DELETE',
++        headers: { 'Authorization': `Bearer ${token}` },
++      })
++      if (!res.ok) {
++        const data = await res.json()
++        alert(data.detail || 'Failed to delete user')
++      } else {
++        await loadUsers()
++      }
++    } catch {
++      alert('Network error')
++    }
++  }
++
++  return (
++    <div style={{ padding: '8px 0' }}>
++      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
++        <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6 }}>
++          <Users size={16} />
++          Admin Panel
++        </h3>
++        <div style={{ display: 'flex', gap: 6 }}>
++          <button
++            className="splash-start-btn"
++            style={{ fontSize: 12, padding: '4px 8px' }}
++            onClick={onLogout}
++          >
++            <LogOut size={12} />
++            Log Out
++          </button>
++          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
++            <X size={16} />
++          </button>
++        </div>
++      </div>
++
++      <form onSubmit={handleCreate} style={{ marginBottom: 16 }}>
++        <div style={{ display: 'flex', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
++          <input
++            type="text"
++            placeholder="Username"
++            value={newUsername}
++            onChange={(e) => setNewUsername(e.target.value)}
++            className="chat-input-field"
++            style={{ flex: 1, minWidth: 100, padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', fontSize: 13 }}
++          />
++          <input
++            type="password"
++            placeholder="Password"
++            value={newPassword}
++            onChange={(e) => setNewPassword(e.target.value)}
++            className="chat-input-field"
++            style={{ flex: 1, minWidth: 100, padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', fontSize: 13 }}
++          />
++          <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, cursor: 'pointer' }}>
++            <input type="checkbox" checked={newIsAdmin} onChange={(e) => setNewIsAdmin(e.target.checked)} />
++            Admin
++          </label>
++          <button type="submit" className="splash-start-btn" disabled={isLoading || !newUsername || !newPassword} style={{ fontSize: 12, padding: '6px 10px' }}>
++            <Plus size={13} />
++            Create
++          </button>
++        </div>
++        {error && <div style={{ color: 'var(--error)', fontSize: 12 }}>{error}</div>}
++      </form>
++
++      <div style={{ maxHeight: 240, overflowY: 'auto' }}>
++        {users.map((u) => (
++          <div
++            key={u.username}
++            style={{
++              display: 'flex',
++              alignItems: 'center',
++              justifyContent: 'space-between',
++              padding: '6px 8px',
++              borderRadius: 6,
++              fontSize: 13,
++              borderBottom: '1px solid var(--border-subtle)',
++            }}
++          >
++            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
++              {u.is_admin && <Shield size={12} style={{ color: 'var(--accent)' }} />}
++              <span style={{ fontWeight: 500 }}>{u.username}</span>
++              {u.is_admin && <span style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>(admin)</span>}
++            </div>
++            <button
++              onClick={() => handleDelete(u.username)}
++              style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--error)', padding: 2 }}
++              title="Delete user"
++            >
++              <Trash2 size={12} />
++            </button>
++          </div>
++        ))}
++        {users.length === 0 && (
++          <div style={{ fontSize: 12, color: 'var(--text-tertiary)', padding: '8px 0' }}>No users found</div>
++        )}
++      </div>
++    </div>
++  )
++}
+diff --git a/frontend/src/components/MCPDiscoveryPanel.jsx b/frontend/src/components/MCPDiscoveryPanel.jsx
+new file mode 100644
+index 0000000..d9b6b19
+--- /dev/null
++++ b/frontend/src/components/MCPDiscoveryPanel.jsx
+@@ -0,0 +1,198 @@
++import React, { useState, useEffect, useRef } from 'react'
++import { X, Plus, Server, Wrench, Loader2, AlertCircle } from 'lucide-react'
++import { discoverMCPServer, addMCPServer } from '../hooks/api'
++
++export default function MCPDiscoveryPanel({ onClose, onAdded }) {
++  const [url, setUrl] = useState('')
++  const [isDiscovering, setIsDiscovering] = useState(false)
++  const [discovered, setDiscovered] = useState(null)
++  const [error, setError] = useState('')
++  const [isAdding, setIsAdding] = useState(false)
++  const panelRef = useRef(null)
++
++  useEffect(() => {
++    const handleEsc = (e) => {
++      if (e.key === 'Escape') onClose()
++    }
++    document.addEventListener('keydown', handleEsc)
++    return () => document.removeEventListener('keydown', handleEsc)
++  }, [onClose])
++
++  const handleDiscover = async (e) => {
++    e.preventDefault()
++    setError('')
++    setDiscovered(null)
++    if (!url.trim()) {
++      setError('Please enter a server URL')
++      return
++    }
++    setIsDiscovering(true)
++    try {
++      const data = await discoverMCPServer(url.trim())
++      setDiscovered(data)
++    } catch (err) {
++      setError(err.message || 'Discovery failed')
++    } finally {
++      setIsDiscovering(false)
++    }
++  }
++
++  const handleAdd = async () => {
++    if (!discovered) return
++    setIsAdding(true)
++    try {
++      const cfg = {
++        url: discovered.server.url,
++        name: discovered.server.name,
++        description: discovered.server.description,
++        icon: discovered.server.icon,
++        timeout: 30,
++      }
++      await addMCPServer(cfg)
++      onAdded()
++      onClose()
++    } catch (err) {
++      setError(err.message || 'Failed to add server')
++    } finally {
++      setIsAdding(false)
++    }
++  }
++
++  return (
++    <div
++      style={{
++        position: 'fixed',
++        inset: 0,
++        background: 'rgba(0,0,0,0.4)',
++        display: 'flex',
++        alignItems: 'center',
++        justifyContent: 'center',
++        zIndex: 300,
++      }}
++      onClick={(e) => {
++        if (e.target === e.currentTarget) onClose()
++      }}
++    >
++      <div
++        ref={panelRef}
++        style={{
++          width: 420,
++          maxWidth: '90vw',
++          background: 'var(--bg-panel)',
++          border: '1px solid var(--border)',
++          borderRadius: 12,
++          boxShadow: '0 8px 24px rgba(0,0,0,0.12)',
++          padding: 20,
++        }}
++      >
++        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
++          <h3 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Add MCP Server</h3>
++          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
++            <X size={18} />
++          </button>
++        </div>
++
++        <form onSubmit={handleDiscover}>
++          <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
++            <input
++              type="text"
++              placeholder="http://192.168.x.x:port_number"
++              value={url}
++              onChange={(e) => setUrl(e.target.value)}
++              className="chat-input-field"
++              style={{ flex: 1, padding: '8px 10px', borderRadius: 6, border: '1px solid var(--border)', fontSize: 13 }}
++            />
++            <button
++              type="submit"
++              className="splash-start-btn"
++              disabled={isDiscovering}
++              style={{ fontSize: 13, padding: '8px 12px' }}
++            >
++              {isDiscovering ? <Loader2 size={14} className="spin" /> : <Server size={14} />}
++              {isDiscovering ? 'Discovering…' : 'Discover'}
++            </button>
++          </div>
++        </form>
++
++        {error && (
++          <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--error)', fontSize: 13, marginBottom: 12 }}>
++            <AlertCircle size={14} />
++            {error}
++          </div>
++        )}
++
++        {discovered && (
++          <div style={{ marginTop: 8 }}>
++            <div
++              style={{
++                display: 'flex',
++                alignItems: 'center',
++                gap: 8,
++                padding: '10px 12px',
++                background: 'var(--bg-subtle)',
++                borderRadius: 8,
++                marginBottom: 12,
++              }}
++            >
++              <Server size={16} style={{ opacity: 0.7 }} />
++              <div style={{ flex: 1 }}>
++                <div style={{ fontWeight: 500, fontSize: 13 }}>{discovered.server.name}</div>
++                <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{discovered.server.description || discovered.server.url}</div>
++              </div>
++              <span
++                style={{
++                  width: 8,
++                  height: 8,
++                  borderRadius: '50%',
++                  background: 'var(--success)',
++                  display: 'inline-block',
++                }}
++                title="Connected"
++              />
++            </div>
++
++            {discovered.tools.length > 0 && (
++              <div style={{ marginBottom: 12 }}>
++                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: 0.5 }}>
++                  Discovered Tools
++                </div>
++                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
++                  {discovered.tools.map((tool) => (
++                    <div
++                      key={tool.name}
++                      style={{
++                        display: 'flex',
++                        alignItems: 'center',
++                        gap: 6,
++                        padding: '4px 8px',
++                        fontSize: 12,
++                        background: 'var(--bg-subtle)',
++                        borderRadius: 4,
++                      }}
++                    >
++                      <Wrench size={12} style={{ opacity: 0.5 }} />
++                      <span style={{ fontWeight: 500 }}>{tool.name}</span>
++                      {tool.description && (
++                        <span style={{ color: 'var(--text-secondary)', marginLeft: 4 }}>{tool.description}</span>
++                      )}
++                    </div>
++                  ))}
++                </div>
++              </div>
++            )}
++
++            <button
++              className="splash-start-btn"
++              onClick={handleAdd}
++              disabled={isAdding}
++              style={{ width: '100%', fontSize: 13 }}
++            >
++              <Plus size={14} />
++              {isAdding ? 'Adding…' : 'Add Server'}
++            </button>
++          </div>
++        )}
++      </div>
++    </div>
++  )
++}
+diff --git a/frontend/src/components/Sidebar.jsx b/frontend/src/components/Sidebar.jsx
+index 560b084..a772996 100644
+--- a/frontend/src/components/Sidebar.jsx
++++ b/frontend/src/components/Sidebar.jsx
+@@ -3,7 +3,7 @@ import {
+   Check, Calculator, Search, Code2, Clock, FileText,
+   Wrench, Trash2, Paperclip, MessageSquarePlus,
+   Database, Server, RefreshCw, ChevronDown, ChevronRight, Image,
+-  MessageCircle, BarChart3, Eye,
++  MessageCircle, BarChart3, Eye, Shield,
+ } from 'lucide-react'
+ import NexusLogoIcon from './NexusLogoIcon'
+ 
+@@ -109,6 +109,8 @@ export default function Sidebar({
+   onToggleTool,
+   mcpServers,
+   onReconnectMCP,
++  onAddMCP,
++  onRemoveMCP,
+   files,
+   selectedFiles,
+   onToggleFile,
+@@ -122,6 +124,8 @@ export default function Sidebar({
+   onNewChat,
+   isOpen,
+   onClose,
++  user,
++  onOpenAdmin,
+ }) {
+   const fileInputRef = React.useRef(null)
+ 
+@@ -245,6 +249,19 @@ export default function Sidebar({
+           </select>
+         </div>
+ 
++        {user?.is_admin && (
++          <div style={{ padding: '8px 16px', borderTop: '1px solid var(--border-subtle)' }}>
++            <button
++              className="new-chat-btn"
++              style={{ width: '100%', margin: 0, fontSize: 13 }}
++              onClick={onOpenAdmin}
++            >
++              <Shield size={14} />
++              Admin Panel
++            </button>
++          </div>
++        )}
++
+         <div className="sidebar-body">
+           {/* Built-in Tools */}
+           <AccordionSection
+@@ -276,103 +293,128 @@ export default function Sidebar({
+           </AccordionSection>
+ 
+           {/* MCP Servers */}
+-          {mcpServers && mcpServers.length > 0 && (
+-            <AccordionSection
+-              label="MCP Servers"
+-              count={mcpToolCount}
+-              isOpen={openSection === 'mcp'}
+-              onToggle={() => toggleSection('mcp')}
+-            >
+-              {mcpServers.map((srv) => {
+-                const mcpTools = tools.filter(
+-                  (t) => t.source === 'mcp' && t.server === srv.id
+-                )
+-                const allSelected = mcpTools.length > 0 && mcpTools.every((t) => selectedTools.includes(t.id))
+-                const someSelected = mcpTools.some((t) => selectedTools.includes(t.id))
+-                return (
+-                  <div key={srv.id} style={{ marginBottom: 4 }}>
++          <AccordionSection
++            label="MCP Servers"
++            count={mcpToolCount}
++            isOpen={openSection === 'mcp'}
++            onToggle={() => toggleSection('mcp')}
++          >
++            <div style={{ padding: '4px 16px', marginBottom: 4 }}>
++              <button
++                className="thread-item"
++                style={{ width: '100%', justifyContent: 'center', fontSize: 12 }}
++                onClick={onAddMCP}
++                title="Add MCP server"
++              >
++                <Plus size={13} style={{ marginRight: 4 }} />
++                Add Server
++              </button>
++            </div>
++            {mcpServers.map((srv) => {
++              const mcpTools = tools.filter(
++                (t) => t.source === 'mcp' && t.server === srv.id
++              )
++              const allSelected = mcpTools.length > 0 && mcpTools.every((t) => selectedTools.includes(t.id))
++              const someSelected = mcpTools.some((t) => selectedTools.includes(t.id))
++              return (
++                <div key={srv.id} style={{ marginBottom: 4 }}>
++                  <div
++                    style={{
++                      display: 'flex',
++                      alignItems: 'center',
++                      gap: 6,
++                      padding: '4px 16px',
++                      fontSize: 12,
++                    }}
++                  >
+                     <div
++                      className={`toggle-check ${allSelected ? 'active' : ''} ${someSelected && !allSelected ? 'partial' : ''}`}
++                      style={{ cursor: 'pointer' }}
++                      onClick={() => {
++                        const toolIds = mcpTools.map((t) => t.id)
++                        if (allSelected) {
++                          // Deselect all tools from this server
++                          toolIds.forEach((id) => onToggleTool(id))
++                        } else {
++                          // Select all tools from this server
++                          toolIds.forEach((id) => {
++                            if (!selectedTools.includes(id)) onToggleTool(id)
++                          })
++                        }
++                      }}
++                      title={allSelected ? 'Deselect all' : 'Select all'}
++                    >
++                      {allSelected && <Check size={11} color="#fff" strokeWidth={3} />}
++                      {someSelected && !allSelected && <span style={{ color: '#fff', fontSize: 10, fontWeight: 700 }}>–</span>}
++                    </div>
++                    <Server size={13} style={{ opacity: 0.6 }} />
++                    <span style={{ fontWeight: 500, flex: 1 }}>{srv.name}</span>
++                    <span
+                       style={{
+-                        display: 'flex',
+-                        alignItems: 'center',
+-                        gap: 6,
+-                        padding: '4px 16px',
+-                        fontSize: 12,
++                        width: 7,
++                        height: 7,
++                        borderRadius: '50%',
++                        background: srv.connected ? 'var(--success)' : 'var(--error)',
++                        display: 'inline-block',
+                       }}
++                      title={srv.connected ? 'Connected' : 'Disconnected'}
++                    />
++                    {!srv.connected && (
++                      <button
++                        style={{
++                          background: 'none',
++                          border: 'none',
++                          cursor: 'pointer',
++                          color: 'var(--text-tertiary)',
++                          padding: 2,
++                        }}
++                        onClick={() => onReconnectMCP(srv.id)}
++                        title="Reconnect"
++                      >
++                        <RefreshCw size={12} />
++                      </button>
++                    )}
++                    <button
++                      style={{
++                        background: 'none',
++                        border: 'none',
++                        cursor: 'pointer',
++                        color: 'var(--error)',
++                        padding: 2,
++                      }}
++                      onClick={(e) => {
++                        e.stopPropagation()
++                        onRemoveMCP(srv.id)
++                      }}
++                      title="Remove server"
+                     >
++                      <Trash2 size={12} />
++                    </button>
++                  </div>
++                  {mcpTools.map((tool) => {
++                    const active = selectedTools.includes(tool.id)
++                    const Icon = ICON_MAP[tool.icon] || Database
++                    return (
+                       <div
+-                        className={`toggle-check ${allSelected ? 'active' : ''} ${someSelected && !allSelected ? 'partial' : ''}`}
+-                        style={{ cursor: 'pointer' }}
+-                        onClick={() => {
+-                          const toolIds = mcpTools.map((t) => t.id)
+-                          if (allSelected) {
+-                            // Deselect all tools from this server
+-                            toolIds.forEach((id) => onToggleTool(id))
+-                          } else {
+-                            // Select all tools from this server
+-                            toolIds.forEach((id) => {
+-                              if (!selectedTools.includes(id)) onToggleTool(id)
+-                            })
+-                          }
+-                        }}
+-                        title={allSelected ? 'Deselect all' : 'Select all'}
++                        key={tool.id}
++                        className="toggle-item"
++                        onClick={() => onToggleTool(tool.id)}
+                       >
+-                        {allSelected && <Check size={11} color="#fff" strokeWidth={3} />}
+-                        {someSelected && !allSelected && <span style={{ color: '#fff', fontSize: 10, fontWeight: 700 }}>–</span>}
+-                      </div>
+-                      <Server size={13} style={{ opacity: 0.6 }} />
+-                      <span style={{ fontWeight: 500, flex: 1 }}>{srv.name}</span>
+-                      <span
+-                        style={{
+-                          width: 7,
+-                          height: 7,
+-                          borderRadius: '50%',
+-                          background: srv.connected ? 'var(--success)' : 'var(--error)',
+-                          display: 'inline-block',
+-                        }}
+-                        title={srv.connected ? 'Connected' : 'Disconnected'}
+-                      />
+-                      {!srv.connected && (
+-                        <button
+-                          style={{
+-                            background: 'none',
+-                            border: 'none',
+-                            cursor: 'pointer',
+-                            color: 'var(--text-tertiary)',
+-                            padding: 2,
+-                          }}
+-                          onClick={() => onReconnectMCP(srv.id)}
+-                          title="Reconnect"
+-                        >
+-                          <RefreshCw size={12} />
+-                        </button>
+-                      )}
+-                    </div>
+-                    {mcpTools.map((tool) => {
+-                      const active = selectedTools.includes(tool.id)
+-                      const Icon = ICON_MAP[tool.icon] || Database
+-                      return (
+-                        <div
+-                          key={tool.id}
+-                          className="toggle-item"
+-                          onClick={() => onToggleTool(tool.id)}
+-                        >
+-                          <div className={`toggle-check ${active ? 'active' : ''}`}>
+-                            {active && <Check size={11} color="#fff" strokeWidth={3} />}
+-                          </div>
+-                          <Icon size={15} className="toggle-icon" />
+-                          <div className="toggle-text">
+-                            <div className="toggle-label">{tool.name}</div>
+-                            <ToolDescription text={tool.description} />
+-                          </div>
++                        <div className={`toggle-check ${active ? 'active' : ''}`}>
++                          {active && <Check size={11} color="#fff" strokeWidth={3} />}
+                         </div>
+-                      )
+-                    })}
+-                  </div>
+-                )
+-              })}
+-            </AccordionSection>
+-          )}
++                        <Icon size={15} className="toggle-icon" />
++                        <div className="toggle-text">
++                          <div className="toggle-label">{tool.name}</div>
++                          <ToolDescription text={tool.description} />
++                        </div>
++                      </div>
++                    )
++                  })}
++                </div>
++              )
++            })}
++          </AccordionSection>
+ 
+           {/* Files */}
+           <AccordionSection
+diff --git a/frontend/src/components/SignInScreen.jsx b/frontend/src/components/SignInScreen.jsx
+new file mode 100644
+index 0000000..80bf4a2
+--- /dev/null
++++ b/frontend/src/components/SignInScreen.jsx
+@@ -0,0 +1,178 @@
++import React, { useState } from 'react'
++import { ArrowRight, LogIn } from 'lucide-react'
++
++export default function SignInScreen({ onSignIn }) {
++  const [username, setUsername] = useState('')
++  const [password, setPassword] = useState('')
++  const [error, setError] = useState('')
++  const [isLoading, setIsLoading] = useState(false)
++
++  const handleSubmit = async (e) => {
++    e.preventDefault()
++    setError('')
++    setIsLoading(true)
++    try {
++      const res = await fetch('/api/auth/login', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ username, password }),
++      })
++      const data = await res.json()
++      if (!res.ok) {
++        setError(data.detail || 'Login failed')
++        return
++      }
++      localStorage.setItem('nexus_token', data.token)
++      localStorage.setItem('nexus_user', JSON.stringify(data.user))
++      onSignIn(data.user)
++    } catch (err) {
++      setError('Network error')
++    } finally {
++      setIsLoading(false)
++    }
++  }
++
++  return (
++    <div className="splash-screen">
++      <div className="splash-content">
++        <div className="splash-logo-shine">
++          <svg
++            className="splash-logo-svg"
++            viewBox="0 0 680 490"
++            xmlns="http://www.w3.org/2000/svg"
++            aria-label="Nexus Chat animated logo"
++          >
++            <title>Nexus Chat animated logo</title>
++            <desc>Animated logo with tighter spacing between icon and text.</desc>
++
++            <g transform="translate(340, 155)">
++              {/* Bubble */}
++              <path
++                className="bubble-bg"
++                d="
++                  M-100,-95
++                  L80,-95
++                  Q100,-95 100,-75
++                  L100,55
++                  Q100,75 80,75
++                  L-15,75
++                  L-48,112
++                  L-36,75
++                  L-80,75
++                  Q-100,75 -100,55
++                  L-100,-75
++                  Q-100,-95 -80,-95
++                  Z
++                "
++                fill="#5a8a7a"
++              />
++
++              {/* Connection lines */}
++              <g>
++                <line className="conn-line" x1="-60" y1="-50" x2="0" y2="10" stroke="#89b5a6" strokeWidth="2.8" strokeLinecap="round" />
++                <line className="conn-line" x1="60" y1="-50" x2="0" y2="10" stroke="#89b5a6" strokeWidth="2.8" strokeLinecap="round" />
++                <line className="conn-line" x1="-50" y1="50" x2="0" y2="10" stroke="#89b5a6" strokeWidth="2.8" strokeLinecap="round" />
++                <line className="conn-line" x1="50" y1="50" x2="0" y2="10" stroke="#89b5a6" strokeWidth="2.8" strokeLinecap="round" />
++                <line className="conn-line" x1="-60" y1="-50" x2="60" y2="-50" stroke="#96c0b2" strokeWidth="2.2" strokeLinecap="round" />
++                <line className="conn-line" x1="-60" y1="-50" x2="-50" y2="50" stroke="#96c0b2" strokeWidth="2.2" strokeLinecap="round" />
++                <line className="conn-line" x1="60" y1="-50" x2="50" y2="50" stroke="#96c0b2" strokeWidth="2.2" strokeLinecap="round" />
++                <line className="conn-line" x1="-50" y1="50" x2="50" y2="50" stroke="#96c0b2" strokeWidth="2.2" strokeLinecap="round" />
++              </g>
++
++              {/* Outer four nodes */}
++              <g>
++                <g className="outer-node" style={{ transformOrigin: '-60px -50px' }}>
++                  <circle cx="-60" cy="-50" r="20" fill="#5a8a7a" />
++                  <circle cx="-60" cy="-50" r="9" fill="#eef3f1" />
++                  <circle cx="-60" cy="-50" r="4.5" fill="#5a8a7a" opacity="0.4" />
++                </g>
++                <g className="outer-node" style={{ transformOrigin: '60px -50px' }}>
++                  <circle cx="60" cy="-50" r="20" fill="#5a8a7a" />
++                  <circle cx="60" cy="-50" r="9" fill="#eef3f1" />
++                  <circle cx="60" cy="-50" r="4.5" fill="#5a8a7a" opacity="0.4" />
++                </g>
++                <g className="outer-node" style={{ transformOrigin: '-50px 50px' }}>
++                  <circle cx="-50" cy="50" r="15" fill="#6b9d8c" />
++                </g>
++                <g className="outer-node" style={{ transformOrigin: '50px 50px' }}>
++                  <circle cx="50" cy="50" r="15" fill="#6b9d8c" />
++                </g>
++              </g>
++
++              {/* Center donut */}
++              <g className="center-node" style={{ transformOrigin: '0px 10px' }}>
++                <circle cx="0" cy="10" r="26" fill="#5a8a7a" />
++                <circle cx="0" cy="10" r="12" fill="#eef3f1" />
++                <circle cx="0" cy="10" r="6" fill="#5a8a7a" opacity="0.4" />
++              </g>
++
++              {/* Crescents */}
++              <path className="crescent" d="M-74,-64 A20,20 0 0,1 -60,-70" stroke="#7aab9c" strokeWidth="1.8" fill="none" strokeLinecap="round" />
++              <path className="crescent" d="M46,-64 A20,20 0 0,1 60,-70" stroke="#7aab9c" strokeWidth="1.8" fill="none" strokeLinecap="round" />
++              <path className="crescent" d="M-16,-4 A26,26 0 0,1 0,-16" stroke="#7aab9c" strokeWidth="2" fill="none" strokeLinecap="round" />
++            </g>
++
++            {/* NEXUS */}
++            <text className="logo-text" x="340" y="345" textAnchor="middle" fontFamily="'DM Sans', system-ui, -apple-system, sans-serif" fontSize="58" fontWeight="600" letterSpacing="10" fill="#3a675a">NEXUS</text>
++
++            {/* CHAT */}
++            <text className="logo-sub" x="340" y="385" textAnchor="middle" fontFamily="'DM Sans', system-ui, -apple-system, sans-serif" fontSize="22" fontWeight="400" letterSpacing="16" fill="#5a8a7a">CHAT</text>
++
++            {/* Divider */}
++            <line className="logo-div" x1="290" y1="405" x2="390" y2="405" stroke="#5a8a7a" strokeWidth="1.5" strokeLinecap="round" opacity="0.3" />
++
++            {/* Tagline */}
++            <text className="logo-tag" x="340" y="435" textAnchor="middle" fontFamily="'DM Sans', system-ui, -apple-system, sans-serif" fontSize="15" fontWeight="500" letterSpacing="5" fill="#6b9d8c">
++              <tspan className="tag-word tag-word-1">AGENTIC</tspan>
++              <tspan> · </tspan>
++              <tspan className="tag-word tag-word-2">RAG</tspan>
++              <tspan> · </tspan>
++              <tspan className="tag-word tag-word-3">MCP</tspan>
++              <tspan> · </tspan>
++              <tspan className="tag-word tag-word-4">MULTI-LLM</tspan>
++            </text>
++          </svg>
++        </div>
++
++        <form onSubmit={handleSubmit} style={{ width: '100%', maxWidth: 320 }}>
++          <div style={{ marginBottom: 12 }}>
++            <input
++              type="text"
++              placeholder="Username"
++              value={username}
++              onChange={(e) => setUsername(e.target.value)}
++              className="chat-input-field"
++              style={{ width: '100%', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--border)' }}
++              autoFocus
++            />
++          </div>
++          <div style={{ marginBottom: 16 }}>
++            <input
++              type="password"
++              placeholder="Password"
++              value={password}
++              onChange={(e) => setPassword(e.target.value)}
++              className="chat-input-field"
++              style={{ width: '100%', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--border)' }}
++            />
++          </div>
++          {error && (
++            <div style={{ color: 'var(--error)', fontSize: 13, marginBottom: 12, textAlign: 'center' }}>
++              {error}
++            </div>
++          )}
++          <button
++            type="submit"
++            className="splash-start-btn"
++            disabled={isLoading || !username || !password}
++            style={{ width: '100%' }}
++          >
++            <LogIn size={16} />
++            <span>{isLoading ? 'Signing in…' : 'Sign In'}</span>
++            <ArrowRight size={16} />
++          </button>
++        </form>
++      </div>
++    </div>
++  )
++}
+diff --git a/frontend/src/components/SplashScreen.jsx b/frontend/src/components/SplashScreen.jsx
+index c1705b0..375e94f 100644
+--- a/frontend/src/components/SplashScreen.jsx
++++ b/frontend/src/components/SplashScreen.jsx
+@@ -1,7 +1,9 @@
+ import React from 'react'
+-import { ArrowRight } from 'lucide-react'
++import { ArrowRight, LogIn, LogOut } from 'lucide-react'
++
++export default function SplashScreen({ onStart, onLogout, user }) {
++  const isReturning = !!user
+ 
+-export default function SplashScreen({ onStart }) {
+   return (
+     <div className="splash-screen">
+       <div className="splash-content">
+@@ -91,7 +93,7 @@ export default function SplashScreen({ onStart }) {
+             {/* Divider */}
+             <line className="logo-div" x1="290" y1="405" x2="390" y2="405" stroke="#5a8a7a" strokeWidth="1.5" strokeLinecap="round" opacity="0.3" />
+ 
+-            {/* Tagline - each word bolds in sync with its paired bubble pop */}
++            {/* Tagline */}
+             <text className="logo-tag" x="340" y="435" textAnchor="middle" fontFamily="'DM Sans', system-ui, -apple-system, sans-serif" fontSize="15" fontWeight="500" letterSpacing="5" fill="#6b9d8c">
+               <tspan className="tag-word tag-word-1">AGENTIC</tspan>
+               <tspan> · </tspan>
+@@ -104,10 +106,31 @@ export default function SplashScreen({ onStart }) {
+           </svg>
+         </div>
+ 
+-        <button className="splash-start-btn" onClick={onStart}>
+-          <span>Start Chat</span>
+-          <ArrowRight size={16} />
+-        </button>
++        {isReturning ? (
++          <div style={{ textAlign: 'center', marginTop: 8 }}>
++            <div style={{ fontSize: 16, color: 'var(--text-secondary)', marginBottom: 16 }}>
++              Welcome back, <strong>{user.username}</strong>
++            </div>
++            <button className="splash-start-btn" onClick={onStart}>
++              <span>Start Chat</span>
++              <ArrowRight size={16} />
++            </button>
++            <button
++              className="splash-start-btn"
++              onClick={onLogout}
++              style={{ marginTop: 12, background: 'transparent', color: 'var(--error)', border: '1px solid var(--error)' }}
++            >
++              <LogOut size={16} />
++              <span>Log Out</span>
++            </button>
++          </div>
++        ) : (
++          <button className="splash-start-btn" onClick={onStart}>
++            <LogIn size={16} />
++            <span>Sign In</span>
++            <ArrowRight size={16} />
++          </button>
++        )}
+       </div>
+     </div>
+   )
+diff --git a/frontend/src/hooks/api.js b/frontend/src/hooks/api.js
+index bdc2a3e..c3c54cf 100644
+--- a/frontend/src/hooks/api.js
++++ b/frontend/src/hooks/api.js
+@@ -1,19 +1,44 @@
+ const BASE = ''
+ 
++function getToken() {
++  return localStorage.getItem('nexus_token')
++}
++
++function handleAuth(res) {
++  if (res.status === 401) {
++    localStorage.removeItem('nexus_token')
++    localStorage.removeItem('nexus_user')
++    window.location.reload()
++  }
++}
++
++async function authFetch(url, options = {}) {
++  const token = getToken()
++  const headers = {
++    ...(options.headers || {}),
++  }
++  if (token) {
++    headers['Authorization'] = `Bearer ${token}`
++  }
++  const res = await fetch(`${BASE}${url}`, { ...options, headers })
++  handleAuth(res)
++  return res
++}
++
+ export async function fetchModels() {
+-  const res = await fetch(`${BASE}/api/models`)
++  const res = await authFetch(`${BASE}/api/models`)
+   const data = await res.json()
+   return data.models || []
+ }
+ 
+ export async function fetchTools() {
+-  const res = await fetch(`${BASE}/api/tools`)
++  const res = await authFetch(`${BASE}/api/tools`)
+   const data = await res.json()
+   return data.tools || []
+ }
+ 
+ export async function fetchFiles() {
+-  const res = await fetch(`${BASE}/api/files`)
++  const res = await authFetch(`${BASE}/api/files`)
+   const data = await res.json()
+   return data.files || []
+ }
+@@ -24,12 +49,21 @@ export async function uploadFile(file, onProgress) {
+     form.append('file', file)
+     const xhr = new XMLHttpRequest()
+     xhr.open('POST', `${BASE}/api/upload`)
++    const token = getToken()
++    if (token) {
++      xhr.setRequestHeader('Authorization', `Bearer ${token}`)
++    }
+     xhr.upload.onprogress = (e) => {
+       if (e.lengthComputable && onProgress) {
+         onProgress(Math.round((e.loaded / e.total) * 100))
+       }
+     }
+     xhr.onload = () => {
++      if (xhr.status === 401) {
++        handleAuth({ status: 401 })
++        reject(new Error('Unauthorized'))
++        return
++      }
+       if (xhr.status >= 200 && xhr.status < 300) {
+         resolve(JSON.parse(xhr.responseText))
+       } else {
+@@ -47,7 +81,7 @@ export async function uploadFile(file, onProgress) {
+ }
+ 
+ export async function fetchUploadProgress(filename) {
+-  const res = await fetch(
++  const res = await authFetch(
+     `${BASE}/api/upload/progress/${encodeURIComponent(filename)}`
+   )
+   if (!res.ok) return null
+@@ -55,41 +89,86 @@ export async function fetchUploadProgress(filename) {
+ }
+ 
+ export async function deleteFile(filename) {
+-  const res = await fetch(`${BASE}/api/files/${encodeURIComponent(filename)}`, {
++  const res = await authFetch(`${BASE}/api/files/${encodeURIComponent(filename)}`, {
+     method: 'DELETE',
+   })
+   return res.json()
+ }
+ 
+ export async function fetchMCPServers() {
+-  const res = await fetch(`${BASE}/api/mcp/servers`)
++  const res = await authFetch(`${BASE}/api/mcp/servers`)
+   const data = await res.json()
+   return data.servers || []
+ }
+ 
+ export async function reconnectMCPServer(serverId) {
+-  const res = await fetch(`${BASE}/api/mcp/servers/${encodeURIComponent(serverId)}/reconnect`, {
++  const res = await authFetch(`${BASE}/api/mcp/servers/${encodeURIComponent(serverId)}/reconnect`, {
++    method: 'POST',
++  })
++  return res.json()
++}
++
++export async function discoverMCPServer(url, timeout = 30) {
++  const res = await authFetch(`${BASE}/api/mcp/servers/discover`, {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify({ url, timeout }),
++  })
++  if (!res.ok) {
++    const err = await res.json().catch(() => ({}))
++    throw new Error(err.detail || `Discovery failed: ${res.status}`)
++  }
++  return res.json()
++}
++
++export async function addMCPServer(cfg) {
++  const res = await authFetch(`${BASE}/api/mcp/servers`, {
+     method: 'POST',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify(cfg),
+   })
++  if (!res.ok) {
++    const err = await res.json().catch(() => ({}))
++    throw new Error(err.detail || `Failed to add server: ${res.status}`)
++  }
++  return res.json()
++}
++
++export async function removeMCPServer(serverId) {
++  const res = await authFetch(`${BASE}/api/mcp/servers/${encodeURIComponent(serverId)}`, {
++    method: 'DELETE',
++  })
++  if (!res.ok) {
++    const err = await res.json().catch(() => ({}))
++    throw new Error(err.detail || `Failed to remove server: ${res.status}`)
++  }
++  return res.json()
++}
++
++// ---- Auth ----
++
++export async function fetchAuthMe() {
++  const res = await authFetch(`${BASE}/api/auth/me`)
++  if (!res.ok) return null
+   return res.json()
+ }
+ 
+ // ---- Conversations ----
+ 
+ export async function fetchConversations() {
+-  const res = await fetch(`${BASE}/api/conversations`)
++  const res = await authFetch(`${BASE}/api/conversations`)
+   const data = await res.json()
+   return data.conversations || []
+ }
+ 
+ export async function fetchConversation(id) {
+-  const res = await fetch(`${BASE}/api/conversations/${encodeURIComponent(id)}`)
++  const res = await authFetch(`${BASE}/api/conversations/${encodeURIComponent(id)}`)
+   if (!res.ok) return null
+   return res.json()
+ }
+ 
+ export async function saveConversation({ id, messages, model, token_usage }) {
+-  const res = await fetch(`${BASE}/api/conversations`, {
++  const res = await authFetch(`${BASE}/api/conversations`, {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify({ id, messages, model, token_usage }),
+@@ -98,7 +177,7 @@ export async function saveConversation({ id, messages, model, token_usage }) {
+ }
+ 
+ export async function deleteConversation(id) {
+-  const res = await fetch(`${BASE}/api/conversations/${encodeURIComponent(id)}`, {
++  const res = await authFetch(`${BASE}/api/conversations/${encodeURIComponent(id)}`, {
+     method: 'DELETE',
+   })
+   return res.json()
+diff --git a/frontend/src/hooks/useChat.js b/frontend/src/hooks/useChat.js
+index 52d6e3b..b7e6fb6 100644
+--- a/frontend/src/hooks/useChat.js
++++ b/frontend/src/hooks/useChat.js
+@@ -9,7 +9,9 @@ export function useChat() {
+     if (wsRef.current?.readyState === WebSocket.OPEN) return
+ 
+     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/chat`)
++    const token = localStorage.getItem('nexus_token') || ''
++    const wsUrl = `${protocol}//${window.location.host}/ws/chat?token=${encodeURIComponent(token)}`
++    const ws = new WebSocket(wsUrl)
+ 
+     ws.onopen = () => setIsConnected(true)
+     ws.onclose = () => {
+diff --git a/requirements.txt b/requirements.txt
+index 2268fa1..27577c0 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -9,9 +9,8 @@ httpx==0.27.2
+ python-multipart==0.0.9
+ aiofiles==24.1.0
+ 
+-# LLM Providers
+-anthropic==0.34.0
+-openai==1.45.0
++bcrypt==4.2.0
++pyjwt==2.9.0
+ 
+ # RAG
+ chromadb==0.5.5
+diff --git a/scripts/update-from-upstream.sh b/scripts/update-from-upstream.sh
+new file mode 100755
+index 0000000..d5dfeb3
+--- /dev/null
++++ b/scripts/update-from-upstream.sh
+@@ -0,0 +1,43 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Nexus Chat Server — Update from Upstream Script
++# Pulls latest changes from upstream main and re-applies server patches.
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
++PATCH_DIR="$ROOT_DIR/scripts/server-patches"
++
++cd "$ROOT_DIR"
++
++# Ensure upstream remote exists
++if ! git remote get-url upstream >/dev/null 2>&1; then
++    echo "[INFO] Adding upstream remote..."
++    git remote add upstream git@github.com:aashiquear/nexus-chat.git
++fi
++
++echo "[INFO] Fetching upstream/main..."
++git fetch upstream main
++
++echo "[INFO] Merging upstream/main into current branch (preferring upstream changes)..."
++if ! git merge -X theirs upstream/main --no-edit; then
++    echo "[ERROR] Merge conflict detected. Please resolve manually and re-run."
++    exit 1
++fi
++
++echo "[INFO] Re-applying server patches..."
++for patch in "$PATCH_DIR"/*.patch; do
++    if [ -f "$patch" ]; then
++        echo "[INFO] Applying $(basename "$patch")..."
++        if ! git apply "$patch"; then
++            echo "[WARN] Patch $(basename "$patch") failed to apply. Skipping."
++        fi
++    fi
++done
++
++echo "[INFO] Staging patch-applied changes..."
++git add -A
++git diff --cached --quiet || git commit -m "Re-apply server patches after upstream merge" || true
++
++echo "[SUCCESS] Upstream updates merged and server patches applied."
++echo "          Run 'docker compose build' and 'docker compose up -d' to deploy."
