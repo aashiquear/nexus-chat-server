@@ -8,6 +8,7 @@ export default function MCPDiscoveryPanel({ onClose, onAdded }) {
   const [discovered, setDiscovered] = useState(null)
   const [error, setError] = useState('')
   const [isAdding, setIsAdding] = useState(false)
+  const [serverName, setServerName] = useState('')
   const scrollRef = useRef(null)
 
   useEffect(() => {
@@ -22,6 +23,7 @@ export default function MCPDiscoveryPanel({ onClose, onAdded }) {
     e.preventDefault()
     setError('')
     setDiscovered(null)
+    setServerName('')
     if (!url.trim()) {
       setError('Please enter a server URL')
       return
@@ -30,6 +32,7 @@ export default function MCPDiscoveryPanel({ onClose, onAdded }) {
     try {
       const data = await discoverMCPServer(url.trim())
       setDiscovered(data)
+      setServerName(data.server.name || '')
     } catch (err) {
       setError(err.message || 'Discovery failed')
     } finally {
@@ -43,7 +46,7 @@ export default function MCPDiscoveryPanel({ onClose, onAdded }) {
     try {
       const cfg = {
         url: discovered.server.url,
-        name: discovered.server.name,
+        name: serverName.trim() || discovered.server.name,
         description: discovered.server.description,
         icon: discovered.server.icon,
         timeout: 30,
@@ -240,7 +243,7 @@ export default function MCPDiscoveryPanel({ onClose, onAdded }) {
           )}
         </div>
 
-        {/* Fixed footer with Add Server */}
+        {/* Fixed footer with name + Add Server */}
         {discovered && (
           <div
             style={{
@@ -249,10 +252,29 @@ export default function MCPDiscoveryPanel({ onClose, onAdded }) {
               flexShrink: 0,
             }}
           >
+            <div style={{ marginBottom: 10 }}>
+              <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                Server Name
+              </label>
+              <input
+                type="text"
+                value={serverName}
+                onChange={(e) => setServerName(e.target.value)}
+                className="chat-input-field"
+                style={{
+                  width: '100%',
+                  padding: '8px 10px',
+                  borderRadius: 6,
+                  border: '1px solid var(--border)',
+                  fontSize: 13,
+                }}
+                placeholder={discovered.server.name}
+              />
+            </div>
             <button
               className="splash-start-btn"
               onClick={handleAdd}
-              disabled={isAdding}
+              disabled={isAdding || !serverName.trim()}
               style={{ width: '100%', fontSize: 13 }}
             >
               <Plus size={14} />
