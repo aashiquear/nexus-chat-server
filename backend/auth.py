@@ -199,16 +199,16 @@ async def delete_user_account(username: str, password: str):
 
 def get_ws_user(token: str | None) -> dict:
     if not token:
-        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason="Missing token")
+        raise WebSocketException(code=1008, reason="Missing token")
     try:
         payload = decode_access_token(token)
     except HTTPException:
-        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid token")
+        raise WebSocketException(code=1008, reason="Invalid token")
     username = payload.get("sub")
     if not username:
-        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid token")
+        raise WebSocketException(code=1008, reason="Invalid token")
     users = _load_users()
     user = users.get(username)
     if not user:
-        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason="User not found")
+        raise WebSocketException(code=1008, reason="User not found")
     return user
