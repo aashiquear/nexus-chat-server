@@ -601,7 +601,7 @@ export default function App() {
   }
 
   if (showSplash) {
-    return <SplashScreen user={user} onStart={() => setShowSplash(false)} />
+    return <SplashScreen user={user} onStart={() => setShowSplash(false)} onLogout={handleLogout} />
   }
 
   return (
@@ -656,6 +656,7 @@ export default function App() {
               className="sidebar-toggle"
               onClick={() => setShowAccount((v) => !v)}
               title="Account"
+              style={{ display: 'flex' }}
             >
               <UserCircle size={18} />
             </button>
@@ -663,6 +664,7 @@ export default function App() {
               className="sidebar-toggle"
               onClick={handleLogout}
               title="Log out"
+              style={{ display: 'flex' }}
             >
               <LogOut size={18} />
             </button>
