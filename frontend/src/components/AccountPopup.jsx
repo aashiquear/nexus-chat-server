@@ -110,9 +110,19 @@ export default function AccountPopup({ user, onClose, onLogout }) {
     >
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <h3 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Account</h3>
-        <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
-          <X size={16} />
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <button
+            className="sidebar-toggle"
+            onClick={onLogout}
+            title="Log out"
+            style={{ color: 'var(--error)' }}
+          >
+            <LogOut size={16} />
+          </button>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
+            <X size={16} />
+          </button>
+        </div>
       </div>
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
@@ -146,17 +156,9 @@ export default function AccountPopup({ user, onClose, onLogout }) {
           <div style={{ fontSize: 14, marginBottom: 4 }}>
             <strong>Username:</strong> {user.username}
           </div>
-          <div style={{ fontSize: 14, color: 'var(--text-secondary)', marginBottom: 12 }}>
+          <div style={{ fontSize: 14, color: 'var(--text-secondary)' }}>
             <strong>Role:</strong> {user.is_admin ? 'Administrator' : 'User'}
           </div>
-          <button
-            className="splash-start-btn"
-            style={{ width: '100%', fontSize: 13 }}
-            onClick={onLogout}
-          >
-            <LogOut size={14} />
-            Log Out
-          </button>
         </div>
       )}
 
