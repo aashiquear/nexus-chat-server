@@ -298,6 +298,14 @@ tools:
       # Defaults to HuggingFace's default cache (~/.cache/huggingface/).
       # model_cache_dir: "./data/models"
 
+  file_generator:
+    enabled: true
+    name: "File Generator"
+    description: "Generate PDF, DOCX, PPTX, and PNG files from content provided by the LLM"
+    icon: "file-text"
+    config:
+      output_dir: "./data/files"
+
 # ------------------------------------------------------------
 # MCP Servers (Model Context Protocol)
 # ------------------------------------------------------------
