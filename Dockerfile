@@ -28,13 +28,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ ./backend/
 COPY config/ ./config/
 
-# Pre-download diffusion model weights during build so first PNG generation is instant.
-# Increases image size by ~6 GB. Set PRELOAD_DIFFUSION=false to skip.
-ARG PRELOAD_DIFFUSION=true
-RUN if [ "$PRELOAD_DIFFUSION" = "true" ]; then \
-        python -c "from backend.tools.file_generator import _ensure_diffusion_loaded; _ensure_diffusion_loaded()"; \
-    fi
-
 # Copy built frontend
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
