@@ -18,6 +18,7 @@ const ICON_MAP = {
   image: Image,
   'bar-chart': BarChart3,
   eye: Eye,
+  'file-generator': FileText,
 }
 
 // Collapse long tool descriptions so the MCP list stays scannable.

@@ -3,6 +3,7 @@ Nexus Chat - FastAPI Application
 Main entry point for the backend server.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ import backend.tools.example_tool
 import backend.tools.svg_diagram
 import backend.tools.graph_plotter
 import backend.tools.image_synthesizer
+import backend.tools.file_generator
 import backend.mcp  # noqa: F401 – MCP client module
 from backend.mcp.client import _load_user_mcp_servers, _save_user_mcp_servers
 
@@ -62,25 +64,42 @@ app.add_middleware(
 # Initialize orchestrator
 orchestrator = ChatOrchestrator()
 
-# Ensure upload, downloads, and sandbox directories exist
+# Ensure upload, downloads, sandbox, and generated files directories exist
 upload_dir = Path(config.get("uploads", {}).get("upload_directory", "./data/uploads"))
 upload_dir.mkdir(parents=True, exist_ok=True)
 download_dir = Path("./data/downloads")
 download_dir.mkdir(parents=True, exist_ok=True)
 sandbox_dir = Path("./data/sandbox")
 sandbox_dir.mkdir(parents=True, exist_ok=True)
+files_dir = Path("./data/files")
+files_dir.mkdir(parents=True, exist_ok=True)
 
 
 # ------ Startup event: initialize async services ------
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize auth, MCP connections and sync uploaded files into the vector store."""
-    await auth.init_admin_user()
+    """Initialize MCP connections, sync uploads, and pre-load heavy models."""
     await orchestrator.init_mcp()
     # Re-ingest any uploaded files missing from the vector store (e.g. after restart)
     if orchestrator.rag_engine:
         await orchestrator.rag_engine.sync_uploads(upload_dir)
+
+    # ── Pre-load diffusion model in background so first PNG generation is fast ──
+    file_gen_cfg = config.get("tools", {}).get("file_generator", {})
+    if file_gen_cfg.get("enabled", False):
+        cache_dir = file_gen_cfg.get("config", {}).get("model_cache_dir")
+
+        async def _warmup_diffusion():
+            try:
+                from backend.tools.file_generator import _ensure_diffusion_loaded
+                logger.info("Pre-loading diffusion model in background …")
+                await asyncio.to_thread(_ensure_diffusion_loaded, cache_dir)
+                logger.info("Diffusion model pre-loaded successfully.")
+            except Exception as e:
+                logger.warning("Diffusion model pre-load failed (will retry on first use): %s", e)
+
+        asyncio.create_task(_warmup_diffusion())
 
 
 # ------ REST API Endpoints ------
@@ -320,8 +339,19 @@ async def serve_plot_file(filename: str):
 
 @app.get("/api/download/{filename}")
 async def download_file(filename: str):
-    """Serve a downloadable file from the downloads directory."""
+    """Serve a downloadable file from the downloads or files directory."""
     filepath = download_dir / filename
+    if not filepath.exists():
+        filepath = files_dir / filename
+    if not filepath.exists():
+        raise HTTPException(404, "File not found")
+    return FileResponse(filepath, media_type="application/octet-stream", filename=filename)
+
+
+@app.get("/api/files/{filename}")
+async def serve_generated_file(filename: str):
+    """Serve a generated file from the files directory."""
+    filepath = files_dir / filename
     if not filepath.exists():
         raise HTTPException(404, "File not found")
     return FileResponse(filepath, media_type="application/octet-stream", filename=filename)

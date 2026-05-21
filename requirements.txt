@@ -19,6 +19,8 @@ sentence-transformers==3.0.1
 # File processing
 pypdf2==3.0.1
 python-docx==1.1.2
+python-pptx==1.0.2
+fpdf2==2.8.3
 
 # Plotting
 matplotlib==3.9.2
@@ -30,6 +32,10 @@ kaleido==0.2.1
 transformers>=4.45.0
 torch>=2.1.0
 Pillow>=10.0.0
+
+# Text-to-image diffusion (Z-Image-Turbo — lazy-loaded on first use)
+diffusers>=0.32.0
+accelerate>=1.0.0
 
 # Utilities
 jinja2==3.1.4

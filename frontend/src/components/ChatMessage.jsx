@@ -845,6 +845,7 @@ export default function ChatMessage({ message, onOpenCanvas }) {
           // Downloadable file result
           if (parsed.downloadable) {
             const d = parsed.downloadable
+            const downloadHref = d.download_url || `/api/download/${encodeURIComponent(d.filename)}`
             return (
               <div key={`dl-${i}`} className="downloadable-card">
                 <div className="downloadable-header">
@@ -855,7 +856,7 @@ export default function ChatMessage({ message, onOpenCanvas }) {
                 <div className="downloadable-actions">
                   <a
                     className="downloadable-btn"
-                    href={`/api/download/${encodeURIComponent(d.filename)}`}
+                    href={downloadHref}
                     download={d.filename}
                   >
                     <DownloadIcon size={13} /> Download
