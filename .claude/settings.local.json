@@ -2,7 +2,17 @@
   "permissions": {
     "allow": [
       "Bash(git clone *)",
-      "Read(//tmp/nexus-chat-upstream/**)"
+      "Read(//tmp/nexus-chat-upstream/**)",
+      "Bash(chmod +x *)",
+      "Bash(python3 *)",
+      "Bash(npm install *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git *)",
+      "Bash(npx tsc *)",
+      "Read(//home/aashiquear/.claude/projects/**)",
+      "Read(//home/aashiquear/.claude/**)"
     ]
   }
 }
