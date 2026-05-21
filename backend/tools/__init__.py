@@ -25,7 +25,7 @@ Example:
 """
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, AsyncIterator
 
 
 class BaseTool(ABC):
@@ -42,6 +42,13 @@ class BaseTool(ABC):
     async def execute(self, **kwargs) -> str:
         """Execute the tool with the given parameters."""
         ...
+
+    async def stream_execute(self, **kwargs) -> AsyncIterator[str]:
+        """Optional streaming execution. Tools that support live output
+        can override this to yield chunks in real-time. The default
+        delegates to execute() and yields the full result as one chunk.
+        """
+        yield await self.execute(**kwargs)
 
     def to_definition(self) -> dict:
         """Convert to a tool definition for LLM providers."""

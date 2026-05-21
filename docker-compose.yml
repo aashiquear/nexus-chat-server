@@ -35,6 +35,18 @@ services:
       start_period: 15s
       retries: 3
 
+  nexus-sandbox:
+    image: python:3.11-slim
+    container_name: nexus-sandbox
+    networks:
+      - nexus-net
+    volumes:
+      - ./data/sandbox:/sandbox
+    command: tail -f /dev/null
+    mem_limit: 512m
+    cpus: '1.0'
+    restart: unless-stopped
+
   # ── MCP Servers (optional, enable with: docker compose --profile mcp up) ──
 
   mcp-database:

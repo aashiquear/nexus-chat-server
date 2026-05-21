@@ -210,6 +210,52 @@ class ChatOrchestrator:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
+    async def _stream_tool(
+        self, tool_name: str, arguments: dict
+    ) -> AsyncIterator[dict]:
+        """Execute a tool with optional live streaming support.
+
+        Yields {"type": "tool_stream", "name": ..., "chunk": ...} for each
+        line of live output, then finally {"type": "tool_result", ...}.
+        """
+        if tool_name.startswith("mcp:"):
+            # MCP tools do not support streaming yet
+            result = await self._execute_tool(tool_name, arguments)
+            yield {"type": "tool_result", "name": tool_name, "result": result}
+            return
+
+        tool = self._tools.get(tool_name)
+        if not tool:
+            yield {
+                "type": "tool_result",
+                "name": tool_name,
+                "result": json.dumps({"error": f"Tool '{tool_name}' not found"}),
+            }
+            return
+
+        try:
+            chunks: list[str] = []
+            async for chunk in tool.stream_execute(**arguments):
+                chunks.append(chunk)
+                yield {"type": "tool_stream", "name": tool_name, "chunk": chunk}
+
+            # Build final result. For code_executor the tool stores extra state.
+            if hasattr(tool, "_last_output"):
+                result = json.dumps({
+                    "output": "\n".join(chunks).strip() or "(no output)",
+                    "return_code": getattr(tool, "_last_return_code", 0),
+                })
+            else:
+                result = json.dumps({"result": "\n".join(chunks)})
+
+            yield {"type": "tool_result", "name": tool_name, "result": result}
+        except Exception as e:
+            yield {
+                "type": "tool_result",
+                "name": tool_name,
+                "result": json.dumps({"error": str(e)}),
+            }
+
     async def _get_rag_context(self, query: str, files: list[str] | None) -> str:
         """Retrieve relevant context from RAG if enabled."""
         if not self._rag or not files:
@@ -366,13 +412,10 @@ class ChatOrchestrator:
                 "arguments": args,
             }
 
-            result = await self._execute_tool(collected_tool_call["name"], args)
-
-            yield {
-                "type": "tool_result",
-                "name": collected_tool_call["name"],
-                "result": result,
-            }
+            async for event in self._stream_tool(collected_tool_call["name"], args):
+                yield event
+                if event["type"] == "tool_result":
+                    result = event["result"]
 
             # Track consecutive failures
             try:

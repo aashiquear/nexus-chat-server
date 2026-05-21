@@ -1,11 +1,43 @@
-import React, { useState } from 'react'
-import { X, Download, BarChart3 } from 'lucide-react'
+import React, { useState, useEffect } from 'react'
+import { X, Download, BarChart3, FileText, Terminal } from 'lucide-react'
 import LazyPlot from './LazyPlot'
+import ReactMarkdown from 'react-markdown'
 
-export default function CanvasPanel({ image, figureJson, title, onClose, style }) {
+function normalizeContentType(mime) {
+  if (!mime) return 'text'
+  if (mime.includes('markdown')) return 'markdown'
+  if (mime.includes('html')) return 'html'
+  return 'text'
+}
+
+export default function CanvasPanel({
+  image,
+  figureJson,
+  content,
+  contentType,
+  chunks,
+  filename,
+  title,
+  onClose,
+  style,
+}) {
   const [downloading, setDownloading] = useState(false)
+  const [previewData, setPreviewData] = useState(null)
 
-  if (!image && !figureJson) return null
+  useEffect(() => {
+    if (filename && !content) {
+      fetch(`/api/preview/${encodeURIComponent(filename)}`)
+        .then((r) => r.json())
+        .then((data) => setPreviewData(data))
+        .catch((err) => console.error('Preview fetch failed:', err))
+    }
+  }, [filename, content])
+
+  const effectiveContent = content || previewData?.content || ''
+  const effectiveContentType = contentType || normalizeContentType(previewData?.content_type) || 'text'
+
+  const hasContent = image || figureJson || effectiveContent || (chunks && chunks.length > 0)
+  if (!hasContent) return null
 
   const imageUrl = image ? `/api/plots/${encodeURIComponent(image)}` : null
 
@@ -14,6 +46,16 @@ export default function CanvasPanel({ image, figureJson, title, onClose, style }
       const a = document.createElement('a')
       a.href = imageUrl
       a.download = image
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      return
+    }
+
+    if (filename) {
+      const a = document.createElement('a')
+      a.href = `/api/download/${encodeURIComponent(filename)}`
+      a.download = filename
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)
@@ -51,18 +93,89 @@ export default function CanvasPanel({ image, figureJson, title, onClose, style }
     font: { color: '#2c2c2c' },
   } : null
 
+  const renderBody = () => {
+    if (figureJson) {
+      return (
+        <LazyPlot
+          data={figureJson.data || []}
+          layout={plotlyLayout}
+          config={{ responsive: true, displayModeBar: true, displaylogo: false }}
+          useResizeHandler
+          style={{ width: '100%', height: '100%' }}
+        />
+      )
+    }
+
+    if (image) {
+      return (
+        <img
+          src={imageUrl}
+          alt={title || 'Generated plot'}
+          className="canvas-panel-image"
+        />
+      )
+    }
+
+    if (effectiveContentType === 'terminal' && chunks) {
+      return (
+        <div className="terminal-container">
+          {chunks.map((chunk, i) => (
+            <div
+              key={i}
+              className={chunk.startsWith('[stderr]') ? 'terminal-line stderr' : 'terminal-line'}
+            >
+              {chunk}
+            </div>
+          ))}
+          <div className="terminal-cursor" />
+        </div>
+      )
+    }
+
+    if (effectiveContentType === 'html' && effectiveContent) {
+      return (
+        <iframe
+          srcDoc={effectiveContent}
+          title={title || 'HTML Preview'}
+          className="canvas-preview-iframe"
+          sandbox="allow-scripts"
+        />
+      )
+    }
+
+    if (effectiveContentType === 'markdown' && effectiveContent) {
+      return (
+        <div className="canvas-preview-markdown">
+          <ReactMarkdown>{effectiveContent}</ReactMarkdown>
+        </div>
+      )
+    }
+
+    if (effectiveContent) {
+      return (
+        <pre className="canvas-preview-pre">{effectiveContent}</pre>
+      )
+    }
+
+    return null
+  }
+
+  const icon = effectiveContentType === 'terminal' ? <Terminal size={15} /> :
+               (effectiveContentType === 'markdown' || effectiveContentType === 'html' || effectiveContentType === 'text') ? <FileText size={15} /> :
+               <BarChart3 size={15} />
+
   return (
     <div className="canvas-panel" style={style}>
       <div className="canvas-panel-header">
         <div className="canvas-panel-title">
-          <BarChart3 size={15} />
-          <span>{title || 'Graph'}</span>
+          {icon}
+          <span>{title || 'Canvas'}</span>
         </div>
         <div className="canvas-panel-actions">
           <button
             className="canvas-panel-btn"
             onClick={handleDownload}
-            title={figureJson ? "Export chart as PNG" : "Download image"}
+            title={figureJson ? "Export chart as PNG" : filename ? "Download file" : "Download"}
             disabled={downloading}
           >
             <Download size={14} />
@@ -77,24 +190,14 @@ export default function CanvasPanel({ image, figureJson, title, onClose, style }
         </div>
       </div>
       <div className="canvas-panel-body">
-        {figureJson ? (
-          <LazyPlot
-            data={figureJson.data || []}
-            layout={plotlyLayout}
-            config={{ responsive: true, displayModeBar: true, displaylogo: false }}
-            useResizeHandler
-            style={{ width: '100%', height: '100%' }}
-          />
-        ) : (
-          <img
-            src={imageUrl}
-            alt={title || 'Generated plot'}
-            className="canvas-panel-image"
-          />
-        )}
+        {renderBody()}
       </div>
       <div className="canvas-panel-footer">
-        {image ? `Saved as ${image}` : 'Interactive Plotly chart'}
+        {image ? `Saved as ${image}` :
+         filename ? filename :
+         figureJson ? 'Interactive Plotly chart' :
+         contentType === 'terminal' ? 'Live execution output' :
+         'Preview'}
       </div>
     </div>
   )

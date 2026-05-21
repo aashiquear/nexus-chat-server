@@ -34,7 +34,6 @@ import backend.tools.builtin
 import backend.tools.example_tool
 import backend.tools.svg_diagram
 import backend.tools.graph_plotter
-import backend.tools.image_analyzer
 import backend.tools.image_synthesizer
 import backend.mcp  # noqa: F401 – MCP client module
 from backend.mcp.client import _load_user_mcp_servers, _save_user_mcp_servers
@@ -63,9 +62,13 @@ app.add_middleware(
 # Initialize orchestrator
 orchestrator = ChatOrchestrator()
 
-# Ensure upload directory exists
+# Ensure upload, downloads, and sandbox directories exist
 upload_dir = Path(config.get("uploads", {}).get("upload_directory", "./data/uploads"))
 upload_dir.mkdir(parents=True, exist_ok=True)
+download_dir = Path("./data/downloads")
+download_dir.mkdir(parents=True, exist_ok=True)
+sandbox_dir = Path("./data/sandbox")
+sandbox_dir.mkdir(parents=True, exist_ok=True)
 
 
 # ------ Startup event: initialize async services ------
@@ -311,6 +314,43 @@ async def serve_plot_file(filename: str):
     if not filepath.exists():
         raise HTTPException(404, "Plot file not found")
     return FileResponse(filepath, media_type="image/png")
+
+
+# ------ Download / Preview Endpoints ------
+
+@app.get("/api/download/{filename}")
+async def download_file(filename: str):
+    """Serve a downloadable file from the downloads directory."""
+    filepath = download_dir / filename
+    if not filepath.exists():
+        raise HTTPException(404, "File not found")
+    return FileResponse(filepath, media_type="application/octet-stream", filename=filename)
+
+
+@app.get("/api/preview/{filename}")
+async def preview_file(filename: str):
+    """Return file content for canvas preview."""
+    filepath = download_dir / filename
+    if not filepath.exists():
+        raise HTTPException(404, "File not found")
+    content = filepath.read_text(encoding="utf-8", errors="replace")
+    # Infer content type from extension
+    ext = filepath.suffix.lower()
+    content_type = {
+        ".md": "text/markdown",
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".py": "text/x-python",
+        ".js": "text/javascript",
+        ".css": "text/css",
+        ".json": "application/json",
+        ".txt": "text/plain",
+        ".csv": "text/csv",
+        ".c": "text/x-c",
+        ".cpp": "text/x-c++",
+        ".h": "text/x-c",
+    }.get(ext, "text/plain")
+    return {"content": content, "content_type": content_type, "filename": filename}
 
 
 MAX_PLOTLY_BODY_BYTES = 10 * 1024 * 1024  # 10 MB

@@ -674,7 +674,7 @@ body {
   padding: 14px;
   margin: 0;
   overflow-x: auto;
-  max-height: 400px;
+  max-height: 600px;
   overflow-y: auto;
   background: none;
   border: none;
@@ -694,7 +694,7 @@ body {
   border-radius: var(--radius-sm);
   overflow-x: hidden;
   overflow-y: auto;
-  max-height: 400px;
+  max-height: 600px;
   max-width: 100%;
 }
 
@@ -897,7 +897,7 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
   line-height: 1.55;
-  max-height: 320px;
+  max-height: 500px;
   overflow-y: auto;
 }
 
@@ -2155,6 +2155,205 @@ body {
 @media (max-width: 768px) {
   .splash-logo-shine { max-width: 100%; }
   .splash-start-btn { padding: 11px 24px; font-size: 13.5px; }
+}
+
+/* ---- Code Block Actions (for large files) ---- */
+.code-block-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.code-block-action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 6px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.code-block-action:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.code-block-pre.truncated {
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+/* ---- Downloadable File Card ---- */
+.downloadable-card {
+  margin: 10px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+
+.downloadable-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  border-bottom: 1px solid var(--border-light);
+}
+
+.downloadable-meta {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-tertiary);
+}
+
+.downloadable-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: var(--bg-panel-hover);
+}
+
+.downloadable-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-full);
+  background: var(--accent-subtle);
+  color: var(--accent);
+  font-family: var(--font-body);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+  transition: all 0.15s;
+}
+
+.downloadable-btn:hover {
+  background: var(--accent);
+  color: var(--text-inverse);
+  border-color: var(--accent);
+}
+
+/* ---- Terminal in Canvas ---- */
+.terminal-container {
+  width: 100%;
+  height: 100%;
+  background: #1e1e1e;
+  color: #f0f0f0;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  padding: 12px;
+  overflow-y: auto;
+  border-radius: var(--radius-sm);
+}
+
+.terminal-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.terminal-line.stderr {
+  color: #ff6b6b;
+}
+
+.terminal-cursor {
+  display: inline-block;
+  width: 8px;
+  height: 16px;
+  background: var(--accent);
+  animation: terminalBlink 1s steps(1) infinite;
+  margin-left: 2px;
+  vertical-align: middle;
+}
+
+@keyframes terminalBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* ---- Canvas Preview Modes ---- */
+.canvas-preview-iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: #ffffff;
+}
+
+.canvas-preview-markdown {
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  padding: 16px;
+  background: var(--bg-panel);
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--text-primary);
+}
+
+.canvas-preview-markdown h1,
+.canvas-preview-markdown h2,
+.canvas-preview-markdown h3,
+.canvas-preview-markdown h4,
+.canvas-preview-markdown h5,
+.canvas-preview-markdown h6 {
+  margin: 12px 0 6px;
+  font-weight: 600;
+}
+
+.canvas-preview-markdown p {
+  margin-bottom: 8px;
+}
+
+.canvas-preview-markdown pre {
+  background: var(--bg-code);
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+.canvas-preview-markdown code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--bg-code);
+  padding: 2px 5px;
+  border-radius: 3px;
+}
+
+.canvas-preview-pre {
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  background: var(--bg-code);
+  padding: 16px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---- Plotly dynamic sizing helper ---- */
+.plotly-result-card .plotly-chart-container {
+  padding: 8px;
+  min-height: 280px;
 }
 
 /* ---- Responsive ---- */

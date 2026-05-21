@@ -2,9 +2,24 @@ import React, { useState, useCallback, useEffect } from 'react'
 import {
   User, Bot, Wrench, CheckCircle2, ChevronDown, ChevronRight,
   BarChart3, Image as ImageIcon, Eye, Copy, Check as CheckIcon,
-  Brain, Timer,
+  Brain, Timer, Download as DownloadIcon, Eye as EyeIcon,
+  ChevronUp as ChevronUpIcon, ChevronDown as ChevronDownIcon,
+  FileText as FileTextIcon,
 } from 'lucide-react'
 import LazyPlot from './LazyPlot'
+
+// Compute a suitable inline height for Plotly charts based on
+// subplot grid rows and trace count so multiplots don't get cropped.
+function computePlotHeight(figData) {
+  const layout = figData.layout || {}
+  if (layout.grid && layout.grid.rows) {
+    return Math.min(900, Math.max(350, layout.grid.rows * 220))
+  }
+  const traceCount = (figData.data || []).length
+  if (traceCount > 10) return 600
+  if (traceCount > 5) return 450
+  return 350
+}
 
 // Format an elapsed millisecond count for the response-duration chip.
 // Sub-second values use one decimal so a snappy reply still shows
@@ -120,9 +135,45 @@ function ThinkingBlock({ text, complete }) {
   )
 }
 
-// Copy-to-clipboard code block wrapper
-function CodeBlock({ code, lang }) {
+// Map a language tag to a file extension and canvas content type.
+const LANG_EXT_MAP = {
+  markdown: { ext: 'md', contentType: 'markdown' },
+  md: { ext: 'md', contentType: 'markdown' },
+  html: { ext: 'html', contentType: 'html' },
+  htm: { ext: 'html', contentType: 'html' },
+  python: { ext: 'py', contentType: 'text' },
+  py: { ext: 'py', contentType: 'text' },
+  c: { ext: 'c', contentType: 'text' },
+  cpp: { ext: 'cpp', contentType: 'text' },
+  'c++': { ext: 'cpp', contentType: 'text' },
+  cxx: { ext: 'cpp', contentType: 'text' },
+  javascript: { ext: 'js', contentType: 'text' },
+  js: { ext: 'js', contentType: 'text' },
+  typescript: { ext: 'ts', contentType: 'text' },
+  ts: { ext: 'ts', contentType: 'text' },
+  java: { ext: 'java', contentType: 'text' },
+  go: { ext: 'go', contentType: 'text' },
+  rust: { ext: 'rs', contentType: 'text' },
+  json: { ext: 'json', contentType: 'text' },
+  yaml: { ext: 'yaml', contentType: 'text' },
+  yml: { ext: 'yml', contentType: 'text' },
+  xml: { ext: 'xml', contentType: 'text' },
+  css: { ext: 'css', contentType: 'text' },
+  sql: { ext: 'sql', contentType: 'text' },
+  shell: { ext: 'sh', contentType: 'text' },
+  bash: { ext: 'sh', contentType: 'text' },
+  dockerfile: { ext: 'dockerfile', contentType: 'text' },
+}
+
+function getLangInfo(lang) {
+  const key = (lang || '').toLowerCase().trim()
+  return LANG_EXT_MAP[key] || { ext: 'txt', contentType: 'text' }
+}
+
+// Copy-to-clipboard code block wrapper with language-aware download & canvas preview
+function CodeBlock({ code, lang, onOpenCanvas }) {
   const [copied, setCopied] = useState(false)
+  const [expanded, setExpanded] = useState(false)
 
   const handleCopy = useCallback(() => {
     navigator.clipboard.writeText(code).then(() => {
@@ -131,21 +182,72 @@ function CodeBlock({ code, lang }) {
     })
   }, [code])
 
+  const lines = code.split('\n')
+  const isLarge = lines.length > 200
+  const displayCode = isLarge && !expanded ? lines.slice(0, 100).join('\n') + '\n\n... (' + (lines.length - 100) + ' more lines)' : code
+
+  const { ext, contentType } = getLangInfo(lang)
+  const isKnownLang = !!(lang && LANG_EXT_MAP[(lang || '').toLowerCase().trim()])
+
+  // Show download/preview for:
+  //   - any block with a known file-type language tag (markdown, html, python, c, etc.)
+  //   - any very large block regardless of language
+  const showFileActions = isKnownLang || isLarge
+
+  const handleDownload = useCallback(() => {
+    const blob = new Blob([code], { type: 'text/plain' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `snippet.${ext}`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }, [code, ext])
+
+  const handleViewInCanvas = useCallback(() => {
+    if (onOpenCanvas) {
+      onOpenCanvas({
+        content: code,
+        contentType: contentType,
+        title: `${lang || 'Snippet'}.${ext}`,
+      })
+    }
+  }, [onOpenCanvas, code, contentType, lang, ext])
+
   return (
     <div className="code-block-wrapper">
       <div className="code-block-header">
         {lang && <span className="code-block-lang">{lang}</span>}
-        <button
-          className={`code-block-copy ${copied ? 'copied' : ''}`}
-          onClick={handleCopy}
-          title="Copy code"
-        >
-          {copied ? <CheckIcon size={12} /> : <Copy size={12} />}
-          {copied ? 'Copied' : 'Copy'}
-        </button>
+        <div className="code-block-actions">
+          {showFileActions && (
+            <>
+              <button className="code-block-action" onClick={handleDownload} title={`Download .${ext}`}>
+                <DownloadIcon size={12} />
+              </button>
+              <button className="code-block-action" onClick={handleViewInCanvas} title="View in Canvas">
+                <EyeIcon size={12} />
+              </button>
+              {isLarge && (
+                <button className="code-block-action" onClick={() => setExpanded((v) => !v)} title={expanded ? 'Collapse' : 'Expand'}>
+                  {expanded ? <ChevronUpIcon size={12} /> : <ChevronDownIcon size={12} />}
+                </button>
+              )}
+            </>
+          )}
+          <button
+            className={`code-block-copy ${copied ? 'copied' : ''}`}
+            onClick={handleCopy}
+            title="Copy code"
+          >
+            {copied ? <CheckIcon size={12} /> : <Copy size={12} />}
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+        </div>
       </div>
-      <pre className="code-block-pre">
-        <code>{code}</code>
+      <pre className={`code-block-pre ${isLarge && !expanded ? 'truncated' : ''}`}>
+        <code>{displayCode}</code>
       </pre>
     </div>
   )
@@ -266,7 +368,7 @@ function renderLinesList(lines, keyPrefix = '') {
 }
 
 // Markdown-like renderer with tables & rich code blocks
-function renderContent(text) {
+function renderContent(text, onOpenCanvas) {
   if (!text) return null
 
   // Split into code blocks and text
@@ -279,7 +381,7 @@ function renderContent(text) {
       const firstNewline = lines.indexOf('\n')
       const lang = firstNewline > 0 ? lines.slice(0, firstNewline).trim() : ''
       const code = firstNewline > 0 ? lines.slice(firstNewline + 1) : lines
-      return <CodeBlock key={i} code={code} lang={lang} />
+      return <CodeBlock key={i} code={code} lang={lang} onOpenCanvas={onOpenCanvas} />
     }
 
     // Regular text: handle tables, inline code, bold, links
@@ -541,11 +643,11 @@ export default function ChatMessage({ message, onOpenCanvas }) {
     return { call: tc, result: tr }
   })
 
-  // Find any plot or SVG results for inline display
+  // Find any plot, SVG, or downloadable results for inline display
   const specialResults = toolResults.filter((tr) => {
     try {
       const p = JSON.parse(tr.result)
-      return (p && p.svg && p.svg.includes('<svg')) || (p && p.plot_image) || (p && p.figure_json) || (p && p.analysis && tr.name === 'image_analyzer')
+      return (p && p.svg && p.svg.includes('<svg')) || (p && p.plot_image) || (p && p.figure_json) || (p && p.downloadable)
     } catch (_e) { return false }
   })
 
@@ -581,7 +683,7 @@ export default function ChatMessage({ message, onOpenCanvas }) {
             }
             return (
               <React.Fragment key={`text-${i}`}>
-                {renderContent(seg.text)}
+                {renderContent(seg.text, onOpenCanvas)}
               </React.Fragment>
             )
           })
@@ -717,7 +819,7 @@ export default function ChatMessage({ message, onOpenCanvas }) {
                     layout={layout}
                     config={{ responsive: true, displayModeBar: false }}
                     useResizeHandler
-                    style={{ width: '100%', height: '350px' }}
+                    style={{ width: '100%', height: computePlotHeight(figData) }}
                   />
                 </div>
                 <div className="plot-result-footer">
@@ -740,22 +842,35 @@ export default function ChatMessage({ message, onOpenCanvas }) {
             )
           }
 
-          // Image analysis result
-          if (parsed.analysis && tr.name === 'image_analyzer') {
+          // Downloadable file result
+          if (parsed.downloadable) {
+            const d = parsed.downloadable
             return (
-              <div key={`img-${i}`} className="image-analysis-card">
-                <div className="image-analysis-header">
-                  <ImageIcon size={14} />
-                  <span>Image Analysis: {parsed.filename}</span>
+              <div key={`dl-${i}`} className="downloadable-card">
+                <div className="downloadable-header">
+                  <FileTextIcon size={14} />
+                  <span>{d.filename}</span>
+                  <span className="downloadable-meta">{d.content_type} — {(d.size / 1024).toFixed(1)} KB</span>
                 </div>
-                <div className="image-analysis-body">
-                  {renderContent(parsed.analysis)}
+                <div className="downloadable-actions">
+                  <a
+                    className="downloadable-btn"
+                    href={`/api/download/${encodeURIComponent(d.filename)}`}
+                    download={d.filename}
+                  >
+                    <DownloadIcon size={13} /> Download
+                  </a>
+                  <button
+                    className="downloadable-btn"
+                    onClick={() => onOpenCanvas && onOpenCanvas({
+                      filename: d.filename,
+                      contentType: d.content_type,
+                      title: d.filename,
+                    })}
+                  >
+                    <EyeIcon size={13} /> Preview
+                  </button>
                 </div>
-                {parsed.question && parsed.question !== 'Analyze this image in detail. Describe what you see, any text, objects, patterns, or notable features.' && (
-                  <div className="image-analysis-footer">
-                    Question: {parsed.question}
-                  </div>
-                )}
               </div>
             )
           }
