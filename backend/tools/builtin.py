@@ -88,8 +88,9 @@ class DateTimeTool(BaseTool):
 class CodeExecutorTool(BaseTool):
     name = "code_executor"
     description = (
-        "Execute Python code in a sandboxed Docker environment and return the output. "
-        "Live output is streamed to the canvas terminal during execution."
+        "Execute Python code in a sandboxed environment and return the output. "
+        "Live output is streamed to the canvas terminal during execution. "
+        "Users may interactively send input via the canvas terminal panel."
     )
     parameters = {
         "type": "object",
@@ -97,15 +98,34 @@ class CodeExecutorTool(BaseTool):
             "code": {
                 "type": "string",
                 "description": "Python code to execute"
-            }
+            },
+            "interactive": {
+                "type": "boolean",
+                "description": (
+                    "If true, expose a stdin channel via the canvas terminal so "
+                    "users can type input while the program runs (input(), "
+                    "sys.stdin.read(), etc.). Default false."
+                ),
+            },
         },
         "required": ["code"]
     }
+
+    DEFAULT_SANDBOX_URL = "http://nexus-sandbox:8500"
 
     def __init__(self, config: dict | None = None):
         super().__init__(config)
         self._last_output = ""
         self._last_return_code = 0
+        # Most recently started interactive session id, exposed to the
+        # orchestrator/frontend so the canvas can connect a WebSocket.
+        self._last_session_id: str | None = None
+
+    @property
+    def sandbox_url(self) -> str:
+        return self.config.get("sandbox_url") or os.environ.get(
+            "NEXUS_SANDBOX_URL", self.DEFAULT_SANDBOX_URL,
+        )
 
     async def execute(self, **kwargs) -> str:
         """Non-streaming fallback: collect all chunks and return as JSON."""
@@ -115,75 +135,122 @@ class CodeExecutorTool(BaseTool):
         return json.dumps({
             "output": "\n".join(chunks).strip() or "(no output)",
             "return_code": self._last_return_code,
+            "interactive_session": self._last_session_id,
         })
 
     async def stream_execute(self, **kwargs) -> AsyncIterator[str]:
-        """Run Python code inside the nexus-sandbox Docker container
-        and yield stdout/stderr lines in real time.
+        """Stream stdout/stderr lines from the sandbox HTTP service in
+        real time. The sandbox runs in a sibling Docker container on the
+        ``nexus-net`` network (see ``docker-compose.yml``). Falls back
+        to a local subprocess if the sandbox endpoint is unreachable —
+        useful for dev runs without docker compose.
         """
-        code = kwargs.get("code", "")
-        timeout = self.config.get("timeout", 30)
+        import httpx
 
-        session_id = uuid.uuid4().hex[:12]
+        code = kwargs.get("code", "")
+        interactive = bool(kwargs.get("interactive", False))
+        timeout = self.config.get("timeout", 60)
+
+        if interactive:
+            # Hand off to the WebSocket-driven session. The frontend
+            # connects to /api/sandbox/interact/{session_id} and the
+            # backend proxies to the sandbox container.
+            self._last_session_id = uuid.uuid4().hex[:16]
+            from backend.sandbox_sessions import register_session
+            register_session(self._last_session_id, code, self.sandbox_url)
+            yield f"[interactive session ready: {self._last_session_id}]"
+            yield "Open the canvas terminal to send input and view live output."
+            self._last_return_code = 0
+            return
+
+        url = self.sandbox_url.rstrip("/") + "/exec"
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout + 10, read=None)) as client:
+                async with client.stream("POST", url, json={"code": code}) as resp:
+                    if resp.status_code >= 400:
+                        body = await resp.aread()
+                        msg = body.decode("utf-8", errors="replace")
+                        yield f"[stderr]: sandbox HTTP {resp.status_code}: {msg}"
+                        self._last_return_code = 1
+                        return
+
+                    async for line in resp.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        payload_raw = line[len("data:"):].strip()
+                        try:
+                            payload = json.loads(payload_raw)
+                        except json.JSONDecodeError:
+                            yield payload_raw
+                            continue
+                        ev = payload.get("type")
+                        if ev == "stdout":
+                            yield payload.get("data", "")
+                        elif ev == "stderr":
+                            yield "[stderr]: " + payload.get("data", "")
+                        elif ev == "exit":
+                            self._last_return_code = int(payload.get("code", 0))
+        except (httpx.ConnectError, httpx.ReadTimeout) as e:
+            # Sandbox unavailable — try a local fallback so dev sessions
+            # without docker still get *some* output. Limit to safe
+            # behaviour: a one-shot subprocess with no shell.
+            logger.warning("Sandbox unreachable (%s); falling back to local subprocess.", e)
+            async for chunk in self._local_fallback(code, timeout):
+                yield chunk
+
+    async def _local_fallback(self, code: str, timeout: int) -> AsyncIterator[str]:
+        """Last-resort local execution when the sandbox is unreachable.
+
+        Runs a one-shot subprocess in a temp file with no shell. This is
+        clearly less safe than the docker sandbox; we emit a warning
+        line so the user understands the difference.
+        """
+        import sys as _sys
+        yield "[stderr]: sandbox container not reachable; running locally"
+
         sandbox_dir = Path("./data/sandbox")
         sandbox_dir.mkdir(parents=True, exist_ok=True)
-        code_file = sandbox_dir / f"{session_id}.py"
+        code_file = sandbox_dir / f"local-{uuid.uuid4().hex[:8]}.py"
         code_file.write_text(code, encoding="utf-8")
 
         proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", "-i", "nexus-sandbox",
-            "python3", f"/sandbox/{session_id}.py",
+            _sys.executable, "-u", str(code_file),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue()
 
-        async def pump(stream: asyncio.StreamReader, prefix: str) -> None:
+        async def pump(stream, prefix):
             while True:
                 line = await stream.readline()
                 if not line:
                     break
-                text = line.decode("utf-8", errors="replace").rstrip("\n")
-                await queue.put(prefix + text)
+                await queue.put(prefix + line.decode("utf-8", errors="replace").rstrip("\n"))
+            await queue.put(None)
 
         stdout_task = asyncio.create_task(pump(proc.stdout, ""))
         stderr_task = asyncio.create_task(pump(proc.stderr, "[stderr]: "))
 
-        async def drain() -> None:
-            await asyncio.gather(stdout_task, stderr_task)
-            await queue.put(None)
-
-        drain_task = asyncio.create_task(drain())
-
-        output_lines: list[str] = []
+        eofs = 0
         try:
-            while True:
+            while eofs < 2:
                 try:
-                    line = await asyncio.wait_for(queue.get(), timeout=timeout)
+                    item = await asyncio.wait_for(queue.get(), timeout=timeout)
                 except asyncio.TimeoutError:
                     proc.kill()
-                    yield "Execution timed out"
-                    output_lines.append("Execution timed out")
+                    yield "[stderr]: local execution timed out"
                     break
-
-                if line is None:
-                    break
-
-                output_lines.append(line)
-                yield line
-        finally:
-            drain_task.cancel()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-
+                if item is None:
+                    eofs += 1
+                    continue
+                yield item
+            await proc.wait()
             self._last_return_code = proc.returncode or 0
-            self._last_output = "\n".join(output_lines)
-
-            # Cleanup sandbox file
+        finally:
+            stdout_task.cancel()
+            stderr_task.cancel()
             try:
                 code_file.unlink()
             except OSError:

@@ -365,17 +365,273 @@ class GraphPlotterTool(BaseTool):
             fig.savefig(filepath, bbox_inches="tight", facecolor=fig.get_facecolor())
             plt.close(fig)
 
-            return json.dumps({
+            # Build a parallel Plotly figure for interactive in-chat
+            # preview. The PNG remains as a static fallback and is also
+            # what the canvas exports for download.
+            figure_json = self._build_plotly_figure(
+                chart_type, title, x_label, y_label,
+                x_data, y_data, y_data_series, labels,
+                colors, _df, kwargs,
+            )
+
+            payload = {
                 "title": title,
                 "chart_type": chart_type,
                 "filename": filename,
                 "path": str(filepath),
                 "plot_image": filename,
-            })
+            }
+            if figure_json is not None:
+                payload["figure_json"] = figure_json
+            return json.dumps(payload)
 
         except Exception as e:
             plt.close(fig)
             return json.dumps({"error": f"Plot failed: {e}"})
+
+    # ──────────────────────────── Plotly figure builder ────────────────────────────
+
+    def _build_plotly_figure(
+        self, chart_type, title, x_label, y_label,
+        x_data, y_data, y_data_series, labels,
+        colors, df, kwargs,
+    ):
+        """Construct a Plotly figure_json dict mirroring the matplotlib
+        chart. Returns None if Plotly is unavailable or the chart type
+        is unsupported — callers fall back to the PNG-only payload.
+        """
+        try:
+            import plotly.graph_objects as go
+            import plotly.io as pio
+        except ImportError:
+            return None
+
+        try:
+            data = []
+
+            def _series_color(i, override=None):
+                return override or colors[i % len(colors)]
+
+            def _coerce_y(seq):
+                out = []
+                for v in seq:
+                    try:
+                        out.append(float(v))
+                    except (TypeError, ValueError):
+                        out.append(None)
+                return out
+
+            x_axis = x_data if x_data is not None else None
+
+            if chart_type in ("line", "scatter_line"):
+                mode = "lines+markers"
+                if y_data_series:
+                    for i, s in enumerate(y_data_series):
+                        ys = _coerce_y(s["data"])
+                        xs = x_axis if x_axis else list(range(len(ys)))
+                        data.append(go.Scatter(
+                            x=xs, y=ys, mode=mode, name=s.get("label", f"Series {i+1}"),
+                            line=dict(color=_series_color(i, s.get("color"))),
+                        ))
+                elif y_data is not None:
+                    ys = _coerce_y(y_data)
+                    xs = x_axis if x_axis else list(range(len(ys)))
+                    data.append(go.Scatter(x=xs, y=ys, mode=mode,
+                                           name=(labels[0] if labels else "Series"),
+                                           line=dict(color=_series_color(0))))
+
+            elif chart_type == "scatter":
+                if y_data_series:
+                    for i, s in enumerate(y_data_series):
+                        ys = _coerce_y(s["data"])
+                        xs = x_axis if x_axis else list(range(len(ys)))
+                        data.append(go.Scatter(
+                            x=xs, y=ys, mode="markers", name=s.get("label", f"Series {i+1}"),
+                            marker=dict(color=_series_color(i, s.get("color")), size=8),
+                        ))
+                elif y_data is not None:
+                    ys = _coerce_y(y_data)
+                    xs = x_axis if x_axis else list(range(len(ys)))
+                    data.append(go.Scatter(x=xs, y=ys, mode="markers",
+                                           marker=dict(color=_series_color(0), size=8)))
+
+            elif chart_type == "bar":
+                if y_data_series:
+                    for i, s in enumerate(y_data_series):
+                        ys = _coerce_y(s["data"])
+                        xs = x_axis if x_axis else list(range(len(ys)))
+                        data.append(go.Bar(x=xs, y=ys, name=s.get("label", f"Series {i+1}"),
+                                           marker=dict(color=_series_color(i, s.get("color")))))
+                elif y_data is not None:
+                    ys = _coerce_y(y_data)
+                    xs = x_axis if x_axis else list(range(len(ys)))
+                    data.append(go.Bar(x=xs, y=ys, marker=dict(color=_series_color(0))))
+
+            elif chart_type in ("grouped_bar", "stacked_bar"):
+                series = y_data_series
+                xs = x_axis
+                if df is not None and kwargs.get("x_column") and kwargs.get("y_columns"):
+                    xs = df[kwargs["x_column"]].astype(str).tolist()
+                    series = [{"label": col, "data": df[col].tolist()} for col in kwargs["y_columns"]]
+                if series:
+                    for i, s in enumerate(series):
+                        ys = _coerce_y(s["data"])
+                        xx = xs if xs else list(range(len(ys)))
+                        data.append(go.Bar(x=xx, y=ys, name=s.get("label", f"Series {i+1}"),
+                                           marker=dict(color=_series_color(i, s.get("color")))))
+
+            elif chart_type == "pie":
+                if y_data is not None:
+                    pie_values = _coerce_y(y_data)
+                    pie_labels = labels if labels else [f"Slice {i+1}" for i in range(len(pie_values))]
+                    data.append(go.Pie(values=pie_values, labels=pie_labels,
+                                       marker=dict(colors=colors[:len(pie_values)])))
+
+            elif chart_type == "histogram":
+                if y_data_series:
+                    for i, s in enumerate(y_data_series):
+                        data.append(go.Histogram(x=_coerce_y(s["data"]),
+                                                 name=s.get("label", f"Series {i+1}"),
+                                                 marker=dict(color=_series_color(i, s.get("color"))),
+                                                 opacity=0.6))
+                elif y_data is not None:
+                    data.append(go.Histogram(x=_coerce_y(y_data),
+                                             marker=dict(color=_series_color(0))))
+
+            elif chart_type == "box":
+                if y_data_series:
+                    for i, s in enumerate(y_data_series):
+                        data.append(go.Box(y=_coerce_y(s["data"]),
+                                           name=s.get("label", f"Series {i+1}"),
+                                           marker=dict(color=_series_color(i, s.get("color")))))
+                elif y_data is not None:
+                    data.append(go.Box(y=_coerce_y(y_data),
+                                       marker=dict(color=_series_color(0))))
+
+            elif chart_type == "violin":
+                if y_data_series:
+                    for i, s in enumerate(y_data_series):
+                        data.append(go.Violin(y=_coerce_y(s["data"]),
+                                              name=s.get("label", f"Series {i+1}"),
+                                              box_visible=True, meanline_visible=True,
+                                              marker=dict(color=_series_color(i, s.get("color")))))
+                elif y_data is not None:
+                    data.append(go.Violin(y=_coerce_y(y_data),
+                                          box_visible=True, meanline_visible=True))
+
+            elif chart_type == "area":
+                if y_data_series:
+                    for i, s in enumerate(y_data_series):
+                        ys = _coerce_y(s["data"])
+                        xs = x_axis if x_axis else list(range(len(ys)))
+                        data.append(go.Scatter(x=xs, y=ys, mode="lines",
+                                               fill="tozeroy",
+                                               name=s.get("label", f"Series {i+1}"),
+                                               line=dict(color=_series_color(i, s.get("color")))))
+                elif y_data is not None:
+                    ys = _coerce_y(y_data)
+                    xs = x_axis if x_axis else list(range(len(ys)))
+                    data.append(go.Scatter(x=xs, y=ys, mode="lines", fill="tozeroy",
+                                           line=dict(color=_series_color(0))))
+
+            elif chart_type == "heatmap":
+                z = None
+                row_labels = None
+                col_labels = labels
+                if df is not None:
+                    y_cols = kwargs.get("y_columns")
+                    sub = df[y_cols] if y_cols else df.select_dtypes(include=[float, int])
+                    if sub.shape[1] > 1:
+                        corr = sub.corr()
+                        z = corr.values.tolist()
+                        row_labels = list(corr.columns)
+                        col_labels = list(corr.columns)
+                    else:
+                        z = sub.values.tolist()
+                elif y_data_series:
+                    z = [_coerce_y(s["data"]) for s in y_data_series]
+                    row_labels = [s.get("label", f"Row {i}") for i, s in enumerate(y_data_series)]
+                elif y_data is not None:
+                    z = y_data if isinstance(y_data[0], list) else [y_data]
+                if z is not None:
+                    data.append(go.Heatmap(z=z, x=col_labels, y=row_labels,
+                                           colorscale=kwargs.get("colormap", "YlGnBu")))
+
+            elif chart_type == "parity":
+                if x_data is not None and y_data is not None:
+                    xs = _coerce_y(x_data)
+                    ys = _coerce_y(y_data)
+                    data.append(go.Scatter(x=xs, y=ys, mode="markers",
+                                           marker=dict(color=_series_color(0), size=8),
+                                           name="Data"))
+                    vmin = min([v for v in xs + ys if v is not None] or [0])
+                    vmax = max([v for v in xs + ys if v is not None] or [1])
+                    data.append(go.Scatter(x=[vmin, vmax], y=[vmin, vmax],
+                                           mode="lines", line=dict(dash="dash", color="#b85450"),
+                                           name="y = x"))
+
+            elif chart_type == "regression":
+                import numpy as _np
+                degree = kwargs.get("regression_degree", 1)
+                def _add_regression(xs_raw, ys_raw, label, color):
+                    xs_arr = _np.array([float(v) for v in xs_raw])
+                    ys_arr = _np.array([float(v) for v in ys_raw])
+                    data.append(go.Scatter(x=xs_arr.tolist(), y=ys_arr.tolist(),
+                                           mode="markers",
+                                           marker=dict(color=color, size=8),
+                                           name=f"{label} data" if label else "Data"))
+                    coeffs = _np.polyfit(xs_arr, ys_arr, degree)
+                    poly = _np.poly1d(coeffs)
+                    xs_smooth = _np.linspace(xs_arr.min(), xs_arr.max(), 200)
+                    data.append(go.Scatter(x=xs_smooth.tolist(), y=poly(xs_smooth).tolist(),
+                                           mode="lines",
+                                           line=dict(dash="dash", color=color),
+                                           name=f"{label} fit" if label else "Fit"))
+                if y_data_series:
+                    for i, s in enumerate(y_data_series):
+                        xs = x_axis if x_axis else list(range(len(s["data"])))
+                        _add_regression(xs, s["data"], s.get("label", f"Series {i+1}"),
+                                        _series_color(i, s.get("color")))
+                elif y_data is not None:
+                    xs = x_axis if x_axis else list(range(len(y_data)))
+                    _add_regression(xs, y_data, labels[0] if labels else None,
+                                    _series_color(0))
+
+            elif chart_type == "count":
+                # Build a frequency table from x_data or df[x_column]
+                from collections import Counter
+                if df is not None and kwargs.get("x_column"):
+                    values = df[kwargs["x_column"]].astype(str).tolist()
+                elif kwargs.get("x_data"):
+                    values = [str(v) for v in kwargs["x_data"]]
+                else:
+                    values = []
+                if values:
+                    counts = Counter(values)
+                    cats = list(counts.keys())
+                    vals = [counts[c] for c in cats]
+                    data.append(go.Bar(x=cats, y=vals,
+                                       marker=dict(color=_series_color(0))))
+
+            if not data:
+                return None
+
+            layout = dict(
+                title=dict(text=title) if title else None,
+                xaxis=dict(title=x_label) if x_label else dict(),
+                yaxis=dict(title=y_label) if y_label else dict(),
+                barmode="stack" if chart_type == "stacked_bar" else (
+                    "group" if chart_type == "grouped_bar" else None
+                ),
+                margin=dict(l=50, r=30, t=50 if title else 20, b=50),
+            )
+            # Drop None layout keys so Plotly doesn't choke
+            layout = {k: v for k, v in layout.items() if v}
+
+            fig = go.Figure(data=data, layout=layout)
+            return json.loads(pio.to_json(fig))
+        except Exception:
+            return None
 
     # ──────────────────────────── Data loading ────────────────────────────
 

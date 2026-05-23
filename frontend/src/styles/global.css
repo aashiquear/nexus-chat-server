@@ -925,11 +925,17 @@ body {
   overflow: hidden;
 }
 
+.tool-dropdown-header-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+}
+
 .tool-dropdown-header {
   display: flex;
   align-items: center;
   gap: 6px;
-  width: 100%;
+  flex: 1;
   padding: 7px 12px;
   background: none;
   border: none;
@@ -938,10 +944,35 @@ body {
   font-size: 12px;
   font-weight: 500;
   transition: background 0.15s;
+  text-align: left;
 }
 
 .tool-dropdown-header:hover {
   background: var(--bg-secondary);
+}
+
+.tool-dropdown-canvas-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 10px;
+  margin: 4px 6px 4px 0;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-sm);
+  background: var(--accent-subtle);
+  color: var(--accent);
+  font-family: var(--font-body);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.tool-dropdown-canvas-btn:hover {
+  background: var(--accent);
+  color: var(--text-inverse);
+  border-color: var(--accent);
 }
 
 .tool-dropdown-chevron {
@@ -1099,6 +1130,46 @@ body {
   background: var(--accent);
   color: var(--text-inverse);
   border-color: var(--accent);
+}
+
+/* Action buttons (preview / download / copy) inside the plot card header */
+.plot-result-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.plot-result-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--border-light);
+  background: var(--bg-panel);
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.plot-result-action:hover:not(:disabled) {
+  background: var(--accent-subtle);
+  color: var(--accent);
+  border-color: var(--accent-border);
+}
+
+.plot-result-action.copied {
+  background: var(--success);
+  color: white;
+  border-color: var(--success);
+}
+
+.plot-result-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* ---- Plotly Chart Container (inline in chat) ---- */
@@ -2208,6 +2279,32 @@ body {
   border-bottom: 1px solid var(--border-light);
 }
 
+.downloadable-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel-hover);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.file-icon-pdf   { background: rgba(220, 38, 38, 0.12);  color: #c0392b; }
+.file-icon-doc   { background: rgba(37, 99, 235, 0.12);  color: #2563eb; }
+.file-icon-ppt   { background: rgba(234, 88, 12, 0.12);  color: #ea580c; }
+.file-icon-sheet { background: rgba(22, 163, 74, 0.12);  color: #16a34a; }
+.file-icon-image { background: rgba(168, 85, 247, 0.14); color: #9333ea; }
+.file-icon-code  { background: rgba(14, 165, 233, 0.12); color: #0ea5e9; }
+.file-icon-text  { background: rgba(100, 116, 139, 0.14); color: #475569; }
+.file-icon-generic { background: var(--bg-panel-hover); color: var(--text-secondary); }
+
+.downloadable-filename {
+  font-weight: 600;
+  word-break: break-all;
+}
+
 .downloadable-meta {
   margin-left: auto;
   font-size: 11px;
@@ -2267,6 +2364,79 @@ body {
 
 .terminal-line.stderr {
   color: #ff6b6b;
+}
+
+.terminal-line.input {
+  color: #6ec1e4;
+}
+
+.terminal-line.system {
+  color: #d4a017;
+  font-style: italic;
+}
+
+/* ---- Interactive Sandbox Terminal ---- */
+.sandbox-terminal {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+}
+
+.sandbox-terminal .terminal-container {
+  flex: 1;
+  height: auto;
+}
+
+.sandbox-terminal-input {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: #2a2a2a;
+  border-top: 1px solid #3a3a3a;
+}
+
+.sandbox-terminal-prompt {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: #9d9d9d;
+  user-select: none;
+}
+
+.sandbox-terminal-input input {
+  flex: 1;
+  background: #1e1e1e;
+  border: 1px solid #3a3a3a;
+  border-radius: var(--radius-sm);
+  color: #f0f0f0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 8px;
+  outline: none;
+}
+
+.sandbox-terminal-input input:focus {
+  border-color: var(--accent);
+}
+
+.sandbox-terminal-input button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 26px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.sandbox-terminal-input button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .terminal-cursor {

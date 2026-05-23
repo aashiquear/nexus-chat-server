@@ -522,20 +522,29 @@ export default function App() {
             // thinking. The buffer is reset at the start of each new
             // user turn (in handleSend) instead.
 
-            // Auto-open canvas panel for graph plots
+            // Auto-open canvas panel for graph plots / interactive
+            // sandbox sessions. Plotly figure_json wins over PNG so the
+            // user sees the interactive chart by default.
             try {
               const parsed = JSON.parse(event.result)
-              if (parsed && parsed.plot_image) {
-                setCanvasData({
-                  image: parsed.plot_image,
-                  title: parsed.title || 'Generated Plot',
-                })
-              } else if (parsed && parsed.figure_json) {
+              if (parsed && parsed.figure_json) {
                 const figData = typeof parsed.figure_json === 'string'
                   ? JSON.parse(parsed.figure_json) : parsed.figure_json
                 setCanvasData({
                   figureJson: figData,
                   title: parsed.title || figData.layout?.title?.text || 'Interactive Plot',
+                })
+              } else if (parsed && parsed.plot_image) {
+                setCanvasData({
+                  image: parsed.plot_image,
+                  title: parsed.title || 'Generated Plot',
+                })
+              } else if (parsed && parsed.interactive_session) {
+                setCanvasData({
+                  sandboxSessionId: parsed.interactive_session,
+                  title: 'Sandbox Console',
+                  contentType: 'terminal',
+                  chunks: [],
                 })
               } else if (parsed && parsed.downloadable) {
                 // If a downloadable result comes through, the user can
@@ -746,6 +755,8 @@ export default function App() {
             contentType={canvasData.contentType}
             chunks={canvasData.chunks}
             filename={canvasData.filename}
+            previewUrl={canvasData.previewUrl}
+            sandboxSessionId={canvasData.sandboxSessionId}
             title={canvasData.title}
             onClose={() => setCanvasData(null)}
             style={canvasWidth ? { width: canvasWidth } : undefined}

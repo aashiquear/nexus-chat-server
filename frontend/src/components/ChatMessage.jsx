@@ -4,7 +4,10 @@ import {
   BarChart3, Image as ImageIcon, Eye, Copy, Check as CheckIcon,
   Brain, Timer, Download as DownloadIcon, Eye as EyeIcon,
   ChevronUp as ChevronUpIcon, ChevronDown as ChevronDownIcon,
-  FileText as FileTextIcon,
+  FileText as FileTextIcon, FileImage as FileImageIcon,
+  FileCode as FileCodeIcon, FileSpreadsheet as FileSpreadsheetIcon,
+  File as FileIcon, FileType2 as FileType2Icon,
+  Terminal as TerminalIcon, ExternalLink as ExternalLinkIcon,
 } from 'lucide-react'
 import LazyPlot from './LazyPlot'
 
@@ -168,6 +171,40 @@ const LANG_EXT_MAP = {
 function getLangInfo(lang) {
   const key = (lang || '').toLowerCase().trim()
   return LANG_EXT_MAP[key] || { ext: 'txt', contentType: 'text' }
+}
+
+// Pick an icon + colour-class for a downloadable file. Anything that has
+// a viewer in the canvas (PDF, HTML, Markdown, JSON, PNG, etc.) returns
+// previewable: true so the card can show a Preview button.
+function getFileTypeMeta(filename, contentType) {
+  const name = (filename || '').toLowerCase()
+  const ext = name.includes('.') ? name.split('.').pop() : ''
+  const ct = (contentType || '').toLowerCase()
+
+  const isPdf = ext === 'pdf' || ct.includes('pdf')
+  const isImg = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(ext) || ct.startsWith('image/')
+  const isHtml = ['html', 'htm'].includes(ext) || ct.includes('html')
+  const isMd = ['md', 'markdown'].includes(ext) || ct.includes('markdown')
+  const isJson = ext === 'json' || ct.includes('json')
+  const isDoc = ['doc', 'docx'].includes(ext) || ct.includes('wordprocessing')
+  const isPpt = ['ppt', 'pptx'].includes(ext) || ct.includes('presentation')
+  const isSheet = ['xls', 'xlsx', 'csv'].includes(ext) || ct.includes('spreadsheet') || ct.includes('csv')
+  const isCode = ['py', 'js', 'ts', 'jsx', 'tsx', 'c', 'cpp', 'java', 'go', 'rs', 'rb', 'php', 'sh', 'yaml', 'yml', 'xml', 'css'].includes(ext)
+  const isText = ['txt', 'log'].includes(ext) || ct.startsWith('text/')
+
+  let icon = <FileIcon size={14} />
+  let className = 'file-icon-generic'
+  if (isPdf) { icon = <FileType2Icon size={14} />; className = 'file-icon-pdf' }
+  else if (isImg) { icon = <FileImageIcon size={14} />; className = 'file-icon-image' }
+  else if (isDoc) { icon = <FileTextIcon size={14} />; className = 'file-icon-doc' }
+  else if (isPpt) { icon = <FileTextIcon size={14} />; className = 'file-icon-ppt' }
+  else if (isSheet) { icon = <FileSpreadsheetIcon size={14} />; className = 'file-icon-sheet' }
+  else if (isCode || isJson) { icon = <FileCodeIcon size={14} />; className = 'file-icon-code' }
+  else if (isMd || isHtml || isText) { icon = <FileTextIcon size={14} />; className = 'file-icon-text' }
+
+  const previewable = isPdf || isImg || isHtml || isMd || isJson || isText || isCode
+
+  return { icon, className, previewable, ext, isImg, isPdf }
 }
 
 // Copy-to-clipboard code block wrapper with language-aware download & canvas preview
@@ -558,7 +595,47 @@ function renderContent(text, onOpenCanvas) {
   })
 }
 
-function ToolCallDropdown({ toolCall, toolResult }) {
+// Inspect a tool result and decide what canvas view (if any) it should
+// reopen into. Returns null when the result has no canvas-renderable
+// artifact, otherwise an object suitable for handing to onOpenCanvas.
+function buildCanvasDataForResult(toolName, parsedResult) {
+  if (!parsedResult) return null
+  if (parsedResult.figure_json) {
+    let fig = parsedResult.figure_json
+    if (typeof fig === 'string') {
+      try { fig = JSON.parse(fig) } catch { return null }
+    }
+    return {
+      figureJson: fig,
+      title: parsedResult.title || fig?.layout?.title?.text || 'Interactive Plot',
+    }
+  }
+  if (parsedResult.plot_image) {
+    return { image: parsedResult.plot_image, title: parsedResult.title || 'Generated Plot' }
+  }
+  if (parsedResult.downloadable) {
+    const d = parsedResult.downloadable
+    return { filename: d.filename, contentType: d.content_type, title: d.filename }
+  }
+  if (parsedResult.interactive_session) {
+    return {
+      sandboxSessionId: parsedResult.interactive_session,
+      title: 'Sandbox Console',
+      contentType: 'terminal',
+      chunks: [],
+    }
+  }
+  if (toolName === 'code_executor' && parsedResult.output) {
+    return {
+      title: 'Code Output',
+      contentType: 'terminal',
+      chunks: parsedResult.output.split('\n'),
+    }
+  }
+  return null
+}
+
+function ToolCallDropdown({ toolCall, toolResult, onOpenCanvas }) {
   const [isOpen, setIsOpen] = useState(false)
 
   // Parse result to check for special types
@@ -568,6 +645,7 @@ function ToolCallDropdown({ toolCall, toolResult }) {
   }
 
   const hasError = parsed && parsed.error
+  const canvasData = buildCanvasDataForResult(toolCall.name, parsed)
 
   // Determine status icon and label
   let statusIcon, statusText, statusColor
@@ -587,17 +665,29 @@ function ToolCallDropdown({ toolCall, toolResult }) {
 
   return (
     <div className="tool-dropdown">
-      <button
-        className="tool-dropdown-header"
-        onClick={() => setIsOpen(!isOpen)}
-        style={{ color: statusColor }}
-      >
-        <span className="tool-dropdown-chevron">
-          {isOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-        </span>
-        {statusIcon}
-        <span className="tool-dropdown-label">{statusText}</span>
-      </button>
+      <div className="tool-dropdown-header-row">
+        <button
+          className="tool-dropdown-header"
+          onClick={() => setIsOpen(!isOpen)}
+          style={{ color: statusColor }}
+        >
+          <span className="tool-dropdown-chevron">
+            {isOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+          </span>
+          {statusIcon}
+          <span className="tool-dropdown-label">{statusText}</span>
+        </button>
+        {canvasData && onOpenCanvas && (
+          <button
+            className="tool-dropdown-canvas-btn"
+            onClick={(e) => { e.stopPropagation(); onOpenCanvas(canvasData) }}
+            title="Reopen this result in the canvas panel"
+          >
+            <ExternalLinkIcon size={11} />
+            <span>Open in canvas</span>
+          </button>
+        )}
+      </div>
       {isOpen && (
         <div className="tool-dropdown-body">
           {/* Tool call arguments */}
@@ -626,6 +716,215 @@ function ToolCallDropdown({ toolCall, toolResult }) {
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+// Reusable card for a static PNG plot (matplotlib) with preview /
+// download / copy actions, matching the code-block button row.
+function PlotImageCard({ imageName, imageUrl, title, chartType, filename, onOpenCanvas }) {
+  const [copied, setCopied] = useState(false)
+
+  const handleDownload = useCallback(() => {
+    const a = document.createElement('a')
+    a.href = imageUrl
+    a.download = imageName || 'plot.png'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+  }, [imageUrl, imageName])
+
+  const handleCopyImage = useCallback(async () => {
+    try {
+      const blob = await fetch(imageUrl).then((r) => r.blob())
+      if (navigator.clipboard && window.ClipboardItem) {
+        await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })])
+      } else {
+        await navigator.clipboard.writeText(window.location.origin + imageUrl)
+      }
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch (e) {
+      console.error('Copy image failed:', e)
+    }
+  }, [imageUrl])
+
+  return (
+    <div className="plot-result-card">
+      <div className="plot-result-header">
+        <BarChart3 size={14} />
+        <span>{title}</span>
+        <div className="plot-result-actions">
+          <button
+            className="plot-result-action"
+            onClick={() => onOpenCanvas && onOpenCanvas({ image: imageName, title })}
+            title="Preview in canvas"
+          >
+            <EyeIcon size={12} />
+          </button>
+          <button
+            className="plot-result-action"
+            onClick={handleDownload}
+            title="Download PNG"
+          >
+            <DownloadIcon size={12} />
+          </button>
+          <button
+            className={`plot-result-action ${copied ? 'copied' : ''}`}
+            onClick={handleCopyImage}
+            title={copied ? 'Copied!' : 'Copy image'}
+          >
+            {copied ? <CheckIcon size={12} /> : <Copy size={12} />}
+          </button>
+        </div>
+      </div>
+      <div className="plot-result-preview">
+        <img src={imageUrl} alt={title || 'Plot'} className="plot-result-img" />
+      </div>
+      <div className="plot-result-footer">
+        <span className="plot-result-meta">
+          {chartType ? `${chartType} chart — ${filename}` : filename}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+// Plotly card: inline interactive chart plus the same Preview/Download/Copy
+// actions as the static image card. Download converts the plotly JSON to
+// PNG via /api/plots/from-json; copy copies the figure JSON.
+function PlotlyChartCard({ figData, layout, title, fallbackImage, onOpenCanvas }) {
+  const [copied, setCopied] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+
+  const handleCopyJson = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(figData, null, 2))
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch (e) {
+      console.error('Copy plotly JSON failed:', e)
+    }
+  }, [figData])
+
+  const handleDownload = useCallback(async () => {
+    // If the tool already produced a static PNG, just download it.
+    if (fallbackImage) {
+      const a = document.createElement('a')
+      a.href = `/api/plots/${encodeURIComponent(fallbackImage)}`
+      a.download = fallbackImage
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      return
+    }
+    setDownloading(true)
+    try {
+      const res = await fetch('/api/plots/from-json', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ figure_json: figData }),
+      })
+      if (!res.ok) throw new Error('Export failed')
+      const { filename } = await res.json()
+      const a = document.createElement('a')
+      a.href = `/api/plots/${encodeURIComponent(filename)}`
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+    } catch (e) {
+      console.error('Plotly PNG download failed:', e)
+    } finally {
+      setDownloading(false)
+    }
+  }, [figData, fallbackImage])
+
+  return (
+    <div className="plot-result-card plotly-result-card">
+      <div className="plot-result-header">
+        <BarChart3 size={14} />
+        <span>{title}</span>
+        <div className="plot-result-actions">
+          <button
+            className="plot-result-action"
+            onClick={() => onOpenCanvas && onOpenCanvas({ figureJson: figData, title })}
+            title="Preview in canvas"
+          >
+            <EyeIcon size={12} />
+          </button>
+          <button
+            className="plot-result-action"
+            onClick={handleDownload}
+            disabled={downloading}
+            title="Download PNG"
+          >
+            <DownloadIcon size={12} />
+          </button>
+          <button
+            className={`plot-result-action ${copied ? 'copied' : ''}`}
+            onClick={handleCopyJson}
+            title={copied ? 'Copied!' : 'Copy figure JSON'}
+          >
+            {copied ? <CheckIcon size={12} /> : <Copy size={12} />}
+          </button>
+        </div>
+      </div>
+      <div className="plotly-chart-container">
+        <LazyPlot
+          data={figData.data || []}
+          layout={layout}
+          config={{ responsive: true, displayModeBar: false }}
+          useResizeHandler
+          style={{ width: '100%', height: computePlotHeight(figData) }}
+        />
+      </div>
+      <div className="plot-result-footer">
+        <span className="plot-result-meta">Interactive Plotly chart</span>
+      </div>
+    </div>
+  )
+}
+
+// Generic downloadable-file card. Icon and colour change by file type;
+// Preview is only shown when the file is renderable in the canvas
+// (text, code, JSON, Markdown, HTML, PDF, PNG/JPG, etc.).
+function DownloadableFileCard({ file, onOpenCanvas }) {
+  const downloadHref = file.download_url || `/api/download/${encodeURIComponent(file.filename)}`
+  const { icon, className, previewable } = getFileTypeMeta(file.filename, file.content_type)
+  const sizeLabel = file.size != null ? `${(file.size / 1024).toFixed(1)} KB` : ''
+
+  return (
+    <div className="downloadable-card">
+      <div className="downloadable-header">
+        <span className={`downloadable-icon ${className}`}>{icon}</span>
+        <span className="downloadable-filename">{file.filename}</span>
+        <span className="downloadable-meta">
+          {file.content_type}{sizeLabel ? ` — ${sizeLabel}` : ''}
+        </span>
+      </div>
+      <div className="downloadable-actions">
+        {previewable && (
+          <button
+            className="downloadable-btn"
+            onClick={() => onOpenCanvas && onOpenCanvas({
+              filename: file.filename,
+              contentType: file.content_type,
+              previewUrl: downloadHref,
+              title: file.filename,
+            })}
+          >
+            <EyeIcon size={13} /> Preview
+          </button>
+        )}
+        <a
+          className="downloadable-btn"
+          href={downloadHref}
+          download={file.filename}
+        >
+          <DownloadIcon size={13} /> Download
+        </a>
+      </div>
     </div>
   )
 }
@@ -697,6 +996,7 @@ export default function ChatMessage({ message, onOpenCanvas }) {
                 key={i}
                 toolCall={pair.call}
                 toolResult={pair.result}
+                onOpenCanvas={onOpenCanvas}
               />
             ))}
           </div>
@@ -727,38 +1027,22 @@ export default function ChatMessage({ message, onOpenCanvas }) {
             )
           }
 
-          // Graph plot — show thumbnail + open in canvas
-          if (parsed.plot_image) {
+          // Graph plot — show thumbnail + open in canvas. If the tool
+          // also produced an interactive figure_json, the Plotly
+          // renderer below picks it up instead; otherwise we render the
+          // static PNG here with preview/download/copy actions.
+          if (parsed.plot_image && !parsed.figure_json) {
+            const imgUrl = `/api/plots/${encodeURIComponent(parsed.plot_image)}`
             return (
-              <div key={`plot-${i}`} className="plot-result-card">
-                <div className="plot-result-header">
-                  <BarChart3 size={14} />
-                  <span>{parsed.title || 'Generated Plot'}</span>
-                </div>
-                <div className="plot-result-preview">
-                  <img
-                    src={`/api/plots/${encodeURIComponent(parsed.plot_image)}`}
-                    alt={parsed.title || 'Plot'}
-                    className="plot-result-img"
-                  />
-                </div>
-                <div className="plot-result-footer">
-                  <span className="plot-result-meta">
-                    {parsed.chart_type} chart — {parsed.filename}
-                  </span>
-                  <button
-                    className="plot-result-expand"
-                    onClick={() => onOpenCanvas && onOpenCanvas({
-                      image: parsed.plot_image,
-                      title: parsed.title,
-                    })}
-                    title="Open in canvas panel"
-                  >
-                    <Eye size={13} />
-                    Open
-                  </button>
-                </div>
-              </div>
+              <PlotImageCard
+                key={`plot-${i}`}
+                imageName={parsed.plot_image}
+                imageUrl={imgUrl}
+                title={parsed.title || 'Generated Plot'}
+                chartType={parsed.chart_type}
+                filename={parsed.filename}
+                onOpenCanvas={onOpenCanvas}
+              />
             )
           }
 
@@ -807,72 +1091,28 @@ export default function ChatMessage({ message, onOpenCanvas }) {
               plot_bgcolor: 'transparent',
               font: { color: '#c9d1d9' },
             }
+            const plotTitle = parsed.title || figData.layout?.title?.text || 'Interactive Plot'
             return (
-              <div key={`plotly-${i}`} className="plot-result-card plotly-result-card">
-                <div className="plot-result-header">
-                  <BarChart3 size={14} />
-                  <span>{parsed.title || figData.layout?.title?.text || 'Interactive Plot'}</span>
-                </div>
-                <div className="plotly-chart-container">
-                  <LazyPlot
-                    data={figData.data || []}
-                    layout={layout}
-                    config={{ responsive: true, displayModeBar: false }}
-                    useResizeHandler
-                    style={{ width: '100%', height: computePlotHeight(figData) }}
-                  />
-                </div>
-                <div className="plot-result-footer">
-                  <span className="plot-result-meta">
-                    Interactive Plotly chart
-                  </span>
-                  <button
-                    className="plot-result-expand"
-                    onClick={() => onOpenCanvas && onOpenCanvas({
-                      figureJson: figData,
-                      title: parsed.title || figData.layout?.title?.text || 'Interactive Plot',
-                    })}
-                    title="Open in canvas panel"
-                  >
-                    <Eye size={13} />
-                    Open
-                  </button>
-                </div>
-              </div>
+              <PlotlyChartCard
+                key={`plotly-${i}`}
+                figData={figData}
+                layout={layout}
+                title={plotTitle}
+                fallbackImage={parsed.plot_image}
+                onOpenCanvas={onOpenCanvas}
+              />
             )
           }
 
           // Downloadable file result
           if (parsed.downloadable) {
             const d = parsed.downloadable
-            const downloadHref = d.download_url || `/api/download/${encodeURIComponent(d.filename)}`
             return (
-              <div key={`dl-${i}`} className="downloadable-card">
-                <div className="downloadable-header">
-                  <FileTextIcon size={14} />
-                  <span>{d.filename}</span>
-                  <span className="downloadable-meta">{d.content_type} — {(d.size / 1024).toFixed(1)} KB</span>
-                </div>
-                <div className="downloadable-actions">
-                  <a
-                    className="downloadable-btn"
-                    href={downloadHref}
-                    download={d.filename}
-                  >
-                    <DownloadIcon size={13} /> Download
-                  </a>
-                  <button
-                    className="downloadable-btn"
-                    onClick={() => onOpenCanvas && onOpenCanvas({
-                      filename: d.filename,
-                      contentType: d.content_type,
-                      title: d.filename,
-                    })}
-                  >
-                    <EyeIcon size={13} /> Preview
-                  </button>
-                </div>
-              </div>
+              <DownloadableFileCard
+                key={`dl-${i}`}
+                file={d}
+                onOpenCanvas={onOpenCanvas}
+              />
             )
           }
 

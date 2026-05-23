@@ -277,24 +277,83 @@ async def download_file(filename: str):
     return FileResponse(filepath, media_type="application/octet-stream", filename=filename)
 
 
+_EXT_MEDIA_TYPES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".json": "application/json",
+    ".csv": "text/csv",
+}
+
+
 @app.get("/api/files/{filename}")
 async def serve_generated_file(filename: str):
-    """Serve a generated file from the files directory."""
+    """Serve a generated file from the files directory.
+
+    Picks an inline-friendly media type for previewable formats (PDF,
+    PNG, etc.) so the browser can render them in an iframe / <img>
+    rather than forcing a download.
+    """
     filepath = files_dir / filename
     if not filepath.exists():
         raise HTTPException(404, "File not found")
-    return FileResponse(filepath, media_type="application/octet-stream", filename=filename)
+    media_type = _EXT_MEDIA_TYPES.get(filepath.suffix.lower(), "application/octet-stream")
+    return FileResponse(filepath, media_type=media_type)
 
 
 @app.get("/api/preview/{filename}")
 async def preview_file(filename: str):
-    """Return file content for canvas preview."""
-    filepath = download_dir / filename
-    if not filepath.exists():
+    """Return file content for canvas preview.
+
+    Looks in the downloads, files, and data directories. Binary formats
+    (pdf, png, jpg) are returned as a reference URL instead of inline
+    text, so the frontend can embed them via ``<iframe>`` or ``<img>``.
+    """
+    for base in (download_dir, files_dir, Path("./data")):
+        candidate = base / filename
+        if candidate.exists():
+            filepath = candidate
+            break
+    else:
         raise HTTPException(404, "File not found")
-    content = filepath.read_text(encoding="utf-8", errors="replace")
-    # Infer content type from extension
+
     ext = filepath.suffix.lower()
+    binary_types = {
+        ".pdf": ("application/pdf", "pdf"),
+        ".png": ("image/png", "image"),
+        ".jpg": ("image/jpeg", "image"),
+        ".jpeg": ("image/jpeg", "image"),
+        ".gif": ("image/gif", "image"),
+        ".webp": ("image/webp", "image"),
+        ".docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "binary"),
+        ".pptx": ("application/vnd.openxmlformats-officedocument.presentationml.presentation", "binary"),
+    }
+    if ext in binary_types:
+        mime, kind = binary_types[ext]
+        # The actual bytes are fetched from /api/files or /api/plots —
+        # we return a reference URL so the frontend can choose an
+        # appropriate embed (iframe for PDF, <img> for images).
+        if filepath.is_relative_to(files_dir):
+            url = f"/api/files/{filename}"
+        elif filepath.is_relative_to(download_dir):
+            url = f"/api/download/{filename}"
+        else:
+            url = f"/api/plots/{filename}"
+        return {
+            "filename": filename,
+            "content_type": mime,
+            "kind": kind,
+            "url": url,
+        }
+
     content_type = {
         ".md": "text/markdown",
         ".html": "text/html",
@@ -309,7 +368,73 @@ async def preview_file(filename: str):
         ".cpp": "text/x-c++",
         ".h": "text/x-c",
     }.get(ext, "text/plain")
-    return {"content": content, "content_type": content_type, "filename": filename}
+    content = filepath.read_text(encoding="utf-8", errors="replace")
+    return {
+        "content": content,
+        "content_type": content_type,
+        "kind": "text",
+        "filename": filename,
+    }
+
+
+# ------ Sandbox Interactive Session Proxy ------
+
+@app.websocket("/ws/sandbox/interact/{session_id}")
+async def sandbox_interact(websocket: WebSocket, session_id: str):
+    """Bridge the browser to the nexus-sandbox WebSocket.
+
+    The CodeExecutorTool registers the session via
+    ``backend.sandbox_sessions.register_session`` when the tool is
+    called with ``interactive=true``; the frontend then opens this
+    endpoint to send stdin and receive live stdout/stderr.
+    """
+    from backend.sandbox_sessions import consume_session
+    import websockets
+
+    await websocket.accept()
+
+    session = consume_session(session_id)
+    if not session:
+        await websocket.send_text(json.dumps({"type": "stderr", "data": "Unknown or expired session"}))
+        await websocket.close()
+        return
+
+    # Convert http://host:port → ws://host:port/interact
+    base = session.sandbox_url.replace("http://", "ws://").replace("https://", "wss://").rstrip("/")
+    target = f"{base}/interact"
+
+    try:
+        async with websockets.connect(target, ping_interval=None) as sandbox_ws:
+            await sandbox_ws.send(json.dumps({"code": session.code}))
+
+            async def browser_to_sandbox():
+                try:
+                    while True:
+                        msg = await websocket.receive_text()
+                        await sandbox_ws.send(msg)
+                except WebSocketDisconnect:
+                    pass
+                except Exception as e:
+                    logger.warning("browser→sandbox bridge ended: %s", e)
+
+            async def sandbox_to_browser():
+                try:
+                    async for msg in sandbox_ws:
+                        await websocket.send_text(msg if isinstance(msg, str) else msg.decode())
+                except Exception as e:
+                    logger.warning("sandbox→browser bridge ended: %s", e)
+
+            await asyncio.gather(browser_to_sandbox(), sandbox_to_browser())
+    except Exception as e:
+        try:
+            await websocket.send_text(json.dumps({"type": "stderr", "data": f"Sandbox unreachable: {e}"}))
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 MAX_PLOTLY_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
