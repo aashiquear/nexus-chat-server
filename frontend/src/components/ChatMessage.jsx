@@ -890,9 +890,37 @@ function PlotlyChartCard({ figData, layout, title, fallbackImage, onOpenCanvas }
 // Preview is only shown when the file is renderable in the canvas
 // (text, code, JSON, Markdown, HTML, PDF, PNG/JPG, etc.).
 function DownloadableFileCard({ file, onOpenCanvas }) {
-  const downloadHref = file.download_url || `/api/download/${encodeURIComponent(file.filename)}`
+  // Tools should send both URLs explicitly; fall back to sensible
+  // defaults so older tool payloads keep working.
+  const encodedName = encodeURIComponent(file.filename)
+  const downloadHref = file.download_url || `/api/download/${encodedName}`
+  const previewHref = file.preview_url || `/api/files/${encodedName}`
   const { icon, className, previewable } = getFileTypeMeta(file.filename, file.content_type)
   const sizeLabel = file.size != null ? `${(file.size / 1024).toFixed(1)} KB` : ''
+
+  // The HTML ``download`` attribute is best-effort: some browsers ignore
+  // it for cross-origin URLs or certain content types. Programmatic
+  // download via fetch + Blob guarantees a save dialog and gives us a
+  // single code path that works in every environment.
+  const handleDownload = useCallback(async (e) => {
+    e.preventDefault()
+    try {
+      const res = await fetch(downloadHref)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = file.filename
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      console.error('Download failed, falling back to direct nav:', err)
+      window.location.href = downloadHref
+    }
+  }, [downloadHref, file.filename])
 
   return (
     <div className="downloadable-card">
@@ -910,7 +938,7 @@ function DownloadableFileCard({ file, onOpenCanvas }) {
             onClick={() => onOpenCanvas && onOpenCanvas({
               filename: file.filename,
               contentType: file.content_type,
-              previewUrl: downloadHref,
+              previewUrl: previewHref,
               title: file.filename,
             })}
           >
@@ -921,6 +949,7 @@ function DownloadableFileCard({ file, onOpenCanvas }) {
           className="downloadable-btn"
           href={downloadHref}
           download={file.filename}
+          onClick={handleDownload}
         >
           <DownloadIcon size={13} /> Download
         </a>

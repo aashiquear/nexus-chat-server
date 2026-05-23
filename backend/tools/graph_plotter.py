@@ -402,7 +402,6 @@ class GraphPlotterTool(BaseTool):
         """
         try:
             import plotly.graph_objects as go
-            import plotly.io as pio
         except ImportError:
             return None
 
@@ -629,7 +628,16 @@ class GraphPlotterTool(BaseTool):
             layout = {k: v for k, v in layout.items() if v}
 
             fig = go.Figure(data=data, layout=layout)
-            return json.loads(pio.to_json(fig))
+            # ``pio.to_json`` includes the default Plotly template — a 7KB+
+            # blob that bloats the websocket payload and clashes with the
+            # frontend's own layout overrides (paper_bgcolor, font, etc.).
+            # Serialize without it so the JSON is small and the frontend
+            # styling wins cleanly.
+            fig_dict = fig.to_dict()
+            if isinstance(fig_dict.get("layout"), dict):
+                fig_dict["layout"].pop("template", None)
+            # Make sure the result is JSON-clean (numpy → list, etc.).
+            return json.loads(json.dumps(fig_dict, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
         except Exception:
             return None
 

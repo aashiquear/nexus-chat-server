@@ -185,12 +185,18 @@ class FileGeneratorTool(BaseTool):
     def _downloadable_response(self, filepath: Path, content_type: str) -> str:
         size = filepath.stat().st_size
         filename = filepath.name
+        # ``download_url`` points at /api/download (forces an attachment
+        # via Content-Disposition so clicking the link always saves the
+        # file, regardless of MIME type). ``preview_url`` points at
+        # /api/files (serves the file inline with its proper MIME type)
+        # so the canvas can embed PDFs in an iframe and images in <img>.
         return json.dumps({
             "downloadable": {
                 "filename": filename,
                 "content_type": content_type,
                 "size": size,
-                "download_url": f"/api/files/{filename}",
+                "download_url": f"/api/download/{filename}",
+                "preview_url": f"/api/files/{filename}",
             }
         })
 
