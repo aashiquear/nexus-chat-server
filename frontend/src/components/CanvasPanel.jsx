@@ -167,8 +167,18 @@ export default function CanvasPanel({
   // Effective content fields — the inline-provided values win, otherwise
   // fall back to whatever /api/preview returned.
   const effectiveContent = content || previewData?.content || "";
+  // Callers pass either a raw MIME type (e.g. "application/pdf" from a
+  // downloadable card) or an already-normalized short type (e.g.
+  // "terminal", "markdown"). Normalize only the MIME variants so the
+  // render branches below — which compare against "pdf", "image", … —
+  // match. Short types are passed through untouched.
+  const normalizedContentType = contentType
+    ? contentType.includes("/")
+      ? normalizeContentType(contentType)
+      : contentType
+    : null;
   const effectiveContentType =
-    contentType ||
+    normalizedContentType ||
     normalizeContentType(previewData?.content_type) ||
     (previewData?.kind === "pdf" ? "pdf" : null) ||
     (previewData?.kind === "image" ? "image" : null) ||
