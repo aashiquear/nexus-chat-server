@@ -196,13 +196,58 @@ class FileGeneratorTool(BaseTool):
                     "filename": filename,
                     "content_type": content_type,
                     "size": size,
-                    "download_url": f"/api/downloads/{filename}",
+                    "download_url": f"/api/download/{filename}",
                     "preview_url": f"/api/files/{filename}",
                 }
             }
         )
 
     # ─────────────────────────── PDF ───────────────────────────
+
+    # Transliteration map for characters the latin-1 core fonts (Helvetica)
+    # cannot render. Used only when no Unicode TTF font is available.
+    _LATIN1_FALLBACK = {
+        "•": "-", "◦": "-", "▪": "-", "‣": "-", "·": "-", "●": "-",
+        "“": '"', "”": '"', "„": '"', "‘": "'", "’": "'", "‚": "'",
+        "–": "-", "—": "-", "―": "-", "−": "-",
+        "…": "...", "→": "->", "←": "<-", "⇒": "=>", "⇐": "<=",
+        "™": "(TM)", "®": "(R)", "©": "(C)", "°": " deg",
+        "≤": "<=", "≥": ">=", "≠": "!=", "×": "x", "÷": "/",
+        " ": " ", "​": "", "﻿": "", "\t": "    ",
+    }
+
+    def _register_pdf_font(self, pdf) -> tuple[str, bool]:
+        """Register a Unicode TTF font if one is available on the system.
+
+        Returns ``(family, unicode_ok)``. When a TTF is found the document
+        can render arbitrary Unicode (bullets, smart quotes, accents …).
+        Otherwise we fall back to the built-in Helvetica core font, which is
+        limited to latin-1 and requires the caller to transliterate text.
+        """
+        candidates = [
+            (
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            ),
+            (
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            ),
+            (
+                "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+                "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            ),
+        ]
+        for regular, bold in candidates:
+            if not os.path.exists(regular):
+                continue
+            try:
+                pdf.add_font("DocFont", "", regular)
+                pdf.add_font("DocFont", "B", bold if os.path.exists(bold) else regular)
+                return "DocFont", True
+            except Exception as e:  # pragma: no cover - font load is environment-specific
+                logger.warning("Failed to register Unicode font %s: %s", regular, e)
+        return "Helvetica", False
 
     def _generate_pdf(
         self, content: str, title: str, suggested_filename: str, output_dir: Path
@@ -218,41 +263,67 @@ class FileGeneratorTool(BaseTool):
         pdf = FPDF()
         pdf.set_auto_page_break(auto=True, margin=15)
         pdf.add_page()
-        pdf.set_font("Helvetica", "", 12)
+
+        font_family, unicode_ok = self._register_pdf_font(pdf)
+        bullet = "• " if unicode_ok else "- "
+
+        def sanitize(text: str) -> str:
+            if unicode_ok:
+                return text
+            for bad, good in self._LATIN1_FALLBACK.items():
+                text = text.replace(bad, good)
+            # Drop anything still outside latin-1 so fpdf never raises.
+            return text.encode("latin-1", "replace").decode("latin-1")
+
+        def write(text: str, size: int, bold: bool = False, indent: float = 0.0) -> None:
+            """Render a block of text safely.
+
+            ``wrapmode="CHAR"`` lets fpdf break overly long unbroken tokens
+            (URLs, hashes …) at the character level instead of raising
+            "Not enough horizontal space to render a single character".
+            """
+            pdf.set_font(font_family, "B" if bold else "", size)
+            text = sanitize(text)
+            if not text:
+                pdf.ln(size * 0.35)
+                return
+            width = max(pdf.epw - indent, 1.0)
+            if indent:
+                pdf.set_x(pdf.l_margin + indent)
+            pdf.multi_cell(
+                width,
+                size * 0.5,
+                text,
+                align="L",
+                new_x="LMARGIN",
+                new_y="NEXT",
+                wrapmode="CHAR",
+            )
 
         if title:
-            pdf.set_font("Helvetica", "B", 16)
-            pdf.cell(0, 10, title, ln=True, align="C")
+            pdf.set_font(font_family, "B", 16)
+            pdf.multi_cell(
+                0, 10, sanitize(title), align="C",
+                new_x="LMARGIN", new_y="NEXT", wrapmode="CHAR",
+            )
             pdf.ln(5)
-            pdf.set_font("Helvetica", "", 12)
 
-        lines = content.splitlines()
-        for raw_line in lines:
+        for raw_line in content.splitlines():
             line = raw_line.rstrip()
             if not line:
                 pdf.ln(4)
-                continue
-
-            if line.startswith("### "):
-                pdf.set_font("Helvetica", "B", 13)
-                pdf.cell(0, 8, line[4:].strip(), ln=True)
-                pdf.set_font("Helvetica", "", 12)
+            elif line.startswith("### "):
+                write(line[4:].strip(), 13, bold=True)
             elif line.startswith("## "):
-                pdf.set_font("Helvetica", "B", 14)
-                pdf.cell(0, 9, line[3:].strip(), ln=True)
-                pdf.set_font("Helvetica", "", 12)
+                write(line[3:].strip(), 14, bold=True)
             elif line.startswith("# "):
-                pdf.set_font("Helvetica", "B", 16)
-                pdf.cell(0, 10, line[2:].strip(), ln=True)
-                pdf.set_font("Helvetica", "", 12)
+                write(line[2:].strip(), 16, bold=True)
             elif line.startswith("- ") or line.startswith("* "):
-                pdf.cell(5)
-                pdf.cell(0, 6, "• " + line[2:].strip(), ln=True)
+                write(bullet + line[2:].strip(), 12, indent=5)
             elif re.match(r"^\d+\.\s", line):
-                pdf.cell(5)
-                pdf.cell(0, 6, line.strip(), ln=True)
+                write(line.strip(), 12, indent=5)
             else:
-                pdf.multi_cell(0, 6, line)
+                write(line, 12)
 
         pdf.output(str(filepath))
         return self._downloadable_response(filepath, "application/pdf")
