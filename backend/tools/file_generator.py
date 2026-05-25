@@ -150,7 +150,7 @@ class FileGeneratorTool(BaseTool):
         title = kwargs.get("title", "")
         suggested_filename = kwargs.get("filename", "")
 
-        output_dir = Path(self.config.get("output_dir", "./data/files"))
+        output_dir = Path(self.config.get("output_dir", "./data/downloads"))
         output_dir.mkdir(parents=True, exist_ok=True)
 
         if not content:
@@ -190,19 +190,23 @@ class FileGeneratorTool(BaseTool):
         # file, regardless of MIME type). ``preview_url`` points at
         # /api/files (serves the file inline with its proper MIME type)
         # so the canvas can embed PDFs in an iframe and images in <img>.
-        return json.dumps({
-            "downloadable": {
-                "filename": filename,
-                "content_type": content_type,
-                "size": size,
-                "download_url": f"/api/download/{filename}",
-                "preview_url": f"/api/files/{filename}",
+        return json.dumps(
+            {
+                "downloadable": {
+                    "filename": filename,
+                    "content_type": content_type,
+                    "size": size,
+                    "download_url": f"/api/downloads/{filename}",
+                    "preview_url": f"/api/files/{filename}",
+                }
             }
-        })
+        )
 
     # ─────────────────────────── PDF ───────────────────────────
 
-    def _generate_pdf(self, content: str, title: str, suggested_filename: str, output_dir: Path) -> str:
+    def _generate_pdf(
+        self, content: str, title: str, suggested_filename: str, output_dir: Path
+    ) -> str:
         try:
             from fpdf import FPDF
         except ImportError:
@@ -255,13 +259,17 @@ class FileGeneratorTool(BaseTool):
 
     # ─────────────────────────── DOCX ───────────────────────────
 
-    def _generate_doc(self, content: str, title: str, suggested_filename: str, output_dir: Path) -> str:
+    def _generate_doc(
+        self, content: str, title: str, suggested_filename: str, output_dir: Path
+    ) -> str:
         try:
             from docx import Document
-            from docx.shared import Inches, Pt
             from docx.enum.text import WD_ALIGN_PARAGRAPH
+            from docx.shared import Inches, Pt
         except ImportError:
-            return json.dumps({"error": "python-docx is not installed. Run: pip install python-docx"})
+            return json.dumps(
+                {"error": "python-docx is not installed. Run: pip install python-docx"}
+            )
 
         filename = self._make_filename(suggested_filename, "doc")
         filepath = output_dir / filename
@@ -292,16 +300,22 @@ class FileGeneratorTool(BaseTool):
                 doc.add_paragraph(stripped)
 
         doc.save(str(filepath))
-        return self._downloadable_response(filepath, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        return self._downloadable_response(
+            filepath, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
 
     # ─────────────────────────── PPTX ───────────────────────────
 
-    def _generate_ppt(self, content: str, title: str, suggested_filename: str, output_dir: Path) -> str:
+    def _generate_ppt(
+        self, content: str, title: str, suggested_filename: str, output_dir: Path
+    ) -> str:
         try:
             from pptx import Presentation
             from pptx.util import Inches, Pt
         except ImportError:
-            return json.dumps({"error": "python-pptx is not installed. Run: pip install python-pptx"})
+            return json.dumps(
+                {"error": "python-pptx is not installed. Run: pip install python-pptx"}
+            )
 
         filename = self._make_filename(suggested_filename, "ppt")
         filepath = output_dir / filename
@@ -372,11 +386,15 @@ class FileGeneratorTool(BaseTool):
                         p.level = 0
 
         prs.save(str(filepath))
-        return self._downloadable_response(filepath, "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        return self._downloadable_response(
+            filepath, "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        )
 
     # ─────────────────────────── PNG ───────────────────────────
 
-    async def _generate_png(self, content: str, title: str, suggested_filename: str, output_dir: Path) -> str:
+    async def _generate_png(
+        self, content: str, title: str, suggested_filename: str, output_dir: Path
+    ) -> str:
         try:
             from PIL import Image, ImageDraw, ImageFont
         except ImportError:
@@ -451,8 +469,10 @@ class FileGeneratorTool(BaseTool):
 
     def _try_base64_to_image(self, content: str):
         try:
-            from PIL import Image
             import io
+
+            from PIL import Image
+
             cleaned = re.sub(r"^data:image/[^;]+;base64,", "", content.strip())
             cleaned = re.sub(r"\s", "", cleaned)
             decoded = base64.b64decode(cleaned)
@@ -463,6 +483,7 @@ class FileGeneratorTool(BaseTool):
     def _get_font(self, size: int):
         try:
             from PIL import ImageFont
+
             candidates = [
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                 "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -476,4 +497,5 @@ class FileGeneratorTool(BaseTool):
         except Exception:
             pass
         from PIL import ImageFont
+
         return ImageFont.load_default()

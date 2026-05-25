@@ -410,13 +410,18 @@ function formatInline(text) {
     )
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, linkText, url) => {
       const isExternal = /^https?:\/\//i.test(url);
-      const isDownload = url.startsWith("/api/download/");
+      const isDownload =
+        url.startsWith("/api/download/") || /\/api\/download\//.test(url);
       const attrs = [];
-      if (isExternal) {
+      if (isExternal && !isDownload) {
         attrs.push('target="_blank" rel="noopener noreferrer"');
       }
       if (isDownload) {
+        // download + target="_blank" gives every browser a safe fallback:
+        // if the download attribute is ignored the file opens in a new tab
+        // instead of reloading the current SPA.
         attrs.push("download");
+        attrs.push('target="_blank"');
       }
       return `<a href="${url}"${attrs.length ? " " + attrs.join(" ") : ""}>${linkText}</a>`;
     })
@@ -797,8 +802,6 @@ function buildCanvasDataForResult(toolName, parsedResult) {
 }
 
 function ToolCallDropdown({ toolCall, toolResult, onOpenCanvas }) {
-  const [isOpen, setIsOpen] = useState(false);
-
   // Parse result to check for special types
   let parsed = null;
   if (toolResult) {
@@ -813,6 +816,11 @@ function ToolCallDropdown({ toolCall, toolResult, onOpenCanvas }) {
     parsed &&
     (parsed.error || (parsed.return_code != null && parsed.return_code !== 0));
   const canvasData = buildCanvasDataForResult(toolCall.name, parsed);
+
+  // Auto-open the dropdown when the tool produced a renderable
+  // artifact (plot, file, sandbox session) so the user can immediately
+  // see the "Open in canvas" action and the raw result.
+  const [isOpen, setIsOpen] = useState(() => !!canvasData);
 
   // Determine status icon and label
   let statusIcon, statusText, statusColor;
@@ -1015,7 +1023,10 @@ function PlotlyChartCard({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ figure_json: figData }),
       });
-      if (!res.ok) throw new Error("Export failed");
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`Export failed: ${res.status} ${text}`);
+      }
       const { filename } = await res.json();
       const a = document.createElement("a");
       a.href = `/api/plots/${encodeURIComponent(filename)}`;
@@ -1025,6 +1036,7 @@ function PlotlyChartCard({
       document.body.removeChild(a);
     } catch (e) {
       console.error("Plotly PNG download failed:", e);
+      alert(`Plotly export failed: ${e.message}`);
     } finally {
       setDownloading(false);
     }
@@ -1211,10 +1223,7 @@ function DownloadableFileCard({ file, onOpenCanvas }) {
   // Tools should send both URLs explicitly; fall back to sensible
   // defaults so older tool payloads keep working.
   const encodedName = encodeURIComponent(file.filename);
-  const downloadHref =
-    file.download_url ||
-    `/api/files/${encodedName}` ||
-    `/api/download/${encodedName}`;
+  const downloadHref = file.download_url || `/api/download/${encodedName}`;
   const previewHref = file.preview_url || `/api/files/${encodedName}`;
   const { icon, className, previewable, isImg } = getFileTypeMeta(
     file.filename,
@@ -1223,6 +1232,34 @@ function DownloadableFileCard({ file, onOpenCanvas }) {
   const sizeLabel =
     file.size != null ? `${(file.size / 1024).toFixed(1)} KB` : "";
   const [copied, setCopied] = useState(false);
+
+  const handleDownload = useCallback(() => {
+    fetch(downloadHref)
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.blob();
+      })
+      .then((blob) => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = file.filename;
+        a.style.display = "none";
+        document.body.appendChild(a);
+        a.click();
+        // Keep the blob URL alive long enough for Chrome to start the
+        // download stream. Revoking too early cancels the transfer.
+        setTimeout(() => {
+          URL.revokeObjectURL(url);
+          if (a.parentNode) a.parentNode.removeChild(a);
+        }, 5000);
+      })
+      .catch((err) => {
+        console.error("Download failed:", err);
+        // Fallback for any browser that blocks programmatic downloads.
+        window.open(downloadHref, "_blank");
+      });
+  }, [downloadHref, file.filename]);
 
   const handleCopy = useCallback(async () => {
     try {
@@ -1297,13 +1334,13 @@ function DownloadableFileCard({ file, onOpenCanvas }) {
             <EyeIcon size={13} /> Preview
           </button>
         )}
-        <a
+        <button
           className="downloadable-btn"
-          href={downloadHref}
-          download={file.filename}
+          onClick={handleDownload}
+          title="Download file"
         >
           <DownloadIcon size={13} /> Download
-        </a>
+        </button>
         <button
           className={`downloadable-btn ${copied ? "copied" : ""}`}
           onClick={handleCopy}

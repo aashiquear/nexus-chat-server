@@ -312,17 +312,18 @@ _EXT_MEDIA_TYPES = {
 
 @app.get("/api/files/{filename}")
 async def serve_generated_file(filename: str):
-    """Serve a generated file from the files directory.
+    """Serve a generated file from the files/downloads directory.
 
     Picks an inline-friendly media type for previewable formats (PDF,
     PNG, etc.) so the browser can render them in an iframe / <img>
     rather than forcing a download.
     """
-    filepath = files_dir / filename
-    if not filepath.exists():
-        raise HTTPException(404, "File not found")
-    media_type = _EXT_MEDIA_TYPES.get(filepath.suffix.lower(), "application/octet-stream")
-    return FileResponse(filepath, media_type=media_type)
+    for base in (files_dir, download_dir, Path("./data")):
+        filepath = base / filename
+        if filepath.exists():
+            media_type = _EXT_MEDIA_TYPES.get(filepath.suffix.lower(), "application/octet-stream")
+            return FileResponse(filepath, media_type=media_type)
+    raise HTTPException(404, "File not found")
 
 
 @app.get("/api/preview/{filename}")
@@ -360,15 +361,10 @@ async def preview_file(filename: str):
     }
     if ext in binary_types:
         mime, kind = binary_types[ext]
-        # The actual bytes are fetched from /api/files or /api/plots —
-        # we return a reference URL so the frontend can choose an
-        # appropriate embed (iframe for PDF, <img> for images).
-        if filepath.is_relative_to(files_dir):
-            url = f"/api/files/{filename}"
-        elif filepath.is_relative_to(download_dir):
-            url = f"/api/download/{filename}"
-        else:
-            url = f"/api/plots/{filename}"
+        # /api/files/{filename} now searches files_dir, download_dir,
+        # and ./data, and serves inline with the correct MIME type —
+        # perfect for canvas embeds (iframe for PDF, <img> for images).
+        url = f"/api/files/{filename}"
         return {
             "filename": filename,
             "content_type": mime,

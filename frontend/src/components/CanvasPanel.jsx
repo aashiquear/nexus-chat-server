@@ -198,12 +198,31 @@ export default function CanvasPanel({
     }
 
     if (filename) {
-      const a = document.createElement("a");
-      a.href = `/api/files/${encodeURIComponent(filename)}`;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
+      fetch(`/api/download/${encodeURIComponent(filename)}`)
+        .then((res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.blob();
+        })
+        .then((blob) => {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = filename;
+          a.style.display = "none";
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => {
+            URL.revokeObjectURL(url);
+            if (a.parentNode) a.parentNode.removeChild(a);
+          }, 5000);
+        })
+        .catch((err) => {
+          console.error("Canvas download failed:", err);
+          window.open(
+            `/api/download/${encodeURIComponent(filename)}`,
+            "_blank",
+          );
+        });
       return;
     }
 
@@ -215,7 +234,10 @@ export default function CanvasPanel({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ figure_json: figureJson }),
       });
-      if (!res.ok) throw new Error("Export failed");
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`Export failed: ${res.status} ${text}`);
+      }
       const { filename: fname } = await res.json();
       const a = document.createElement("a");
       a.href = `/api/plots/${encodeURIComponent(fname)}`;
@@ -225,6 +247,7 @@ export default function CanvasPanel({
       document.body.removeChild(a);
     } catch (err) {
       console.error("Plotly PNG download failed:", err);
+      alert(`Plotly export failed: ${err.message}`);
     } finally {
       setDownloading(false);
     }
@@ -314,7 +337,7 @@ export default function CanvasPanel({
       );
     }
 
-    // PDF preview via iframe
+    // PDF preview via embed (more reliable than iframe for PDFs)
     if (effectiveContentType === "pdf" && effectivePreviewUrl) {
       if (iframeError) {
         return (
@@ -333,23 +356,40 @@ export default function CanvasPanel({
           >
             <FileText size={32} />
             <span>Unable to preview PDF inline.</span>
-            <a
+            <button
               className="downloadable-btn"
-              href={effectivePreviewUrl}
-              download={filename}
+              onClick={() => {
+                fetch(effectivePreviewUrl)
+                  .then((r) => r.blob())
+                  .then((blob) => {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = filename || "document.pdf";
+                    a.style.display = "none";
+                    document.body.appendChild(a);
+                    a.click();
+                    setTimeout(() => {
+                      URL.revokeObjectURL(url);
+                      if (a.parentNode) a.parentNode.removeChild(a);
+                    }, 5000);
+                  })
+                  .catch((e) => console.error("PDF download failed:", e));
+              }}
               style={{ marginTop: 8 }}
             >
               <Download size={13} /> Download PDF
-            </a>
+            </button>
           </div>
         );
       }
       return (
-        <iframe
+        <embed
           src={effectivePreviewUrl}
-          title={title || "PDF Preview"}
+          type="application/pdf"
           className="canvas-preview-iframe"
           onError={() => setIframeError(true)}
+          style={{ width: "100%", height: "100%", border: "none" }}
         />
       );
     }
