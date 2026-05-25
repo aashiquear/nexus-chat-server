@@ -8,15 +8,23 @@ import json
 import logging
 import os
 import sys
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-import uuid
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request, BackgroundTasks
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 # Load env vars before importing config
 load_dotenv()
@@ -24,21 +32,21 @@ load_dotenv()
 # Ensure backend is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from backend.config import load_config, get_config
-from backend.orchestrator import ChatOrchestrator
-from backend import conversations
+import backend.mcp  # noqa: F401 – MCP client module
 
 # Import providers and tools to trigger registration
 import backend.providers.anthropic_provider
-import backend.providers.openai_provider
 import backend.providers.ollama_provider
+import backend.providers.openai_provider
 import backend.tools.builtin
 import backend.tools.example_tool
-import backend.tools.svg_diagram
+import backend.tools.file_generator
 import backend.tools.graph_plotter
 import backend.tools.image_synthesizer
-import backend.tools.file_generator
-import backend.mcp  # noqa: F401 – MCP client module
+import backend.tools.svg_diagram
+from backend import conversations
+from backend.config import get_config, load_config
+from backend.orchestrator import ChatOrchestrator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -77,6 +85,7 @@ files_dir.mkdir(parents=True, exist_ok=True)
 
 # ------ Startup event: initialize async services ------
 
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize MCP connections, sync uploads, and pre-load heavy models."""
@@ -93,6 +102,7 @@ async def startup_event():
         async def _warmup_diffusion():
             try:
                 from backend.tools.file_generator import _ensure_diffusion_loaded
+
                 logger.info("Pre-loading diffusion model in background …")
                 await asyncio.to_thread(_ensure_diffusion_loaded, cache_dir)
                 logger.info("Diffusion model pre-loaded successfully.")
@@ -103,6 +113,7 @@ async def startup_event():
 
 
 # ------ REST API Endpoints ------
+
 
 @app.get("/api/health")
 async def health():
@@ -188,6 +199,7 @@ async def upload_file(file: UploadFile = File(...)):
                 rag._set_progress(file.filename, stage="error", percent=0)
 
         import asyncio
+
         asyncio.create_task(_ingest_in_background())
         embedding_status = "started"
 
@@ -225,11 +237,13 @@ async def list_files():
     files = []
     for f in upload_dir.iterdir():
         if f.is_file():
-            files.append({
-                "name": f.name,
-                "size": f.stat().st_size,
-                "extension": f.suffix,
-            })
+            files.append(
+                {
+                    "name": f.name,
+                    "size": f.stat().st_size,
+                    "extension": f.suffix,
+                }
+            )
     return {"files": files}
 
 
@@ -251,6 +265,7 @@ async def delete_file(filename: str):
 
 # ------ Plot Image Endpoint ------
 
+
 @app.get("/api/plots/{filename}")
 async def serve_plot_file(filename: str):
     """Serve a generated plot image from the data directory."""
@@ -266,6 +281,7 @@ async def serve_plot_file(filename: str):
 
 # ------ Download / Preview Endpoints ------
 
+
 @app.get("/api/download/{filename}")
 async def download_file(filename: str):
     """Serve a downloadable file from the downloads or files directory."""
@@ -277,24 +293,85 @@ async def download_file(filename: str):
     return FileResponse(filepath, media_type="application/octet-stream", filename=filename)
 
 
+_EXT_MEDIA_TYPES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".json": "application/json",
+    ".csv": "text/csv",
+}
+
+
 @app.get("/api/files/{filename}")
 async def serve_generated_file(filename: str):
-    """Serve a generated file from the files directory."""
-    filepath = files_dir / filename
-    if not filepath.exists():
-        raise HTTPException(404, "File not found")
-    return FileResponse(filepath, media_type="application/octet-stream", filename=filename)
+    """Serve a generated file from the files/downloads directory.
+
+    Picks an inline-friendly media type for previewable formats (PDF,
+    PNG, etc.) so the browser can render them in an iframe / <img>
+    rather than forcing a download.
+    """
+    for base in (files_dir, download_dir, Path("./data")):
+        filepath = base / filename
+        if filepath.exists():
+            media_type = _EXT_MEDIA_TYPES.get(filepath.suffix.lower(), "application/octet-stream")
+            return FileResponse(filepath, media_type=media_type)
+    raise HTTPException(404, "File not found")
 
 
 @app.get("/api/preview/{filename}")
 async def preview_file(filename: str):
-    """Return file content for canvas preview."""
-    filepath = download_dir / filename
-    if not filepath.exists():
+    """Return file content for canvas preview.
+
+    Looks in the downloads, files, and data directories. Binary formats
+    (pdf, png, jpg) are returned as a reference URL instead of inline
+    text, so the frontend can embed them via ``<iframe>`` or ``<img>``.
+    """
+    for base in (download_dir, files_dir, Path("./data")):
+        candidate = base / filename
+        if candidate.exists():
+            filepath = candidate
+            break
+    else:
         raise HTTPException(404, "File not found")
-    content = filepath.read_text(encoding="utf-8", errors="replace")
-    # Infer content type from extension
+
     ext = filepath.suffix.lower()
+    binary_types = {
+        ".pdf": ("application/pdf", "pdf"),
+        ".png": ("image/png", "image"),
+        ".jpg": ("image/jpeg", "image"),
+        ".jpeg": ("image/jpeg", "image"),
+        ".gif": ("image/gif", "image"),
+        ".webp": ("image/webp", "image"),
+        ".docx": (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "binary",
+        ),
+        ".pptx": (
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "binary",
+        ),
+    }
+    if ext in binary_types:
+        mime, kind = binary_types[ext]
+        # /api/files/{filename} now searches files_dir, download_dir,
+        # and ./data, and serves inline with the correct MIME type —
+        # perfect for canvas embeds (iframe for PDF, <img> for images).
+        url = f"/api/files/{filename}"
+        return {
+            "filename": filename,
+            "content_type": mime,
+            "kind": kind,
+            "url": url,
+        }
+
     content_type = {
         ".md": "text/markdown",
         ".html": "text/html",
@@ -309,7 +386,79 @@ async def preview_file(filename: str):
         ".cpp": "text/x-c++",
         ".h": "text/x-c",
     }.get(ext, "text/plain")
-    return {"content": content, "content_type": content_type, "filename": filename}
+    content = filepath.read_text(encoding="utf-8", errors="replace")
+    return {
+        "content": content,
+        "content_type": content_type,
+        "kind": "text",
+        "filename": filename,
+    }
+
+
+# ------ Sandbox Interactive Session Proxy ------
+
+
+@app.websocket("/ws/sandbox/interact/{session_id}")
+async def sandbox_interact(websocket: WebSocket, session_id: str):
+    """Bridge the browser to the nexus-sandbox WebSocket.
+
+    The CodeExecutorTool registers the session via
+    ``backend.sandbox_sessions.register_session`` when the tool is
+    called with ``interactive=true``; the frontend then opens this
+    endpoint to send stdin and receive live stdout/stderr.
+    """
+    import websockets
+
+    from backend.sandbox_sessions import peek_session
+
+    await websocket.accept()
+
+    session = peek_session(session_id)
+    if not session:
+        await websocket.send_text(
+            json.dumps({"type": "stderr", "data": "Unknown or expired session"})
+        )
+        await websocket.close()
+        return
+
+    # Convert http://host:port → ws://host:port/interact
+    base = session.sandbox_url.replace("http://", "ws://").replace("https://", "wss://").rstrip("/")
+    target = f"{base}/interact"
+
+    try:
+        async with websockets.connect(target, ping_interval=None) as sandbox_ws:
+            await sandbox_ws.send(json.dumps({"code": session.code}))
+
+            async def browser_to_sandbox():
+                try:
+                    while True:
+                        msg = await websocket.receive_text()
+                        await sandbox_ws.send(msg)
+                except WebSocketDisconnect:
+                    pass
+                except Exception as e:
+                    logger.warning("browser→sandbox bridge ended: %s", e)
+
+            async def sandbox_to_browser():
+                try:
+                    async for msg in sandbox_ws:
+                        await websocket.send_text(msg if isinstance(msg, str) else msg.decode())
+                except Exception as e:
+                    logger.warning("sandbox→browser bridge ended: %s", e)
+
+            await asyncio.gather(browser_to_sandbox(), sandbox_to_browser())
+    except Exception as e:
+        try:
+            await websocket.send_text(
+                json.dumps({"type": "stderr", "data": f"Sandbox unreachable: {e}"})
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 MAX_PLOTLY_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -323,14 +472,18 @@ async def plotly_json_to_png(request: Request):
 
         raw_body = await request.body()
         if len(raw_body) > MAX_PLOTLY_BODY_BYTES:
-            raise HTTPException(413, f"Request body exceeds {MAX_PLOTLY_BODY_BYTES // (1024 * 1024)} MB limit")
+            raise HTTPException(
+                413, f"Request body exceeds {MAX_PLOTLY_BODY_BYTES // (1024 * 1024)} MB limit"
+            )
 
         body = json.loads(raw_body)
         figure_json = body.get("figure_json")
         if not figure_json:
             raise HTTPException(400, "Missing figure_json in request body")
 
-        fig = pio.from_json(json.dumps(figure_json) if isinstance(figure_json, dict) else figure_json)
+        fig = pio.from_json(
+            json.dumps(figure_json) if isinstance(figure_json, dict) else figure_json
+        )
         filename = f"plotly-{uuid.uuid4().hex[:8]}.png"
         data_dir = Path("./data")
         data_dir.mkdir(exist_ok=True)
@@ -345,6 +498,7 @@ async def plotly_json_to_png(request: Request):
 
 
 # ------ MCP Server Endpoints ------
+
 
 @app.get("/api/mcp/servers")
 async def list_mcp_servers():
@@ -405,6 +559,7 @@ async def delete_conversation_endpoint(conversation_id: str):
 
 # ------ WebSocket Chat ------
 
+
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
     """WebSocket endpoint for streaming chat."""
@@ -435,9 +590,7 @@ async def websocket_chat(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         try:
-            await websocket.send_text(
-                json.dumps({"type": "error", "content": str(e)})
-            )
+            await websocket.send_text(json.dumps({"type": "error", "content": str(e)}))
         except Exception:
             pass
 
@@ -459,6 +612,7 @@ if frontend_dir.exists():
 def main():
     """Run the server."""
     import uvicorn
+
     host = app_config.get("host", "0.0.0.0")
     port = app_config.get("port", 8000)
     debug = app_config.get("debug", False)

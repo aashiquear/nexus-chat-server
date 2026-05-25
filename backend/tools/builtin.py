@@ -2,14 +2,14 @@
 
 import ast
 import asyncio
-import math
-import operator
 import datetime as dt
 import json
 import logging
+import math
+import operator
+import os
 import subprocess
 import tempfile
-import os
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -28,18 +28,27 @@ class CalculatorTool(BaseTool):
         "properties": {
             "expression": {
                 "type": "string",
-                "description": "Mathematical expression to evaluate, e.g. '2 + 3 * 4' or 'sqrt(16)'"
+                "description": "Mathematical expression to evaluate, e.g. '2 + 3 * 4' or 'sqrt(16)'",
             }
         },
-        "required": ["expression"]
+        "required": ["expression"],
     }
 
     SAFE_FUNCTIONS = {
-        "sqrt": math.sqrt, "abs": abs, "round": round,
-        "sin": math.sin, "cos": math.cos, "tan": math.tan,
-        "log": math.log, "log10": math.log10, "log2": math.log2,
-        "pi": math.pi, "e": math.e, "pow": pow,
-        "floor": math.floor, "ceil": math.ceil,
+        "sqrt": math.sqrt,
+        "abs": abs,
+        "round": round,
+        "sin": math.sin,
+        "cos": math.cos,
+        "tan": math.tan,
+        "log": math.log,
+        "log10": math.log10,
+        "log2": math.log2,
+        "pi": math.pi,
+        "e": math.e,
+        "pow": pow,
+        "floor": math.floor,
+        "ceil": math.ceil,
     }
 
     async def execute(self, **kwargs) -> str:
@@ -64,126 +73,204 @@ class DateTimeTool(BaseTool):
         "properties": {
             "timezone": {
                 "type": "string",
-                "description": "Timezone name (e.g. 'US/Mountain', 'UTC'). Defaults to UTC."
+                "description": "Timezone name (e.g. 'US/Mountain', 'UTC'). Defaults to UTC.",
             },
             "format": {
                 "type": "string",
-                "description": "Output format string (strftime). Default: '%Y-%m-%d %H:%M:%S %Z'"
-            }
+                "description": "Output format string (strftime). Default: '%Y-%m-%d %H:%M:%S %Z'",
+            },
         },
-        "required": []
+        "required": [],
     }
 
     async def execute(self, **kwargs) -> str:
         fmt = kwargs.get("format", "%Y-%m-%d %H:%M:%S %Z")
         now = dt.datetime.now(dt.timezone.utc)
-        return json.dumps({
-            "datetime": now.strftime(fmt),
-            "timestamp": now.timestamp(),
-            "iso": now.isoformat(),
-        })
+        return json.dumps(
+            {
+                "datetime": now.strftime(fmt),
+                "timestamp": now.timestamp(),
+                "iso": now.isoformat(),
+            }
+        )
 
 
 @register_tool("code_executor")
 class CodeExecutorTool(BaseTool):
     name = "code_executor"
     description = (
-        "Execute Python code in a sandboxed Docker environment and return the output. "
-        "Live output is streamed to the canvas terminal during execution."
+        "Execute Python code in a sandboxed environment and return the output. "
+        "Live output is streamed to the canvas terminal during execution. "
+        "Users may interactively send input via the canvas terminal panel."
     )
     parameters = {
         "type": "object",
         "properties": {
-            "code": {
-                "type": "string",
-                "description": "Python code to execute"
-            }
+            "code": {"type": "string", "description": "Python code to execute"},
+            "interactive": {
+                "type": "boolean",
+                "description": (
+                    "If true, expose a stdin channel via the canvas terminal so "
+                    "users can type input while the program runs (input(), "
+                    "sys.stdin.read(), etc.). Default false."
+                ),
+            },
         },
-        "required": ["code"]
+        "required": ["code"],
     }
+
+    DEFAULT_SANDBOX_URL = "http://nexus-sandbox:8500"
 
     def __init__(self, config: dict | None = None):
         super().__init__(config)
         self._last_output = ""
         self._last_return_code = 0
+        # Most recently started interactive session id, exposed to the
+        # orchestrator/frontend so the canvas can connect a WebSocket.
+        self._last_session_id: str | None = None
+
+    @property
+    def sandbox_url(self) -> str:
+        return self.config.get("sandbox_url") or os.environ.get(
+            "NEXUS_SANDBOX_URL",
+            self.DEFAULT_SANDBOX_URL,
+        )
 
     async def execute(self, **kwargs) -> str:
         """Non-streaming fallback: collect all chunks and return as JSON."""
         chunks = []
         async for chunk in self.stream_execute(**kwargs):
             chunks.append(chunk)
-        return json.dumps({
-            "output": "\n".join(chunks).strip() or "(no output)",
-            "return_code": self._last_return_code,
-        })
+        return json.dumps(
+            {
+                "output": "\n".join(chunks).strip() or "(no output)",
+                "return_code": self._last_return_code,
+                "interactive_session": self._last_session_id,
+            }
+        )
 
     async def stream_execute(self, **kwargs) -> AsyncIterator[str]:
-        """Run Python code inside the nexus-sandbox Docker container
-        and yield stdout/stderr lines in real time.
+        """Stream stdout/stderr lines from the sandbox HTTP service in
+        real time. The sandbox runs in a sibling Docker container on the
+        ``nexus-net`` network (see ``docker-compose.yml``). Falls back
+        to a local subprocess if the sandbox endpoint is unreachable —
+        useful for dev runs without docker compose.
         """
-        code = kwargs.get("code", "")
-        timeout = self.config.get("timeout", 30)
+        import httpx
 
-        session_id = uuid.uuid4().hex[:12]
+        code = kwargs.get("code", "")
+        interactive = bool(kwargs.get("interactive", False))
+        timeout = self.config.get("timeout", 60)
+
+        # Reset per-call state so a previous interactive session id or
+        # return code doesn't leak into the current result.
+        self._last_session_id = None
+        self._last_return_code = 0
+
+        if interactive:
+            # Hand off to the WebSocket-driven session. The frontend
+            # connects to /api/sandbox/interact/{session_id} and the
+            # backend proxies to the sandbox container.
+            self._last_session_id = uuid.uuid4().hex[:16]
+            from backend.sandbox_sessions import register_session
+
+            register_session(self._last_session_id, code, self.sandbox_url)
+            yield f"[interactive session ready: {self._last_session_id}]"
+            yield "Open the canvas terminal to send input and view live output."
+            self._last_return_code = 0
+            return
+
+        url = self.sandbox_url.rstrip("/") + "/exec"
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout + 10, read=None)) as client:
+                async with client.stream("POST", url, json={"code": code}) as resp:
+                    if resp.status_code >= 400:
+                        body = await resp.aread()
+                        msg = body.decode("utf-8", errors="replace")
+                        yield f"[stderr]: sandbox HTTP {resp.status_code}: {msg}"
+                        self._last_return_code = 1
+                        return
+
+                    async for line in resp.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        payload_raw = line[len("data:") :].strip()
+                        try:
+                            payload = json.loads(payload_raw)
+                        except json.JSONDecodeError:
+                            yield payload_raw
+                            continue
+                        ev = payload.get("type")
+                        if ev == "stdout":
+                            yield payload.get("data", "")
+                        elif ev == "stderr":
+                            yield "[stderr]: " + payload.get("data", "")
+                        elif ev == "exit":
+                            self._last_return_code = int(payload.get("code", 0))
+        except (httpx.ConnectError, httpx.ReadTimeout) as e:
+            # Sandbox unavailable — try a local fallback so dev sessions
+            # without docker still get *some* output. Limit to safe
+            # behaviour: a one-shot subprocess with no shell.
+            logger.warning("Sandbox unreachable (%s); falling back to local subprocess.", e)
+            async for chunk in self._local_fallback(code, timeout):
+                yield chunk
+
+    async def _local_fallback(self, code: str, timeout: int) -> AsyncIterator[str]:
+        """Last-resort local execution when the sandbox is unreachable.
+
+        Runs a one-shot subprocess in a temp file with no shell. This is
+        clearly less safe than the docker sandbox; we emit a warning
+        line so the user understands the difference.
+        """
+        import sys as _sys
+
+        yield "[stderr]: sandbox container not reachable; running locally"
+
         sandbox_dir = Path("./data/sandbox")
         sandbox_dir.mkdir(parents=True, exist_ok=True)
-        code_file = sandbox_dir / f"{session_id}.py"
+        code_file = sandbox_dir / f"local-{uuid.uuid4().hex[:8]}.py"
         code_file.write_text(code, encoding="utf-8")
 
         proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", "-i", "nexus-sandbox",
-            "python3", f"/sandbox/{session_id}.py",
+            _sys.executable,
+            "-u",
+            str(code_file),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue()
 
-        async def pump(stream: asyncio.StreamReader, prefix: str) -> None:
+        async def pump(stream, prefix):
             while True:
                 line = await stream.readline()
                 if not line:
                     break
-                text = line.decode("utf-8", errors="replace").rstrip("\n")
-                await queue.put(prefix + text)
+                await queue.put(prefix + line.decode("utf-8", errors="replace").rstrip("\n"))
+            await queue.put(None)
 
         stdout_task = asyncio.create_task(pump(proc.stdout, ""))
         stderr_task = asyncio.create_task(pump(proc.stderr, "[stderr]: "))
 
-        async def drain() -> None:
-            await asyncio.gather(stdout_task, stderr_task)
-            await queue.put(None)
-
-        drain_task = asyncio.create_task(drain())
-
-        output_lines: list[str] = []
+        eofs = 0
         try:
-            while True:
+            while eofs < 2:
                 try:
-                    line = await asyncio.wait_for(queue.get(), timeout=timeout)
+                    item = await asyncio.wait_for(queue.get(), timeout=timeout)
                 except asyncio.TimeoutError:
                     proc.kill()
-                    yield "Execution timed out"
-                    output_lines.append("Execution timed out")
+                    yield "[stderr]: local execution timed out"
                     break
-
-                if line is None:
-                    break
-
-                output_lines.append(line)
-                yield line
-        finally:
-            drain_task.cancel()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-
+                if item is None:
+                    eofs += 1
+                    continue
+                yield item
+            await proc.wait()
             self._last_return_code = proc.returncode or 0
-            self._last_output = "\n".join(output_lines)
-
-            # Cleanup sandbox file
+        finally:
+            stdout_task.cancel()
+            stderr_task.cancel()
             try:
                 code_file.unlink()
             except OSError:
@@ -193,16 +280,15 @@ class CodeExecutorTool(BaseTool):
 @register_tool("file_reader")
 class FileReaderTool(BaseTool):
     name = "file_reader"
-    description = "Read and extract text content from uploaded files (txt, md, csv, json, py, etc.)."
+    description = (
+        "Read and extract text content from uploaded files (txt, md, csv, json, py, etc.)."
+    )
     parameters = {
         "type": "object",
         "properties": {
-            "filename": {
-                "type": "string",
-                "description": "Name of the uploaded file to read"
-            }
+            "filename": {"type": "string", "description": "Name of the uploaded file to read"}
         },
-        "required": ["filename"]
+        "required": ["filename"],
     }
 
     async def execute(self, **kwargs) -> str:
@@ -224,31 +310,36 @@ class FileReaderTool(BaseTool):
                 # Truncate if very long
                 if len(content) > 50000:
                     content = content[:50000] + "\n... (truncated)"
-                return json.dumps({
-                    "filename": filename,
-                    "content": content,
-                    "size": filepath.stat().st_size,
-                })
+                return json.dumps(
+                    {
+                        "filename": filename,
+                        "content": content,
+                        "size": filepath.stat().st_size,
+                    }
+                )
         except Exception as e:
             return json.dumps({"error": str(e)})
 
     async def _read_pdf(self, path: Path) -> str:
         try:
             from PyPDF2 import PdfReader
+
             reader = PdfReader(str(path))
-            text = "\n".join(
-                page.extract_text() or "" for page in reader.pages
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            return json.dumps(
+                {
+                    "filename": path.name,
+                    "content": text,
+                    "pages": len(reader.pages),
+                }
             )
-            return json.dumps({
-                "filename": path.name, "content": text,
-                "pages": len(reader.pages),
-            })
         except ImportError:
             return json.dumps({"error": "PyPDF2 not installed"})
 
     async def _read_docx(self, path: Path) -> str:
         try:
             from docx import Document
+
             doc = Document(str(path))
             text = "\n".join(p.text for p in doc.paragraphs)
             return json.dumps({"filename": path.name, "content": text})
@@ -288,11 +379,19 @@ class WebSearchTool(BaseTool):
         "properties": {
             "query": {
                 "type": "string",
-                "description": "The search query string. Be specific and include temporal keywords (today, now, latest, current) when relevant."
+                "description": "The search query string. Be specific and include temporal keywords (today, now, latest, current) when relevant.",
             },
             "search_type": {
                 "type": "string",
-                "enum": ["general", "news", "weather", "sports", "finance", "dictionary", "current_events"],
+                "enum": [
+                    "general",
+                    "news",
+                    "weather",
+                    "sports",
+                    "finance",
+                    "dictionary",
+                    "current_events",
+                ],
                 "description": (
                     "Category of search to optimize result formatting. "
                     "general = broad factual queries; "
@@ -302,21 +401,21 @@ class WebSearchTool(BaseTool):
                     "finance = stocks, crypto, rates, markets; "
                     "dictionary = word definitions and meanings; "
                     "current_events = recent political or social happenings."
-                )
+                ),
             },
             "location": {
                 "type": "string",
-                "description": "Optional geographic hint for weather, sports, or local news queries (e.g., 'London', 'New York', 'near me')."
+                "description": "Optional geographic hint for weather, sports, or local news queries (e.g., 'London', 'New York', 'near me').",
             },
             "num_results": {
                 "type": "integer",
                 "description": "Number of search results to retrieve (default: 5, max: 10).",
                 "default": 5,
                 "minimum": 1,
-                "maximum": 10
-            }
+                "maximum": 10,
+            },
         },
-        "required": ["query", "search_type"]
+        "required": ["query", "search_type"],
     }
 
     async def execute(self, **kwargs) -> str:
@@ -349,6 +448,7 @@ class WebSearchTool(BaseTool):
             # 1. DuckDuckGo news API (usually not rate-limited)
             try:
                 from duckduckgo_search import DDGS
+
                 with DDGS() as ddgs:
                     raw = list(ddgs.news(effective_query, max_results=num))
                 if raw:
@@ -384,6 +484,7 @@ class WebSearchTool(BaseTool):
             # 1. DuckDuckGo text API
             try:
                 from duckduckgo_search import DDGS
+
                 with DDGS() as ddgs:
                     raw = list(ddgs.text(effective_query, max_results=num))
                 if raw:
@@ -412,9 +513,36 @@ class WebSearchTool(BaseTool):
         # 2b. Relevance guard: for weather queries, if Bing results don't contain
         # weather-related keywords, discard them (Bing often returns irrelevant forums).
         if raw_results and search_type == "weather":
-            weather_keywords = {"weather", "forecast", "temperature", "rain", "snow", "sunny", "cloud", "wind", "humidity", "storm", "drizzle", "showers", "degrees", "°f", "°c", "high", "low", "nws", "noaa", "accuweather", "weather.com", "met office", "bbc weather"}
+            weather_keywords = {
+                "weather",
+                "forecast",
+                "temperature",
+                "rain",
+                "snow",
+                "sunny",
+                "cloud",
+                "wind",
+                "humidity",
+                "storm",
+                "drizzle",
+                "showers",
+                "degrees",
+                "°f",
+                "°c",
+                "high",
+                "low",
+                "nws",
+                "noaa",
+                "accuweather",
+                "weather.com",
+                "met office",
+                "bbc weather",
+            }
             relevant = any(
-                any(kw in (r.get("title", "") + " " + r.get("text", "")).lower() for kw in weather_keywords)
+                any(
+                    kw in (r.get("title", "") + " " + r.get("text", "")).lower()
+                    for kw in weather_keywords
+                )
                 for r in raw_results
             )
             if not relevant:
@@ -425,10 +553,17 @@ class WebSearchTool(BaseTool):
         # (titles don't contain the target word), discard and continue.
         if raw_results and search_type == "dictionary":
             import re as _re
-            word = _re.sub(
-                r'\b(definition|meaning|define|of|what is|what does|mean|dictionary)\b',
-                '', query, flags=_re.IGNORECASE,
-            ).strip().split()[0]
+
+            word = (
+                _re.sub(
+                    r"\b(definition|meaning|define|of|what is|what does|mean|dictionary)\b",
+                    "",
+                    query,
+                    flags=_re.IGNORECASE,
+                )
+                .strip()
+                .split()[0]
+            )
             relevant = any(word.lower() in r.get("title", "").lower() for r in raw_results)
             if not relevant:
                 raw_results = []
@@ -439,14 +574,47 @@ class WebSearchTool(BaseTool):
         # garbage results (e.g. Stack Overflow for "New Zealand vs Bangladesh").
         if raw_results and search_type == "sports":
             sports_keywords = {
-                "cricket", "football", "soccer", "rugby", "tennis", "basketball",
-                "baseball", "hockey", "golf", "match", "score", "result", "game",
-                "team", "player", "won", "win", "loss", "draw", "played", "vs",
-                "versus", "scorecard", "highlights", "over", "innings", "wicket",
-                "goal", "tournament", "championship", "league", "fixture", "live",
-                "espncricinfo", "espn", "bbc sport", "skysports", "cricbuzz",
+                "cricket",
+                "football",
+                "soccer",
+                "rugby",
+                "tennis",
+                "basketball",
+                "baseball",
+                "hockey",
+                "golf",
+                "match",
+                "score",
+                "result",
+                "game",
+                "team",
+                "player",
+                "won",
+                "win",
+                "loss",
+                "draw",
+                "played",
+                "vs",
+                "versus",
+                "scorecard",
+                "highlights",
+                "over",
+                "innings",
+                "wicket",
+                "goal",
+                "tournament",
+                "championship",
+                "league",
+                "fixture",
+                "live",
+                "espncricinfo",
+                "espn",
+                "bbc sport",
+                "skysports",
+                "cricbuzz",
             }
             spam_domains = {"stackoverflow.com", "thumpertalk.com", "quora.com"}
+
             def _is_sports_relevant(r: dict) -> bool:
                 title_text = (r.get("title", "") + " " + r.get("text", "")).lower()
                 has_keyword = any(kw in title_text for kw in sports_keywords)
@@ -499,34 +667,44 @@ class WebSearchTool(BaseTool):
                     engines_tried.append("bing_mobile_reformulated(failed)")
 
         if not raw_results:
-            return json.dumps({
+            return json.dumps(
+                {
+                    "query": query,
+                    "effective_query": effective_query,
+                    "search_type": search_type,
+                    "location": location or None,
+                    "engines_tried": engines_tried,
+                    "results": [
+                        {
+                            "text": "No results found for this query. Try rephrasing or using different keywords."
+                        }
+                    ],
+                }
+            )
+
+        # --- Post-process / categorize results ---
+        categorized = self._categorize_results(raw_results, search_type, query)
+        return json.dumps(
+            {
                 "query": query,
                 "effective_query": effective_query,
                 "search_type": search_type,
                 "location": location or None,
                 "engines_tried": engines_tried,
-                "results": [{"text": "No results found for this query. Try rephrasing or using different keywords."}]
-            })
-
-        # --- Post-process / categorize results ---
-        categorized = self._categorize_results(raw_results, search_type, query)
-        return json.dumps({
-            "query": query,
-            "effective_query": effective_query,
-            "search_type": search_type,
-            "location": location or None,
-            "engines_tried": engines_tried,
-            **extra,
-            **categorized,
-        })
+                **extra,
+                **categorized,
+            }
+        )
 
     # --- Engine helpers ---
 
     async def _bing_mobile_search(self, query: str, num: int) -> tuple[list[dict], dict]:
         """Bing mobile HTML search — works when DDG is rate-limited."""
-        import httpx
         import re as _re
         from html import unescape
+
+        import httpx
+
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
@@ -559,7 +737,7 @@ class WebSearchTool(BaseTool):
                 for href, text in links:
                     if "bing.com" in href or "microsoft.com" in href:
                         continue
-                    clean_text = _re.sub(r'<[^>]+>', '', unescape(text)).strip()
+                    clean_text = _re.sub(r"<[^>]+>", "", unescape(text)).strip()
                     if clean_text:
                         ext.append((href, clean_text))
                 if len(ext) < 2:
@@ -572,14 +750,19 @@ class WebSearchTool(BaseTool):
                     continue
                 # Extract the best snippet from divs/spans/ps in the chunk
                 snippets = _re.findall(
-                    r'<(?:div|span|p)[^>]*>(.*?)</(?:div|span|p)>',
+                    r"<(?:div|span|p)[^>]*>(.*?)</(?:div|span|p)>",
                     chunk,
                     _re.DOTALL,
                 )
-                clean_snippets = [_re.sub(r'<[^>]+>', '', s).strip() for s in snippets]
+                clean_snippets = [_re.sub(r"<[^>]+>", "", s).strip() for s in snippets]
                 snippet = ""
                 for s in clean_snippets:
-                    if 20 < len(s) < 300 and not s.startswith("http") and " › " not in s and s != title:
+                    if (
+                        20 < len(s) < 300
+                        and not s.startswith("http")
+                        and " › " not in s
+                        and s != title
+                    ):
                         snippet = s
                         break
                 results.append({"title": title, "text": snippet, "url": url})
@@ -594,6 +777,7 @@ class WebSearchTool(BaseTool):
                 _re.DOTALL,
             )
             from urllib.parse import unquote as _unquote
+
             for q_raw, _ in related_matches[:8]:
                 clean = _unquote(q_raw.replace("+", " "))
                 # Discard Bing internal tracking params that leak through
@@ -606,11 +790,14 @@ class WebSearchTool(BaseTool):
     async def _ddg_html_search(self, query: str, num: int) -> tuple[list[dict], dict]:
         """DuckDuckGo HTML scrape fallback."""
         import asyncio
+
         await asyncio.sleep(1)
-        import httpx
+        import re as _re
         from html import unescape
         from urllib.parse import unquote as url_unquote
-        import re as _re
+
+        import httpx
+
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -629,9 +816,9 @@ class WebSearchTool(BaseTool):
                 _re.DOTALL,
             )
             for url, title, snippet in result_blocks[:num]:
-                clean_title = _re.sub(r'<[^>]+>', '', unescape(title)).strip()
-                clean_snippet = _re.sub(r'<[^>]+>', '', unescape(snippet)).strip()
-                url_match = _re.search(r'uddg=([^&]+)', url)
+                clean_title = _re.sub(r"<[^>]+>", "", unescape(title)).strip()
+                clean_snippet = _re.sub(r"<[^>]+>", "", unescape(snippet)).strip()
+                url_match = _re.search(r"uddg=([^&]+)", url)
                 actual_url = url_unquote(url_match.group(1)) if url_match else url
                 if clean_title or clean_snippet:
                     results.append({"title": clean_title, "text": clean_snippet, "url": actual_url})
@@ -647,6 +834,7 @@ class WebSearchTool(BaseTool):
     async def _ddg_instant_answer(self, query: str, num: int) -> tuple[list[dict], dict]:
         """DuckDuckGo Instant Answer API for factual snippets."""
         import httpx
+
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 "https://api.duckduckgo.com/",
@@ -664,45 +852,57 @@ class WebSearchTool(BaseTool):
 
     async def _google_news_rss(self, query: str, num: int) -> tuple[list[dict], dict]:
         """Google News RSS — reliable, no auth, returns real headlines with dates."""
-        import httpx
         import re as _re
+
+        import httpx
+
         async with httpx.AsyncClient(timeout=15) as client:
             params = {"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"}
             resp = await client.get("https://news.google.com/rss/search", params=params)
             text = resp.text
-            items = _re.findall(r'<item>(.*?)</item>', text, _re.DOTALL)
+            items = _re.findall(r"<item>(.*?)</item>", text, _re.DOTALL)
             results = []
             for item in items[:num]:
-                title_m = _re.search(r'<title>\s*(.*?)\s*</title>', item, _re.DOTALL)
-                link_m = _re.search(r'<link>\s*(.*?)\s*</link>', item, _re.DOTALL)
-                pub_m = _re.search(r'<pubDate>\s*(.*?)\s*</pubDate>', item, _re.DOTALL)
-                source_m = _re.search(r'<source[^>]*>\s*(.*?)\s*</source>', item, _re.DOTALL)
+                title_m = _re.search(r"<title>\s*(.*?)\s*</title>", item, _re.DOTALL)
+                link_m = _re.search(r"<link>\s*(.*?)\s*</link>", item, _re.DOTALL)
+                pub_m = _re.search(r"<pubDate>\s*(.*?)\s*</pubDate>", item, _re.DOTALL)
+                source_m = _re.search(r"<source[^>]*>\s*(.*?)\s*</source>", item, _re.DOTALL)
 
                 def _strip_cdata(s: str) -> str:
-                    return _re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\1', s, flags=_re.DOTALL).strip()
+                    return _re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", s, flags=_re.DOTALL).strip()
 
                 raw_title = _strip_cdata(title_m.group(1)) if title_m else ""
                 raw_source = _strip_cdata(source_m.group(1)) if source_m else ""
-                raw_source = _re.sub(r'&amp;', '&', raw_source)
+                raw_source = _re.sub(r"&amp;", "&", raw_source)
                 url = link_m.group(1).strip() if link_m else ""
                 pub_date = pub_m.group(1).strip() if pub_m else ""
 
                 if raw_title:
-                    results.append({
-                        "title": raw_title,
-                        "text": f"{raw_title} — via {raw_source}" + (f" ({pub_date})" if pub_date else ""),
-                        "url": url,
-                        "date": pub_date,
-                        "source": raw_source,
-                    })
+                    results.append(
+                        {
+                            "title": raw_title,
+                            "text": f"{raw_title} — via {raw_source}"
+                            + (f" ({pub_date})" if pub_date else ""),
+                            "url": url,
+                            "date": pub_date,
+                            "source": raw_source,
+                        }
+                    )
             return results, {}
 
     async def _dictionary_api(self, query: str, num: int) -> tuple[list[dict], dict]:
         """Free Dictionary API (dictionaryapi.dev) — no auth, works for English words."""
-        import httpx
         import re as _re
+
+        import httpx
+
         # Extract the word from the query (remove "definition", "meaning", etc.)
-        word = _re.sub(r'\b(definition|meaning|define|of|what is|what does|mean|dictionary)\b', '', query, flags=_re.IGNORECASE).strip()
+        word = _re.sub(
+            r"\b(definition|meaning|define|of|what is|what does|mean|dictionary)\b",
+            "",
+            query,
+            flags=_re.IGNORECASE,
+        ).strip()
         word = word.split()[0] if word else query.split()[0]
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}")
@@ -719,25 +919,38 @@ class WebSearchTool(BaseTool):
                     defs = [d.get("definition", "") for d in meaning.get("definitions", [])[:2]]
                     if defs:
                         parts.append(f"{pos}: " + "; ".join(defs))
-                text = f"{word_text}" + (f" {phonetic}" if phonetic else "") + " — " + " | ".join(parts)
-                results.append({
-                    "title": f"Definition of {word_text}",
-                    "text": text,
-                    "url": f"https://en.wiktionary.org/wiki/{word_text}",
-                })
+                text = (
+                    f"{word_text}"
+                    + (f" {phonetic}" if phonetic else "")
+                    + " — "
+                    + " | ".join(parts)
+                )
+                results.append(
+                    {
+                        "title": f"Definition of {word_text}",
+                        "text": text,
+                        "url": f"https://en.wiktionary.org/wiki/{word_text}",
+                    }
+                )
             return results, {}
 
     def _all_stale(self, results: list[dict], days: int = 30) -> bool:
         """Return True if every result is older than `days`."""
         import re as _re
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
+
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         for r in results:
             date_str = r.get("date", "")
             if not date_str:
                 return False  # can't tell → not stale
             # Try ISO 8601
-            for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%a, %d %b %Y %H:%M:%S %Z"):
+            for fmt in (
+                "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d",
+                "%a, %d %b %Y %H:%M:%S %Z",
+            ):
                 try:
                     dt = datetime.strptime(date_str, fmt)
                     if dt.tzinfo is None:
@@ -753,15 +966,20 @@ class WebSearchTool(BaseTool):
 
     async def _openmeteo_weather(self, query: str, location: str) -> tuple[list[dict], dict]:
         """Open-Meteo free weather API — structured 7-day forecast, no auth."""
-        import httpx
         import re as _re
         from datetime import datetime, timedelta
+
+        import httpx
 
         # Extract location from query + location parameter
         loc = location.strip() if location else ""
         if not loc:
             # Try to extract a place name from the query
-            loc_match = _re.search(r'\b(?:in|for|near|at)\s+([A-Za-z\s,]+?)(?:\s+(?:weather|forecast|today|tomorrow|now|\d{4}))?\b', query, _re.IGNORECASE)
+            loc_match = _re.search(
+                r"\b(?:in|for|near|at)\s+([A-Za-z\s,]+?)(?:\s+(?:weather|forecast|today|tomorrow|now|\d{4}))?\b",
+                query,
+                _re.IGNORECASE,
+            )
             if loc_match:
                 loc = loc_match.group(1).strip()
         if not loc:
@@ -770,7 +988,11 @@ class WebSearchTool(BaseTool):
         # 1. Geocode (try raw, then stripped variants)
         async with httpx.AsyncClient(timeout=15) as client:
             geo_results = []
-            for attempt_loc in [loc, _re.sub(r',\s*[A-Za-z\.\s]+$', '', loc).strip(), loc.split(',')[0].strip()]:
+            for attempt_loc in [
+                loc,
+                _re.sub(r",\s*[A-Za-z\.\s]+$", "", loc).strip(),
+                loc.split(",")[0].strip(),
+            ]:
                 if not attempt_loc:
                     continue
                 geo_resp = await client.get(
@@ -793,7 +1015,7 @@ class WebSearchTool(BaseTool):
             if country:
                 full_name += f", {country}"
 
-        # 2. Forecast
+            # 2. Forecast
             forecast_resp = await client.get(
                 "https://api.open-meteo.com/v1/forecast",
                 params={
@@ -815,17 +1037,34 @@ class WebSearchTool(BaseTool):
 
         # WMO Weather interpretation codes
         WMO_CODES = {
-            0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
-            45: "Fog", 48: "Depositing rime fog",
-            51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
-            56: "Light freezing drizzle", 57: "Dense freezing drizzle",
-            61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
-            66: "Light freezing rain", 67: "Heavy freezing rain",
-            71: "Slight snow fall", 73: "Moderate snow fall", 75: "Heavy snow fall",
+            0: "Clear sky",
+            1: "Mainly clear",
+            2: "Partly cloudy",
+            3: "Overcast",
+            45: "Fog",
+            48: "Depositing rime fog",
+            51: "Light drizzle",
+            53: "Moderate drizzle",
+            55: "Dense drizzle",
+            56: "Light freezing drizzle",
+            57: "Dense freezing drizzle",
+            61: "Slight rain",
+            63: "Moderate rain",
+            65: "Heavy rain",
+            66: "Light freezing rain",
+            67: "Heavy freezing rain",
+            71: "Slight snow fall",
+            73: "Moderate snow fall",
+            75: "Heavy snow fall",
             77: "Snow grains",
-            80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
-            85: "Slight snow showers", 86: "Heavy snow showers",
-            95: "Thunderstorm", 96: "Thunderstorm with slight hail", 99: "Thunderstorm with heavy hail",
+            80: "Slight rain showers",
+            81: "Moderate rain showers",
+            82: "Violent rain showers",
+            85: "Slight snow showers",
+            86: "Heavy snow showers",
+            95: "Thunderstorm",
+            96: "Thunderstorm with slight hail",
+            99: "Thunderstorm with heavy hail",
         }
 
         # Build structured daily entries
@@ -848,33 +1087,40 @@ class WebSearchTool(BaseTool):
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         summary_parts = [f"Weather forecast for {full_name}."]
         for entry in daily_entries[:5]:
-            day_label = "Today" if entry["date"] == today else ("Tomorrow" if entry["date"] == tomorrow else entry["date"])
+            day_label = (
+                "Today"
+                if entry["date"] == today
+                else ("Tomorrow" if entry["date"] == tomorrow else entry["date"])
+            )
             summary_parts.append(
                 f"{day_label}: {entry['condition']}, high {entry['temp_high_c']}C, low {entry['temp_low_c']}C, "
                 f"precipitation {entry['precipitation_mm']}mm, wind {entry['wind_max_kmh']}km/h."
             )
         summary_text = " ".join(summary_parts)
 
-        results = [{
-            "title": f"7-Day Weather Forecast for {full_name}",
-            "text": summary_text,
-            "url": f"https://open-meteo.com/en/docs#latitude={lat}&longitude={lon}",
-        }]
+        results = [
+            {
+                "title": f"7-Day Weather Forecast for {full_name}",
+                "text": summary_text,
+                "url": f"https://open-meteo.com/en/docs#latitude={lat}&longitude={lon}",
+            }
+        ]
         extra = {"daily_forecast": daily_entries, "location": full_name}
         return results, extra
 
     def _simplify_query(self, query: str) -> str:
         """Strip temporal/local qualifiers for a broader retry search."""
         import re as _re
+
         # Remove common temporal words
         simplified = _re.sub(
-            r'\b(today|now|latest|current|recent|live|this week|this month|yesterday|tomorrow)\b',
-            '',
+            r"\b(today|now|latest|current|recent|live|this week|this month|yesterday|tomorrow)\b",
+            "",
             query,
             flags=_re.IGNORECASE,
         )
         # Remove extra whitespace
-        simplified = ' '.join(simplified.split())
+        simplified = " ".join(simplified.split())
         return simplified.strip() or query
 
     def _categorize_results(self, raw: list[dict], search_type: str, query: str) -> dict:
@@ -887,36 +1133,50 @@ class WebSearchTool(BaseTool):
             rows = []
             for t in texts:
                 # Look for patterns like "Team A 3 - 1 Team B" or "BTC $67,000"
-                score_match = _re.search(r'([A-Za-z\s]+)\s+(\d+)[\s\-:]+(\d+)\s+([A-Za-z\s]+)', t)
+                score_match = _re.search(r"([A-Za-z\s]+)\s+(\d+)[\s\-:]+(\d+)\s+([A-Za-z\s]+)", t)
                 if score_match:
-                    rows.append({
-                        "home": score_match.group(1).strip(),
-                        "home_score": score_match.group(2),
-                        "away_score": score_match.group(3),
-                        "away": score_match.group(4).strip(),
-                        "context": t,
-                    })
-                price_match = _re.search(r'(BTC|ETH|Bitcoin|Ether(?:eum)?|EUR|USD|GBP|JPY|Gold|Silver)[\s\-:]?\$?([\d,\.]+)', t, _re.IGNORECASE)
+                    rows.append(
+                        {
+                            "home": score_match.group(1).strip(),
+                            "home_score": score_match.group(2),
+                            "away_score": score_match.group(3),
+                            "away": score_match.group(4).strip(),
+                            "context": t,
+                        }
+                    )
+                price_match = _re.search(
+                    r"(BTC|ETH|Bitcoin|Ether(?:eum)?|EUR|USD|GBP|JPY|Gold|Silver)[\s\-:]?\$?([\d,\.]+)",
+                    t,
+                    _re.IGNORECASE,
+                )
                 if price_match:
-                    rows.append({
-                        "asset": price_match.group(1).strip(),
-                        "value": price_match.group(2),
-                        "context": t,
-                    })
+                    rows.append(
+                        {
+                            "asset": price_match.group(1).strip(),
+                            "value": price_match.group(2),
+                            "context": t,
+                        }
+                    )
             return rows
 
         def maybe_extract_weather(texts: list[str]) -> list[dict]:
             """Heuristically extract temperature and condition info."""
             entries = []
             for t in texts:
-                temps = _re.findall(r'(-?\d+)\s*[°°]\s*([CF])', t)
-                conditions = _re.findall(r'(sunny|cloudy|rain|snow|clear|overcast|storm|windy|fog|humid|drizzle|showers|thunder)', t, _re.IGNORECASE)
+                temps = _re.findall(r"(-?\d+)\s*[°°]\s*([CF])", t)
+                conditions = _re.findall(
+                    r"(sunny|cloudy|rain|snow|clear|overcast|storm|windy|fog|humid|drizzle|showers|thunder)",
+                    t,
+                    _re.IGNORECASE,
+                )
                 if temps or conditions:
-                    entries.append({
-                        "snippet": t,
-                        "temperatures": [f"{v} {u.upper()}" for v, u in temps],
-                        "conditions": conditions,
-                    })
+                    entries.append(
+                        {
+                            "snippet": t,
+                            "temperatures": [f"{v} {u.upper()}" for v, u in temps],
+                            "conditions": conditions,
+                        }
+                    )
             return entries
 
         # Default structure
@@ -954,9 +1214,15 @@ class WebSearchTool(BaseTool):
             for r in raw:
                 text = r["text"]
                 # Try to extract "word: definition" or "word - definition" patterns
-                match = _re.search(r'^(?:Definition of\s+)?([^:]+)[:\-]\s*(.+)', text)
+                match = _re.search(r"^(?:Definition of\s+)?([^:]+)[:\-]\s*(.+)", text)
                 if match:
-                    defs.append({"term": match.group(1).strip(), "definition": match.group(2).strip(), "source": r.get("url", "")})
+                    defs.append(
+                        {
+                            "term": match.group(1).strip(),
+                            "definition": match.group(2).strip(),
+                            "source": r.get("url", ""),
+                        }
+                    )
                 else:
                     defs.append({"term": query, "definition": text, "source": r.get("url", "")})
             result["definitions"] = defs
@@ -968,12 +1234,12 @@ class WebSearchTool(BaseTool):
         elif search_type in ("news", "current_events"):
             # Heuristically extract date mentions from snippets
             date_patterns = [
-                r'\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})\b',
-                r'\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4})\b',
-                r'\b(\d{4}-\d{2}-\d{2})\b',
-                r'\b(\d{1,2}/\d{1,2}/\d{4})\b',
-                r'\b(yesterday|today|last\s+(?:night|week|month|year|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday))\b',
-                r'\b(\d+\s+(?:hours?|minutes?)\s+ago)\b',
+                r"\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})\b",
+                r"\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4})\b",
+                r"\b(\d{4}-\d{2}-\d{2})\b",
+                r"\b(\d{1,2}/\d{1,2}/\d{4})\b",
+                r"\b(yesterday|today|last\s+(?:night|week|month|year|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday))\b",
+                r"\b(\d+\s+(?:hours?|minutes?)\s+ago)\b",
             ]
             date_extracts = []
             for r in raw:
@@ -983,7 +1249,9 @@ class WebSearchTool(BaseTool):
                     for m in _re.findall(pat, text, _re.IGNORECASE):
                         found.append(m)
                 if found:
-                    date_extracts.append({"dates": found, "snippet": text, "source": r.get("url", "")})
+                    date_extracts.append(
+                        {"dates": found, "snippet": text, "source": r.get("url", "")}
+                    )
             result["date_extracts"] = date_extracts
             if search_type == "news":
                 result["summary"] = (

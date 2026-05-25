@@ -32,7 +32,7 @@ COPY config/ ./config/
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
 # Create data directories
-RUN mkdir -p data/uploads data/vector_store data/files
+RUN mkdir -p data/uploads data/vector_store data/files data/downloads
 
 # Expose port
 EXPOSE 8000
