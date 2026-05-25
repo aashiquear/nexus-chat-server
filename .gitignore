@@ -14,17 +14,13 @@ frontend/dist/
 # Environment
 .env
 
-# Data
-data/uploads/*
-data/vector_store/*
-data/conversations/*
+# Data - ignore all generated files in any child directory of data
+data/*/**
 data/*.png
 data/*.jpg
 data/*.jpeg
 data/*.svg
-!data/uploads/.gitkeep
-!data/vector_store/.gitkeep
-!data/conversations/.gitkeep
+!data/*/.gitkeep
 
 # IDE
 .vscode/
