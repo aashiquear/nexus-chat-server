@@ -24,7 +24,7 @@ app:
 providers:
   anthropic:
     enabled: true
-    api_key: "${ANTHROPIC_API_KEY}"  # Set via env var or paste key here
+    api_key: "${ANTHROPIC_API_KEY}" # Set via env var or paste key here
     default_model: "claude-sonnet-4-6"
     # The /v1/models probe will mark each entry as available or
     # unavailable based on what the API key actually has access to.
@@ -103,7 +103,7 @@ providers:
     # For local Ollama: http://localhost:11434
     # For Ollama Cloud: https://ollama.com/api (requires OLLAMA_API_KEY)
     base_url: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
-    api_key: "${OLLAMA_API_KEY}"  # Required for Ollama Cloud, leave empty for local
+    api_key: "${OLLAMA_API_KEY}" # Required for Ollama Cloud, leave empty for local
     default_model: "llama3.2"
     # ----
     # Thinking models: set ``thinking: true`` (or ``thinking_level`` in
@@ -247,7 +247,7 @@ tools:
     icon: "search"
     config:
       api_key: "${SEARCH_API_KEY}"
-      engine: "duckduckgo"  # or "google", "bing"
+      engine: "duckduckgo" # or "google", "bing"
 
   code_executor:
     enabled: true
@@ -304,7 +304,7 @@ tools:
     description: "Generate PDF, DOCX, PPTX, and PNG files from content provided by the LLM"
     icon: "file-text"
     config:
-      output_dir: "./data/files"
+      output_dir: "./data/downloads"
 
 # ------------------------------------------------------------
 # MCP Servers (Model Context Protocol)
@@ -313,7 +313,33 @@ tools:
 # Use the "+" button in the MCP Servers sidebar panel to
 # discover and add a server by its URL.
 # ------------------------------------------------------------
-mcp_servers: {}
+mcp_servers:
+  # Example: SQLite database server (see examples/mcp-database-server)
+  database:
+    enabled: true
+    name: "Database"
+    description: "Query and manage a SQLite database"
+    url: "http://mcp-database:8100" # Docker service name
+    icon: "database"
+    timeout: 30
+
+  moose:
+    enabled: true
+    name: "MOOSE Simulator"
+    description: "Build, run, and post-process MOOSE framework simulations"
+    # Native mode: use host.docker.internal to reach the host from Docker
+    url: "http://host.docker.internal:8200"
+    # Docker mode: use the container name instead
+    # url: "http://mcp-moose:8200"
+    icon: "atom"
+    timeout: 120
+
+  statflow:
+    enabled: true
+    name: "StatFlow - Statistical Analysis"
+    url: "http://statflow-mcp:9000" # container name on nexus-net
+    icon: "chart-bar"
+    timeout: 120 # longer timeout for complex analyses
 
 # ------------------------------------------------------------
 # RAG (Retrieval-Augmented Generation)
@@ -339,5 +365,5 @@ uploads:
   # the request body to disk in 1 MiB chunks, so memory stays bounded
   # regardless of this value.
   max_file_size_mb: 5120
-  allowed_extensions: []  # Empty list = allow all file types
+  allowed_extensions: [] # Empty list = allow all file types
   upload_directory: "./data/uploads"

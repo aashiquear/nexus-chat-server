@@ -239,13 +239,31 @@ class ChatOrchestrator:
                 chunks.append(chunk)
                 yield {"type": "tool_stream", "name": tool_name, "chunk": chunk}
 
-            # Build final result. For code_executor the tool stores extra state.
+            # Build final result.
             if hasattr(tool, "_last_output"):
-                result = json.dumps({
+                # code_executor stashes extra state on the instance —
+                # surface it (return code, optional interactive session
+                # id) alongside the streamed output so the frontend can
+                # auto-open the right canvas view.
+                result_dict = {
                     "output": "\n".join(chunks).strip() or "(no output)",
                     "return_code": getattr(tool, "_last_return_code", 0),
-                })
+                }
+                session_id = getattr(tool, "_last_session_id", None)
+                if session_id:
+                    result_dict["interactive_session"] = session_id
+                result = json.dumps(result_dict)
+            elif len(chunks) == 1:
+                # Single-chunk tools (the default BaseTool.stream_execute
+                # path) yield their entire result as one chunk — pass it
+                # through verbatim so structured JSON (figure_json,
+                # plot_image, downloadable, svg, ...) reaches the frontend
+                # intact instead of being wrapped in ``{"result": "<json
+                # string>"}`` and double-encoded.
+                result = chunks[0]
             else:
+                # True multi-chunk streamer with no ``_last_output`` —
+                # concatenate the streamed lines into one text payload.
                 result = json.dumps({"result": "\n".join(chunks)})
 
             yield {"type": "tool_result", "name": tool_name, "result": result}

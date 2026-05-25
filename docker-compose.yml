@@ -36,16 +36,25 @@ services:
       retries: 3
 
   nexus-sandbox:
-    image: python:3.11-slim
+    build: ./sandbox
     container_name: nexus-sandbox
     networks:
       - nexus-net
-    volumes:
-      - ./data/sandbox:/sandbox
-    command: tail -f /dev/null
+    # Bind to localhost only — the sandbox is reachable from the
+    # nexus-chat container over the docker network, not the host.
+    expose:
+      - "8500"
+    environment:
+      - SANDBOX_TIMEOUT=60
     mem_limit: 512m
     cpus: '1.0'
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8500/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
 
   # ── MCP Servers (optional, enable with: docker compose --profile mcp up) ──
 
