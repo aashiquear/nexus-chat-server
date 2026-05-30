@@ -35,15 +35,19 @@ index c6b7dd2..aaf3064 100644
 -APP_SECRET_KEY=change-me-in-production
 -APP_DEBUG=false
 diff --git a/Dockerfile b/Dockerfile
-index aa6b3a7..b0e4b62 100644
+index fa8458b..0271647 100644
 --- a/Dockerfile
 +++ b/Dockerfile
-@@ -32,7 +32,7 @@ COPY config/ ./config/
+@@ -32,7 +32,11 @@ COPY config/ ./config/
  COPY --from=frontend-build /app/frontend/dist ./frontend/dist
  
  # Create data directories
--RUN mkdir -p data/uploads data/vector_store
-+RUN mkdir -p data/uploads data/vector_store data/conversations
+-RUN mkdir -p data/uploads data/vector_store data/files data/downloads
++RUN mkdir -p data/uploads data/vector_store data/files data/downloads data/conversations
++
++# Pre-download ONNX embedding model so it's available offline at runtime
++ENV ANONYMIZED_TELEMETRY=False
++RUN python -c "from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2; ONNXMiniLM_L6_V2()" || true
  
  # Expose port
  EXPOSE 8000
@@ -420,50 +424,60 @@ index 2e436be..09cf57e 100644
          path.unlink()
          return True
 diff --git a/backend/main.py b/backend/main.py
-index 117bd51..0e1a12a 100644
+index ff03e15..21c8673 100644
 --- a/backend/main.py
 +++ b/backend/main.py
-@@ -12,7 +12,7 @@ from pathlib import Path
+@@ -14,6 +14,7 @@ from pathlib import Path
  from dotenv import load_dotenv
- import uuid
- 
--from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request, BackgroundTasks
-+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request, BackgroundTasks, Depends, status
+ from fastapi import (
+     BackgroundTasks,
++    Depends,
+     FastAPI,
+     File,
+     HTTPException,
+@@ -21,6 +22,7 @@ from fastapi import (
+     UploadFile,
+     WebSocket,
+     WebSocketDisconnect,
++    status,
+ )
  from fastapi.middleware.cors import CORSMiddleware
- from fastapi.staticfiles import StaticFiles
  from fastapi.responses import FileResponse, JSONResponse
-@@ -26,10 +26,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
- from backend.config import load_config, get_config
- from backend.orchestrator import ChatOrchestrator
- from backend import conversations
-+import backend.auth as auth
+@@ -32,7 +34,13 @@ load_dotenv()
+ # Ensure backend is importable
+ sys.path.insert(0, str(Path(__file__).parent.parent))
  
--# Import providers and tools to trigger registration
--import backend.providers.anthropic_provider
--import backend.providers.openai_provider
-+# Import providers and tools to trigger registration (server: ollama only)
- import backend.providers.ollama_provider
- import backend.tools.builtin
- import backend.tools.example_tool
-@@ -38,6 +37,7 @@ import backend.tools.graph_plotter
- import backend.tools.image_analyzer
- import backend.tools.image_synthesizer
++from backend.config import load_config, get_config
++from backend.orchestrator import ChatOrchestrator
++from backend import conversations
++import backend.auth as auth
++
  import backend.mcp  # noqa: F401 – MCP client module
 +from backend.mcp.client import _load_user_mcp_servers, _save_user_mcp_servers
  
+ # Import providers and tools to trigger registration
+ import backend.providers.anthropic_provider
+@@ -44,9 +52,6 @@ import backend.tools.file_generator
+ import backend.tools.graph_plotter
+ import backend.tools.image_synthesizer
+ import backend.tools.svg_diagram
+-from backend import conversations
+-from backend.config import get_config, load_config
+-from backend.orchestrator import ChatOrchestrator
+ 
  logging.basicConfig(level=logging.INFO)
  logger = logging.getLogger(__name__)
-@@ -72,7 +72,8 @@ upload_dir.mkdir(parents=True, exist_ok=True)
+@@ -88,7 +93,8 @@ files_dir.mkdir(parents=True, exist_ok=True)
  
  @app.on_event("startup")
  async def startup_event():
--    """Initialize MCP connections and sync uploaded files into the vector store."""
-+    """Initialize auth, MCP connections and sync uploaded files into the vector store."""
+-    """Initialize MCP connections, sync uploads, and pre-load heavy models."""
++    """Initialize auth, MCP connections, sync uploads, and pre-load heavy models."""
 +    await auth.init_admin_user()
      await orchestrator.init_mcp()
      # Re-ingest any uploaded files missing from the vector store (e.g. after restart)
      if orchestrator.rag_engine:
-@@ -86,6 +87,77 @@ async def health():
+@@ -120,6 +126,77 @@ async def health():
      return {"status": "ok", "name": app_config.get("name")}
  
  
@@ -541,7 +555,7 @@ index 117bd51..0e1a12a 100644
  @app.get("/api/models")
  async def list_models():
      """Return all configured LLM models, annotated with whether each is
-@@ -108,7 +180,7 @@ UPLOAD_STREAM_CHUNK = 1024 * 1024  # 1 MiB per read — bounded memory
+@@ -142,7 +219,7 @@ UPLOAD_STREAM_CHUNK = 1024 * 1024  # 1 MiB per read — bounded memory
  
  
  @app.post("/api/upload")
@@ -550,7 +564,7 @@ index 117bd51..0e1a12a 100644
      """Upload a file for RAG and tool use.
  
      The request body is streamed to disk in 1 MiB chunks so multi-GB
-@@ -193,7 +265,7 @@ async def upload_progress(filename: str):
+@@ -228,7 +305,7 @@ async def upload_progress(filename: str):
  
  
  @app.get("/api/files")
@@ -559,7 +573,7 @@ index 117bd51..0e1a12a 100644
      """List uploaded files and resync any new files into the RAG vector store."""
      # Re-ingest any files placed directly in the uploads directory (not via upload API)
      if orchestrator.rag_engine:
-@@ -211,7 +283,7 @@ async def list_files():
+@@ -248,7 +325,7 @@ async def list_files():
  
  
  @app.delete("/api/files/{filename}")
@@ -568,7 +582,7 @@ index 117bd51..0e1a12a 100644
      """Delete an uploaded file."""
      filepath = upload_dir / filename
      if not filepath.exists():
-@@ -290,43 +362,109 @@ async def reconnect_mcp_server(server_id: str):
+@@ -515,43 +592,109 @@ async def reconnect_mcp_server(server_id: str):
      return {"status": "connected", "server": server_id}
  
  
@@ -689,7 +703,7 @@ index 117bd51..0e1a12a 100644
      if not ok:
          raise HTTPException(404, "Conversation not found")
      return {"deleted": conversation_id}
-@@ -336,7 +474,14 @@ async def delete_conversation_endpoint(conversation_id: str):
+@@ -562,7 +705,14 @@ async def delete_conversation_endpoint(conversation_id: str):
  
  @app.websocket("/ws/chat")
  async def websocket_chat(websocket: WebSocket):
@@ -805,7 +819,7 @@ index 469cc95..5f2b6d5 100644
      # ------------------------------------------------------------------
      # Tool discovery
 diff --git a/backend/orchestrator.py b/backend/orchestrator.py
-index 9c794ec..1e0f98d 100644
+index a8aa162..fc33793 100644
 --- a/backend/orchestrator.py
 +++ b/backend/orchestrator.py
 @@ -121,9 +121,8 @@ class ChatOrchestrator:
@@ -881,7 +895,7 @@ index 0000000..4197d68
 +    api_key: ""
 +    models: []   # empty = dynamic discovery from /api/tags only
 diff --git a/config/settings.yaml b/config/settings.yaml
-index 48cc099..10484db 100644
+index 2d4959c..a9db20c 100644
 --- a/config/settings.yaml
 +++ b/config/settings.yaml
 @@ -309,41 +309,11 @@ tools:
@@ -905,7 +919,7 @@ index 48cc099..10484db 100644
 -    enabled: true
 -    name: "Database"
 -    description: "Query and manage a SQLite database"
--    url: "http://mcp-database:8100"   # Docker service name
+-    url: "http://mcp-database:8100" # Docker service name
 -    icon: "database"
 -    timeout: 30
 -
@@ -923,18 +937,18 @@ index 48cc099..10484db 100644
 -  statflow:
 -    enabled: true
 -    name: "StatFlow - Statistical Analysis"
--    url: "http://statflow-mcp:9000"  # container name on nexus-net
+-    url: "http://statflow-mcp:9000" # container name on nexus-net
 -    icon: "chart-bar"
--    timeout: 120  # longer timeout for complex analyses
+-    timeout: 120 # longer timeout for complex analyses
 +mcp_servers: {}
  
  # ------------------------------------------------------------
  # RAG (Retrieval-Augmented Generation)
 diff --git a/docker-compose.yml b/docker-compose.yml
-index b8ad2bf..fa6ce28 100644
+index b2b1b1a..c35e46c 100644
 --- a/docker-compose.yml
 +++ b/docker-compose.yml
-@@ -9,18 +9,21 @@ networks:
+@@ -9,18 +9,22 @@ networks:
  services:
    nexus-chat:
      build: .
@@ -951,6 +965,7 @@ index b8ad2bf..fa6ce28 100644
 +      - NEXUS_JWT_SECRET=${NEXUS_JWT_SECRET:-change-me-in-production}
 +      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
 +      - OLLAMA_API_KEY=${OLLAMA_API_KEY:-}
++      - ANONYMIZED_TELEMETRY=False
      volumes:
        # Mount config for easy editing without rebuild
        - ./config:/app/config:ro
@@ -961,53 +976,80 @@ index b8ad2bf..fa6ce28 100644
      extra_hosts:
        # Allow container to reach Ollama on the host machine
        - "host.docker.internal:host-gateway"
-@@ -53,4 +56,5 @@ services:
+@@ -74,4 +78,5 @@ services:
        retries: 3
  
  volumes:
 +  nexus-data:
    mcp-db-data:
 diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
-index 2862fbb..9fd7450 100644
+index 8e01d31..9fd7450 100644
 --- a/frontend/src/App.jsx
 +++ b/frontend/src/App.jsx
-@@ -1,32 +1,32 @@
- import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
--import { Menu, MessageCircle, Wifi, WifiOff } from 'lucide-react'
+@@ -1,421 +1,395 @@
+-import React, {
+-  useState,
+-  useEffect,
+-  useRef,
+-  useCallback,
+-  useMemo,
+-} from "react";
+-import { Menu, MessageCircle, Wifi, WifiOff } from "lucide-react";
+-import Sidebar from "./components/Sidebar";
+-import ChatMessage, { TypingIndicator } from "./components/ChatMessage";
+-import ChatInput from "./components/ChatInput";
+-import CanvasPanel from "./components/CanvasPanel";
+-import SplashScreen from "./components/SplashScreen";
+-import { useChat } from "./hooks/useChat";
++import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 +import { Menu, MessageCircle, Wifi, WifiOff, UserCircle, LogOut } from 'lucide-react'
- import Sidebar from './components/Sidebar'
- import ChatMessage, { TypingIndicator } from './components/ChatMessage'
- import ChatInput from './components/ChatInput'
- import CanvasPanel from './components/CanvasPanel'
++import Sidebar from './components/Sidebar'
++import ChatMessage, { TypingIndicator } from './components/ChatMessage'
++import ChatInput from './components/ChatInput'
++import CanvasPanel from './components/CanvasPanel'
 +import SignInScreen from './components/SignInScreen'
- import SplashScreen from './components/SplashScreen'
++import SplashScreen from './components/SplashScreen'
 +import AccountPopup from './components/AccountPopup'
 +import AdminPanel from './components/AdminPanel'
 +import MCPDiscoveryPanel from './components/MCPDiscoveryPanel'
- import { useChat } from './hooks/useChat'
++import { useChat } from './hooks/useChat'
  import {
-   fetchModels, fetchTools, fetchFiles, uploadFile, deleteFile,
+-  fetchModels,
+-  fetchTools,
+-  fetchFiles,
+-  uploadFile,
+-  deleteFile,
++  fetchModels, fetchTools, fetchFiles, uploadFile, deleteFile,
    fetchUploadProgress,
-   fetchMCPServers, reconnectMCPServer,
+-  fetchMCPServers,
+-  reconnectMCPServer,
+-  fetchConversations,
+-  fetchConversation,
+-  saveConversation,
+-  deleteConversation,
+-} from "./hooks/api";
++  fetchMCPServers, reconnectMCPServer,
 +  addMCPServer, removeMCPServer,
-   fetchConversations, fetchConversation, saveConversation, deleteConversation,
++  fetchConversations, fetchConversation, saveConversation, deleteConversation,
 +  fetchAuthMe,
- } from './hooks/api'
++} from './hooks/api'
  
  export default function App() {
 -  // Splash / title screen - dismissed after user clicks "Start Chat"
 -  const [showSplash, setShowSplash] = useState(() => {
 -    try {
--      return sessionStorage.getItem('nexus:splashDismissed') !== '1'
+-      return sessionStorage.getItem("nexus:splashDismissed") !== "1";
 -    } catch {
--      return true
+-      return true;
 -    }
--  })
+-  });
 -
 -  const dismissSplash = useCallback(() => {
--    try { sessionStorage.setItem('nexus:splashDismissed', '1') } catch {}
--    setShowSplash(false)
--  }, [])
+-    try {
+-      sessionStorage.setItem("nexus:splashDismissed", "1");
+-    } catch {}
+-    setShowSplash(false);
+-  }, []);
 +  // Auth state
 +  const [user, setUser] = useState(null)
 +  const [authChecked, setAuthChecked] = useState(false)
@@ -1017,46 +1059,90 @@ index 2862fbb..9fd7450 100644
 +  const [showMcpDiscovery, setShowMcpDiscovery] = useState(false)
  
    // State
-   const [models, setModels] = useState([])
-@@ -41,28 +41,20 @@ export default function App() {
-   const [isTyping, setIsTyping] = useState(false)
-   const [sidebarOpen, setSidebarOpen] = useState(false)
- 
+-  const [models, setModels] = useState([]);
+-  const [tools, setTools] = useState([]);
+-  const [files, setFiles] = useState([]);
+-  const [mcpServers, setMcpServers] = useState([]);
+-  const [selectedModel, setSelectedModel] = useState("");
+-  const [selectedTools, setSelectedTools] = useState([]);
+-  const [selectedFiles, setSelectedFiles] = useState([]);
+-  const [messages, setMessages] = useState([]);
+-  const [inputValue, setInputValue] = useState("");
+-  const [isTyping, setIsTyping] = useState(false);
+-  const [sidebarOpen, setSidebarOpen] = useState(false);
+-
 -  // LLM response status — drives the floating pop-up above the chat input.
 -  // Shape: { stage: 'initiated'|'thinking'|'responding'|'tool_calling'|'tool_executing'|'idle'|'error', detail?: string }
-   const [llmStatus, setLlmStatus] = useState({ stage: 'idle' })
- 
+-  const [llmStatus, setLlmStatus] = useState({ stage: "idle" });
+-
 -  // Conversation state
-   const [conversations, setConversations] = useState([])
-   const [activeConversationId, setActiveConversationId] = useState(null)
- 
+-  const [conversations, setConversations] = useState([]);
+-  const [activeConversationId, setActiveConversationId] = useState(null);
+-
 -  // Canvas panel state (right-side panel for graphs)
-   const [canvasData, setCanvasData] = useState(null)
--  const [canvasWidth, setCanvasWidth] = useState(null) // null = auto-calculate initial
-+  const [canvasWidth, setCanvasWidth] = useState(null)
-   const isDraggingRef = useRef(false)
- 
+-  const [canvasData, setCanvasData] = useState(null);
+-  const [canvasWidth, setCanvasWidth] = useState(null); // null = auto-calculate initial
+-  const isDraggingRef = useRef(false);
+-
 -  // Upload progress state: { filename, stage, percent (0-100) } or null
 -  // Stages: 'uploading' (bytes -> server) then 'embedding' (server -> vector store)
-   const [uploadProgress, setUploadProgress] = useState(null)
- 
+-  const [uploadProgress, setUploadProgress] = useState(null);
+-
 -  // Token usage tracking: array of { prompt_tokens, completion_tokens, total_tokens } per response
-   const [tokenUsageHistory, setTokenUsageHistory] = useState([])
-   const tokenUsageRef = useRef([])
- 
+-  const [tokenUsageHistory, setTokenUsageHistory] = useState([]);
+-  const tokenUsageRef = useRef([]);
+-
 -  // Live last-response stats — only populated during active conversation, not from saved data
-   const [lastResponseStats, setLastResponseStats] = useState(null)
- 
-   const chatEndRef = useRef(null)
-@@ -72,12 +64,40 @@ export default function App() {
-   const userScrolledRef = useRef(false)
-   const { connect, sendMessage, isConnected, isStreaming } = useChat()
- 
+-  const [lastResponseStats, setLastResponseStats] = useState(null);
+-
+-  const chatEndRef = useRef(null);
+-  const chatAreaRef = useRef(null);
+-  const streamBufferRef = useRef("");
+-  const responseStartRef = useRef(null);
+-  const userScrolledRef = useRef(false);
+-  const { connect, sendMessage, isConnected, isStreaming } = useChat();
+-
 -  // Initialize
++  const [models, setModels] = useState([])
++  const [tools, setTools] = useState([])
++  const [files, setFiles] = useState([])
++  const [mcpServers, setMcpServers] = useState([])
++  const [selectedModel, setSelectedModel] = useState('')
++  const [selectedTools, setSelectedTools] = useState([])
++  const [selectedFiles, setSelectedFiles] = useState([])
++  const [messages, setMessages] = useState([])
++  const [inputValue, setInputValue] = useState('')
++  const [isTyping, setIsTyping] = useState(false)
++  const [sidebarOpen, setSidebarOpen] = useState(false)
++
++  const [llmStatus, setLlmStatus] = useState({ stage: 'idle' })
++
++  const [conversations, setConversations] = useState([])
++  const [activeConversationId, setActiveConversationId] = useState(null)
++
++  const [canvasData, setCanvasData] = useState(null)
++  const [canvasWidth, setCanvasWidth] = useState(null)
++  const isDraggingRef = useRef(false)
++
++  const [uploadProgress, setUploadProgress] = useState(null)
++
++  const [tokenUsageHistory, setTokenUsageHistory] = useState([])
++  const tokenUsageRef = useRef([])
++
++  const [lastResponseStats, setLastResponseStats] = useState(null)
++
++  const chatEndRef = useRef(null)
++  const chatAreaRef = useRef(null)
++  const streamBufferRef = useRef('')
++  const responseStartRef = useRef(null)
++  const userScrolledRef = useRef(false)
++  const { connect, sendMessage, isConnected, isStreaming } = useChat()
++
 +  // Validate auth on mount
    useEffect(() => {
--    connect()
--    loadData()
+-    connect();
+-    loadData();
+-  }, [connect]);
 +    const init = async () => {
 +      const token = localStorage.getItem('nexus_token')
 +      if (token) {
@@ -1077,8 +1163,8 @@ index 2862fbb..9fd7450 100644
 +      setAuthChecked(true)
 +    }
 +    init()
-   }, [connect])
- 
++  }, [connect])
++
 +  const handleLogout = () => {
 +    localStorage.removeItem('nexus_token')
 +    localStorage.removeItem('nexus_user')
@@ -1088,17 +1174,33 @@ index 2862fbb..9fd7450 100644
 +    setConversations([])
 +    window.location.reload()
 +  }
-+
+ 
    const loadData = async () => {
      try {
        const [m, t, f, mcp, convos] = await Promise.all([
-@@ -90,9 +110,14 @@ export default function App() {
-       setMcpServers(mcp)
-       setConversations(convos)
- 
+-        fetchModels(),
+-        fetchTools(),
+-        fetchFiles(),
+-        fetchMCPServers(),
++        fetchModels(), fetchTools(), fetchFiles(), fetchMCPServers(),
+         fetchConversations(),
+-      ]);
+-      setModels(m);
+-      setTools(t);
+-      setFiles(f);
+-      setMcpServers(mcp);
+-      setConversations(convos);
+-
 -      // Default-select a model that is both provider-configured *and*
 -      // confirmed on the remote (when probe info is available). Fall
 -      // back to any configured model if no probe data was returned.
++      ])
++      setModels(m)
++      setTools(t)
++      setFiles(f)
++      setMcpServers(mcp)
++      setConversations(convos)
++
 +      // Select all tools by default on first load
 +      setSelectedTools((prev) => {
 +        if (prev.length === 0) {
@@ -1108,73 +1210,208 @@ index 2862fbb..9fd7450 100644
 +      })
 +
        const isUsable = (x) =>
-         x.available && (x.remote_available === null || x.remote_available === undefined || x.remote_available)
-       const preferred = m.find(isUsable) || m.find((x) => x.available)
-@@ -102,7 +127,6 @@ export default function App() {
+-        x.available &&
+-        (x.remote_available === null ||
+-          x.remote_available === undefined ||
+-          x.remote_available);
+-      const preferred = m.find(isUsable) || m.find((x) => x.available);
+-      if (preferred) setSelectedModel(preferred.id);
++        x.available && (x.remote_available === null || x.remote_available === undefined || x.remote_available)
++      const preferred = m.find(isUsable) || m.find((x) => x.available)
++      if (preferred) setSelectedModel(preferred.id)
+     } catch (err) {
+-      console.error("Failed to load data:", err);
++      console.error('Failed to load data:', err)
      }
-   }
+-  };
++  }
  
 -  // Smart auto-scroll: only auto-scroll if user is near the bottom
    const handleScroll = useCallback(() => {
-     const el = chatAreaRef.current
-     if (!el) return
-@@ -118,26 +142,21 @@ export default function App() {
-     return () => el.removeEventListener('scroll', handleScroll)
-   }, [handleScroll])
+-    const el = chatAreaRef.current;
+-    if (!el) return;
+-    const threshold = 100;
+-    const atBottom =
+-      el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+-    userScrolledRef.current = !atBottom;
+-  }, []);
++    const el = chatAreaRef.current
++    if (!el) return
++    const threshold = 100
++    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < threshold
++    userScrolledRef.current = !atBottom
++  }, [])
+ 
+   useEffect(() => {
+-    const el = chatAreaRef.current;
+-    if (!el) return;
+-    el.addEventListener("scroll", handleScroll, { passive: true });
+-    return () => el.removeEventListener("scroll", handleScroll);
+-  }, [handleScroll]);
++    const el = chatAreaRef.current
++    if (!el) return
++    el.addEventListener('scroll', handleScroll, { passive: true })
++    return () => el.removeEventListener('scroll', handleScroll)
++  }, [handleScroll])
  
 -  // Auto-scroll when new content arrives (only if user hasn't scrolled up)
    useEffect(() => {
      if (!userScrolledRef.current) {
-       chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+-      chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
++      chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
      }
-   }, [messages, isTyping])
+-  }, [messages, isTyping]);
++  }, [messages, isTyping])
  
 -  // Toggle helpers
    const toggleTool = (id) => {
 -    // Check if this tool is a toolkit with grouped children
-     const tool = tools.find((t) => t.id === id)
-     const childIds = tool?.children || []
+-    const tool = tools.find((t) => t.id === id);
+-    const childIds = tool?.children || [];
++    const tool = tools.find((t) => t.id === id)
++    const childIds = tool?.children || []
  
      setSelectedTools((prev) => {
        if (prev.includes(id)) {
 -        // Deactivating: remove toolkit and all its children
-         const toRemove = new Set([id, ...childIds])
-         return prev.filter((x) => !toRemove.has(x))
+-        const toRemove = new Set([id, ...childIds]);
+-        return prev.filter((x) => !toRemove.has(x));
++        const toRemove = new Set([id, ...childIds])
++        return prev.filter((x) => !toRemove.has(x))
        } else {
 -        // Activating: add toolkit and all its children
-         const toAdd = [id, ...childIds].filter((x) => !prev.includes(x))
-         return [...prev, ...toAdd]
+-        const toAdd = [id, ...childIds].filter((x) => !prev.includes(x));
+-        return [...prev, ...toAdd];
++        const toAdd = [id, ...childIds].filter((x) => !prev.includes(x))
++        return [...prev, ...toAdd]
        }
-@@ -154,17 +173,13 @@ export default function App() {
-     setSelectedFiles((prev) => prev.filter((x) => x !== name))
-   }
+-    });
+-  };
++    })
++  }
+ 
+   const toggleFile = (name) => {
+     setSelectedFiles((prev) =>
+-      prev.includes(name) ? prev.filter((x) => x !== name) : [...prev, name],
+-    );
+-  };
++      prev.includes(name) ? prev.filter((x) => x !== name) : [...prev, name]
++    )
++  }
+ 
+   const removeFile = (name) => {
+-    setSelectedFiles((prev) => prev.filter((x) => x !== name));
+-  };
++    setSelectedFiles((prev) => prev.filter((x) => x !== name))
++  }
  
 -  // Upload
    const handleUpload = async (file) => {
      try {
 -      // Stage 1: bytes leaving the browser
-       setUploadProgress({ filename: file.name, stage: 'uploading', percent: 0 })
+-      setUploadProgress({
+-        filename: file.name,
+-        stage: "uploading",
+-        percent: 0,
+-      });
++      setUploadProgress({ filename: file.name, stage: 'uploading', percent: 0 })
        await uploadFile(file, (percent) => {
-         setUploadProgress({ filename: file.name, stage: 'uploading', percent })
-       })
- 
+-        setUploadProgress({ filename: file.name, stage: "uploading", percent });
+-      });
+-
 -      // Stage 2: server-side embedding (chunks → vector store).
 -      // Backend returns immediately; poll for embedding progress.
-       setUploadProgress({ filename: file.name, stage: 'embedding', percent: 0 })
- 
-       let done = false
-@@ -173,7 +188,6 @@ export default function App() {
-         attempts += 1
-         const progress = await fetchUploadProgress(file.name)
-         if (!progress || progress.stage === 'unknown') {
+-      setUploadProgress({
+-        filename: file.name,
+-        stage: "embedding",
+-        percent: 0,
+-      });
+-
+-      let done = false;
+-      let attempts = 0;
++        setUploadProgress({ filename: file.name, stage: 'uploading', percent })
++      })
++
++      setUploadProgress({ filename: file.name, stage: 'embedding', percent: 0 })
++
++      let done = false
++      let attempts = 0
+       while (!done && attempts < 600) {
+-        attempts += 1;
+-        const progress = await fetchUploadProgress(file.name);
+-        if (!progress || progress.stage === "unknown") {
 -          // Backend hasn't recorded progress yet — keep polling briefly
-           await new Promise((r) => setTimeout(r, 250))
-           continue
+-          await new Promise((r) => setTimeout(r, 250));
+-          continue;
++        attempts += 1
++        const progress = await fetchUploadProgress(file.name)
++        if (!progress || progress.stage === 'unknown') {
++          await new Promise((r) => setTimeout(r, 250))
++          continue
          }
-@@ -216,6 +230,33 @@ export default function App() {
-     }
-   }
+-        const stage =
+-          progress.stage === "complete" ? "embedding" : progress.stage;
++        const stage = progress.stage === 'complete' ? 'embedding' : progress.stage
+         setUploadProgress({
+           filename: file.name,
+-          stage:
+-            stage === "reading" || stage === "chunking" || stage === "queued"
+-              ? "embedding"
+-              : stage,
++          stage: stage === 'reading' || stage === 'chunking' || stage === 'queued'
++            ? 'embedding'
++            : stage,
+           percent: progress.percent || 0,
+           subStage: progress.stage,
+-        });
+-        if (progress.stage === "complete" || progress.stage === "error") {
+-          done = true;
+-          break;
++        })
++        if (progress.stage === 'complete' || progress.stage === 'error') {
++          done = true
++          break
+         }
+-        await new Promise((r) => setTimeout(r, 350));
++        await new Promise((r) => setTimeout(r, 350))
+       }
  
+-      setUploadProgress(null);
+-      const updatedFiles = await fetchFiles();
+-      setFiles(updatedFiles);
++      setUploadProgress(null)
++      const updatedFiles = await fetchFiles()
++      setFiles(updatedFiles)
+       if (!selectedFiles.includes(file.name)) {
+-        setSelectedFiles((prev) => [...prev, file.name]);
++        setSelectedFiles((prev) => [...prev, file.name])
+       }
+     } catch (err) {
+-      setUploadProgress(null);
+-      alert(`Upload failed: ${err.message}`);
++      setUploadProgress(null)
++      alert(`Upload failed: ${err.message}`)
+     }
+-  };
++  }
+ 
+   const handleReconnectMCP = async (serverId) => {
+     try {
+-      await reconnectMCPServer(serverId);
+-      const [t, mcp] = await Promise.all([fetchTools(), fetchMCPServers()]);
+-      setTools(t);
+-      setMcpServers(mcp);
++      await reconnectMCPServer(serverId)
++      const [t, mcp] = await Promise.all([fetchTools(), fetchMCPServers()])
++      setTools(t)
++      setMcpServers(mcp)
+     } catch (err) {
+-      console.error("MCP reconnect failed:", err);
++      console.error('MCP reconnect failed:', err)
+     }
+-  };
++  }
++
 +  const handleAddMCP = async (cfg) => {
 +    try {
 +      await addMCPServer(cfg)
@@ -1201,108 +1438,500 @@ index 2862fbb..9fd7450 100644
 +      alert(`Failed to remove MCP server: ${err.message}`)
 +    }
 +  }
-+
+ 
    const handleDeleteFile = async (filename) => {
      try {
-       await deleteFile(filename)
-@@ -226,8 +267,6 @@ export default function App() {
+-      await deleteFile(filename);
+-      setFiles((prev) => prev.filter((f) => f.name !== filename));
+-      setSelectedFiles((prev) => prev.filter((n) => n !== filename));
++      await deleteFile(filename)
++      setFiles((prev) => prev.filter((f) => f.name !== filename))
++      setSelectedFiles((prev) => prev.filter((n) => n !== filename))
+     } catch (err) {
+-      console.error("Delete failed:", err);
++      console.error('Delete failed:', err)
      }
-   }
- 
+-  };
+-
 -  // ---- Conversation persistence ----
 -
-   const persistConversation = useCallback(async (msgs, convId, tokenUsage) => {
-     if (!msgs || msgs.length === 0) return null
+-  const persistConversation = useCallback(
+-    async (msgs, convId, tokenUsage) => {
+-      if (!msgs || msgs.length === 0) return null;
+-      try {
+-        const result = await saveConversation({
+-          id: convId || undefined,
+-          messages: msgs,
+-          model: selectedModel,
+-          token_usage: tokenUsage || undefined,
+-        });
+-        // Refresh the sidebar list
+-        const convos = await fetchConversations();
+-        setConversations(convos);
+-        return result.id;
+-      } catch (err) {
+-        console.error("Save conversation failed:", err);
+-        return convId;
+-      }
+-    },
+-    [selectedModel],
+-  );
++  }
++
++  const persistConversation = useCallback(async (msgs, convId, tokenUsage) => {
++    if (!msgs || msgs.length === 0) return null
++    try {
++      const result = await saveConversation({
++        id: convId || undefined,
++        messages: msgs,
++        model: selectedModel,
++        token_usage: tokenUsage || undefined,
++      })
++      const convos = await fetchConversations()
++      setConversations(convos)
++      return result.id
++    } catch (err) {
++      console.error('Save conversation failed:', err)
++      return convId
++    }
++  }, [selectedModel])
+ 
+   const handleSelectConversation = async (id) => {
      try {
-@@ -237,7 +276,6 @@ export default function App() {
-         model: selectedModel,
-         token_usage: tokenUsage || undefined,
-       })
--      // Refresh the sidebar list
-       const convos = await fetchConversations()
-       setConversations(convos)
-       return result.id
-@@ -277,13 +315,11 @@ export default function App() {
+-      const data = await fetchConversation(id);
++      const data = await fetchConversation(id)
+       if (data) {
+-        setMessages(data.messages || []);
+-        setActiveConversationId(data.id);
+-        if (data.model) setSelectedModel(data.model);
+-        setSidebarOpen(false);
+-        setTokenUsageHistory(data.token_usage || []);
+-        tokenUsageRef.current = data.token_usage || [];
+-        setLastResponseStats(null);
++        setMessages(data.messages || [])
++        setActiveConversationId(data.id)
++        if (data.model) setSelectedModel(data.model)
++        setSidebarOpen(false)
++        setTokenUsageHistory(data.token_usage || [])
++        tokenUsageRef.current = data.token_usage || []
++        setLastResponseStats(null)
+       }
+     } catch (err) {
+-      console.error("Failed to load conversation:", err);
++      console.error('Failed to load conversation:', err)
      }
-   }
+-  };
++  }
+ 
+   const handleDeleteConversation = async (id) => {
+     try {
+-      await deleteConversation(id);
+-      setConversations((prev) => prev.filter((c) => c.id !== id));
++      await deleteConversation(id)
++      setConversations((prev) => prev.filter((c) => c.id !== id))
+       if (activeConversationId === id) {
+-        setMessages([]);
+-        setActiveConversationId(null);
++        setMessages([])
++        setActiveConversationId(null)
+       }
+     } catch (err) {
+-      console.error("Delete conversation failed:", err);
++      console.error('Delete conversation failed:', err)
+     }
+-  };
++  }
  
 -  // Open canvas panel for a graph
    const handleOpenCanvas = useCallback((data) => {
-     setCanvasData(data)
--    setCanvasWidth(null) // reset to auto-calculate on each new open
+-    setCanvasData(data);
+-    setCanvasWidth(null); // reset to auto-calculate on each new open
+-  }, []);
++    setCanvasData(data)
 +    setCanvasWidth(null)
-   }, [])
++  }, [])
  
 -  // Canvas divider drag-to-resize
    const resizeCanvas = useCallback((delta) => {
      setCanvasWidth((prev) => {
-       const current = prev || window.innerWidth * 0.4
-@@ -330,7 +366,6 @@ export default function App() {
-     }
-   }, [resizeCanvas])
+-      const current = prev || window.innerWidth * 0.4;
+-      const minWidth = 300;
+-      const maxWidth = window.innerWidth * 0.7;
+-      return Math.max(minWidth, Math.min(maxWidth, current + delta));
+-    });
+-  }, []);
++      const current = prev || window.innerWidth * 0.4
++      const minWidth = 300
++      const maxWidth = window.innerWidth * 0.7
++      return Math.max(minWidth, Math.min(maxWidth, current + delta))
++    })
++  }, [])
+ 
+   const handleDividerMouseDown = useCallback((e) => {
+-    e.preventDefault();
+-    isDraggingRef.current = true;
+-    document.body.style.cursor = "col-resize";
+-    document.body.style.userSelect = "none";
++    e.preventDefault()
++    isDraggingRef.current = true
++    document.body.style.cursor = 'col-resize'
++    document.body.style.userSelect = 'none'
+ 
+     const onMouseMove = (e) => {
+-      if (!isDraggingRef.current) return;
+-      const newWidth = window.innerWidth - e.clientX;
+-      const minWidth = 300;
+-      const maxWidth = window.innerWidth * 0.7;
+-      setCanvasWidth(Math.max(minWidth, Math.min(maxWidth, newWidth)));
+-    };
++      if (!isDraggingRef.current) return
++      const newWidth = window.innerWidth - e.clientX
++      const minWidth = 300
++      const maxWidth = window.innerWidth * 0.7
++      setCanvasWidth(Math.max(minWidth, Math.min(maxWidth, newWidth)))
++    }
+ 
+     const onMouseUp = () => {
+-      isDraggingRef.current = false;
+-      document.body.style.cursor = "";
+-      document.body.style.userSelect = "";
+-      document.removeEventListener("mousemove", onMouseMove);
+-      document.removeEventListener("mouseup", onMouseUp);
+-    };
+-
+-    document.addEventListener("mousemove", onMouseMove);
+-    document.addEventListener("mouseup", onMouseUp);
+-  }, []);
+-
+-  const handleDividerKeyDown = useCallback(
+-    (e) => {
+-      const step = e.shiftKey ? 50 : 10;
+-      if (e.key === "ArrowLeft") {
+-        e.preventDefault();
+-        resizeCanvas(step);
+-      } else if (e.key === "ArrowRight") {
+-        e.preventDefault();
+-        resizeCanvas(-step);
+-      }
+-    },
+-    [resizeCanvas],
+-  );
++      isDraggingRef.current = false
++      document.body.style.cursor = ''
++      document.body.style.userSelect = ''
++      document.removeEventListener('mousemove', onMouseMove)
++      document.removeEventListener('mouseup', onMouseUp)
++    }
++
++    document.addEventListener('mousemove', onMouseMove)
++    document.addEventListener('mouseup', onMouseUp)
++  }, [])
++
++  const handleDividerKeyDown = useCallback((e) => {
++    const step = e.shiftKey ? 50 : 10
++    if (e.key === 'ArrowLeft') {
++      e.preventDefault()
++      resizeCanvas(step)
++    } else if (e.key === 'ArrowRight') {
++      e.preventDefault()
++      resizeCanvas(-step)
++    }
++  }, [resizeCanvas])
  
 -  // Compute conversation statistics from messages and token history
    const conversationStats = useMemo(() => {
-     const countWords = (text) => text ? text.trim().split(/\s+/).filter(Boolean).length : 0
+-    const countWords = (text) =>
+-      text ? text.trim().split(/\s+/).filter(Boolean).length : 0;
+-
+-    const userMsgs = messages.filter((m) => m.role === "user");
+-    const assistantMsgs = messages.filter((m) => m.role === "assistant");
+-
+-    const userMessages = userMsgs.length;
+-    const assistantMessages = assistantMsgs.length;
+-
+-    const totalUserWords = userMsgs.reduce(
+-      (sum, m) => sum + countWords(m.content),
+-      0,
+-    );
+-    const assistantWordCounts = assistantMsgs.map((m) => countWords(m.content));
+-    const totalAssistantWords = assistantWordCounts.reduce((a, b) => a + b, 0);
+-
+-    const maxResponseWords =
+-      assistantWordCounts.length > 0 ? Math.max(...assistantWordCounts) : 0;
+-    const avgResponseWords =
+-      assistantMessages > 0
+-        ? Math.round(totalAssistantWords / assistantMessages)
+-        : 0;
+-
+-    const totalPromptTokens = tokenUsageHistory.reduce(
+-      (sum, u) => sum + (u.prompt_tokens || 0),
+-      0,
+-    );
+-    const totalCompletionTokens = tokenUsageHistory.reduce(
+-      (sum, u) => sum + (u.completion_tokens || 0),
+-      0,
+-    );
+-    const totalTokens = tokenUsageHistory.reduce(
+-      (sum, u) => sum + (u.total_tokens || 0),
+-      0,
+-    );
+-
+-    const completionTokenCounts = tokenUsageHistory.map(
+-      (u) => u.completion_tokens || 0,
+-    );
+-    const maxResponseTokens =
+-      completionTokenCounts.length > 0 ? Math.max(...completionTokenCounts) : 0;
+-    const avgResponseTokens =
+-      tokenUsageHistory.length > 0
+-        ? Math.round(totalCompletionTokens / tokenUsageHistory.length)
+-        : 0;
++    const countWords = (text) => text ? text.trim().split(/\s+/).filter(Boolean).length : 0
++
++    const userMsgs = messages.filter((m) => m.role === 'user')
++    const assistantMsgs = messages.filter((m) => m.role === 'assistant')
++
++    const userMessages = userMsgs.length
++    const assistantMessages = assistantMsgs.length
++
++    const totalUserWords = userMsgs.reduce((sum, m) => sum + countWords(m.content), 0)
++    const assistantWordCounts = assistantMsgs.map((m) => countWords(m.content))
++    const totalAssistantWords = assistantWordCounts.reduce((a, b) => a + b, 0)
++
++    const maxResponseWords = assistantWordCounts.length > 0 ? Math.max(...assistantWordCounts) : 0
++    const avgResponseWords = assistantMessages > 0 ? Math.round(totalAssistantWords / assistantMessages) : 0
++
++    const totalPromptTokens = tokenUsageHistory.reduce((sum, u) => sum + (u.prompt_tokens || 0), 0)
++    const totalCompletionTokens = tokenUsageHistory.reduce((sum, u) => sum + (u.completion_tokens || 0), 0)
++    const totalTokens = tokenUsageHistory.reduce((sum, u) => sum + (u.total_tokens || 0), 0)
++
++    const completionTokenCounts = tokenUsageHistory.map((u) => u.completion_tokens || 0)
++    const maxResponseTokens = completionTokenCounts.length > 0 ? Math.max(...completionTokenCounts) : 0
++    const avgResponseTokens = tokenUsageHistory.length > 0
++      ? Math.round(totalCompletionTokens / tokenUsageHistory.length) : 0
  
-@@ -371,7 +406,6 @@ export default function App() {
-     }
-   }, [messages, tokenUsageHistory])
+     return {
+       userMessages,
+@@ -429,36 +403,32 @@ export default function App() {
+       maxResponseTokens,
+       avgResponseWords,
+       avgResponseTokens,
+-    };
+-  }, [messages, tokenUsageHistory]);
++    }
++  }, [messages, tokenUsageHistory])
  
 -  // Send message
    const handleSend = useCallback(() => {
-     const text = inputValue.trim()
-     if (!text || !selectedModel) return
-@@ -384,19 +418,16 @@ export default function App() {
-     setLlmStatus({ stage: 'initiated' })
-     streamBufferRef.current = ''
-     responseStartRef.current = Date.now()
--    userScrolledRef.current = false  // Reset scroll on new message
-+    userScrolledRef.current = false
- 
+-    const text = inputValue.trim();
+-    if (!text || !selectedModel) return;
+-
+-    const userMsg = { role: "user", content: text };
+-    const newMessages = [...messages, userMsg];
+-    setMessages(newMessages);
+-    setInputValue("");
+-    setIsTyping(true);
+-    setLlmStatus({ stage: "initiated" });
+-    streamBufferRef.current = "";
+-    responseStartRef.current = Date.now();
+-    userScrolledRef.current = false; // Reset scroll on new message
+-
 -    // Build message history for the API
++    const text = inputValue.trim()
++    if (!text || !selectedModel) return
++
++    const userMsg = { role: 'user', content: text }
++    const newMessages = [...messages, userMsg]
++    setMessages(newMessages)
++    setInputValue('')
++    setIsTyping(true)
++    setLlmStatus({ stage: 'initiated' })
++    streamBufferRef.current = ''
++    responseStartRef.current = Date.now()
++    userScrolledRef.current = false
++
      const apiMessages = newMessages.map((m) => ({
        role: m.role,
        content: m.content,
-     }))
+-    }));
++    }))
  
 -    // Track tool events for the current response
-     const toolCalls = []
-     const toolResults = []
+-    const toolCalls = [];
+-    const toolResults = [];
++    const toolCalls = []
++    const toolResults = []
  
 -    // Save reference to current conversation id
-     let currentConvId = activeConversationId
+-    let currentConvId = activeConversationId;
++    let currentConvId = activeConversationId
  
      sendMessage(
-@@ -409,8 +440,6 @@ export default function App() {
+       {
+@@ -469,289 +439,211 @@ export default function App() {
+       },
        async (event) => {
          switch (event.type) {
-           case 'status':
+-          case "status":
 -            // Backend-emitted lifecycle marker (e.g. "initiated"). The
 -            // remaining stages are inferred from text/tool events below.
++          case 'status':
              if (event.stage) {
-               setLlmStatus({ stage: event.stage })
+-              setLlmStatus({ stage: event.stage });
++              setLlmStatus({ stage: event.stage })
              }
-@@ -441,13 +470,10 @@ export default function App() {
-               return updated
-             })
-             setIsTyping(false)
+-            break;
++            break
+ 
+-          case "text":
+-            streamBufferRef.current += event.content;
++          case 'text':
++            streamBufferRef.current += event.content
+             setMessages((prev) => {
+-              const updated = [...prev];
+-              const lastIdx = updated.length - 1;
+-              if (lastIdx >= 0 && updated[lastIdx].role === "assistant") {
++              const updated = [...prev]
++              const lastIdx = updated.length - 1
++              if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') {
+                 updated[lastIdx] = {
+                   ...updated[lastIdx],
+                   content: streamBufferRef.current,
+                   toolCalls: [...toolCalls],
+                   toolResults: [...toolResults],
+-                  startedAt:
+-                    updated[lastIdx].startedAt ?? responseStartRef.current,
+-                };
++                  startedAt: updated[lastIdx].startedAt ?? responseStartRef.current,
++                }
+               } else {
+                 updated.push({
+-                  role: "assistant",
++                  role: 'assistant',
+                   content: streamBufferRef.current,
+                   toolCalls: [...toolCalls],
+                   toolResults: [...toolResults],
+                   startedAt: responseStartRef.current,
+-                });
++                })
+               }
+-              return updated;
+-            });
+-            setIsTyping(false);
 -            // A <think>…</think> block that hasn't closed yet means the
 -            // model is still mid-reasoning. Anything else counts as the
 -            // visible response.
++              return updated
++            })
++            setIsTyping(false)
              {
-               const buf = streamBufferRef.current
--              const lastOpen = Math.max(buf.lastIndexOf('<think>'), buf.lastIndexOf('<thinking>'))
--              const lastClose = Math.max(buf.lastIndexOf('</think>'), buf.lastIndexOf('</thinking>'))
+-              const buf = streamBufferRef.current;
+-              const lastOpen = Math.max(
+-                buf.lastIndexOf("<think>"),
+-                buf.lastIndexOf("<thinking>"),
+-              );
+-              const lastClose = Math.max(
+-                buf.lastIndexOf("</think>"),
+-                buf.lastIndexOf("</thinking>"),
+-              );
+-              const inThink = lastOpen > lastClose;
+-              setLlmStatus({ stage: inThink ? "thinking" : "responding" });
++              const buf = streamBufferRef.current
 +              const lastOpen = Math.max(buf.lastIndexOf('<thinking>'), buf.lastIndexOf('<thinking>'))
 +              const lastClose = Math.max(buf.lastIndexOf('</thinking>'), buf.lastIndexOf('</thinking>'))
-               const inThink = lastOpen > lastClose
-               setLlmStatus({ stage: inThink ? 'thinking' : 'responding' })
++              const inThink = lastOpen > lastClose
++              setLlmStatus({ stage: inThink ? 'thinking' : 'responding' })
              }
-@@ -498,15 +524,6 @@ export default function App() {
+-            break;
++            break
+ 
+-          case "tool_call":
+-            setLlmStatus({ stage: "tool_calling", detail: event.name });
++          case 'tool_call':
++            setLlmStatus({ stage: 'tool_calling', detail: event.name })
+             toolCalls.push({
+               name: event.name,
+               arguments: event.arguments,
+-            });
++            })
+             setMessages((prev) => {
+-              const updated = [...prev];
+-              const lastIdx = updated.length - 1;
+-              if (lastIdx >= 0 && updated[lastIdx].role === "assistant") {
++              const updated = [...prev]
++              const lastIdx = updated.length - 1
++              if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') {
+                 updated[lastIdx] = {
+                   ...updated[lastIdx],
+                   toolCalls: [...toolCalls],
+-                  startedAt:
+-                    updated[lastIdx].startedAt ?? responseStartRef.current,
+-                };
++                  startedAt: updated[lastIdx].startedAt ?? responseStartRef.current,
++                }
+               } else {
+                 updated.push({
+-                  role: "assistant",
+-                  content: "",
++                  role: 'assistant',
++                  content: '',
+                   toolCalls: [...toolCalls],
+                   toolResults: [],
+                   startedAt: responseStartRef.current,
+-                });
++                })
                }
-               return updated
-             })
+-              return updated;
+-            });
+-            break;
+-
+-          case "tool_stream":
+-            // Live output from a streaming tool (e.g. code_executor)
+-            setCanvasData((prev) => {
+-              if (
+-                prev &&
+-                prev.type === "terminal" &&
+-                prev.name === event.name
+-              ) {
+-                return { ...prev, chunks: [...prev.chunks, event.chunk] };
+-              }
+-              return {
+-                type: "terminal",
+-                name: event.name,
+-                title: `Running ${event.name}…`,
+-                chunks: [event.chunk],
+-                contentType: "terminal",
+-              };
+-            });
+-            break;
+-
+-          case "tool_result":
+-            setLlmStatus({ stage: "tool_executing", detail: event.name });
++              return updated
++            })
++            break
++
++          case 'tool_result':
++            setLlmStatus({ stage: 'tool_executing', detail: event.name })
+             toolResults.push({
+               name: event.name,
+               result: event.result,
+-            });
++            })
+             setMessages((prev) => {
+-              const updated = [...prev];
+-              const lastIdx = updated.length - 1;
+-              if (lastIdx >= 0 && updated[lastIdx].role === "assistant") {
++              const updated = [...prev]
++              const lastIdx = updated.length - 1
++              if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') {
+                 updated[lastIdx] = {
+                   ...updated[lastIdx],
+                   toolResults: [...toolResults],
+-                };
++                }
+               }
+-              return updated;
+-            });
 -            // Note: do NOT reset streamBufferRef here. The agentic loop
 -            // sends another round of streamed text after this tool call,
 -            // and that text needs to *append* to the prior round (whose
@@ -1311,65 +1940,225 @@ index 2862fbb..9fd7450 100644
 -            // thinking. The buffer is reset at the start of each new
 -            // user turn (in handleSend) instead.
 -
--            // Auto-open canvas panel for graph plots
+-            // Auto-open canvas panel for graph plots / interactive
+-            // sandbox sessions. Plotly figure_json wins over PNG so the
+-            // user sees the interactive chart by default.
++              return updated
++            })
              try {
-               const parsed = JSON.parse(event.result)
-               if (parsed && parsed.plot_image) {
-@@ -528,7 +545,6 @@ export default function App() {
-           case 'done':
-             setIsTyping(false)
-             setLlmStatus({ stage: 'idle' })
--            // Freeze the response timer on the last assistant message.
-             {
-               const start = responseStartRef.current
-               if (start) {
-@@ -548,7 +564,6 @@ export default function App() {
+-              const parsed = JSON.parse(event.result);
+-              if (parsed && parsed.figure_json) {
+-                const figData =
+-                  typeof parsed.figure_json === "string"
+-                    ? JSON.parse(parsed.figure_json)
+-                    : parsed.figure_json;
+-                setCanvasData({
+-                  figureJson: figData,
+-                  title:
+-                    parsed.title ||
+-                    figData.layout?.title?.text ||
+-                    "Interactive Plot",
+-                });
+-              } else if (parsed && parsed.plot_image) {
++              const parsed = JSON.parse(event.result)
++              if (parsed && parsed.plot_image) {
+                 setCanvasData({
+                   image: parsed.plot_image,
+-                  title: parsed.title || "Generated Plot",
+-                });
+-              } else if (parsed && parsed.interactive_session) {
+-                setCanvasData({
+-                  sandboxSessionId: parsed.interactive_session,
+-                  title: "Sandbox Console",
+-                  contentType: "terminal",
+-                  chunks: [],
+-                });
+-              } else if (
+-                event.name === "code_executor" &&
+-                parsed &&
+-                parsed.output != null
+-              ) {
++                  title: parsed.title || 'Generated Plot',
++                })
++              } else if (parsed && parsed.figure_json) {
++                const figData = typeof parsed.figure_json === 'string'
++                  ? JSON.parse(parsed.figure_json) : parsed.figure_json
+                 setCanvasData({
+-                  title: parsed.title || "Code Output",
+-                  contentType: "terminal",
+-                  chunks: parsed.output.split("\n"),
+-                });
+-              } else if (parsed && parsed.downloadable) {
+-                // If a downloadable result comes through, the user can
+-                // click Preview in the inline card; we don't auto-open.
++                  figureJson: figData,
++                  title: parsed.title || figData.layout?.title?.text || 'Interactive Plot',
++                })
                }
-               responseStartRef.current = null
+-            } catch (_e) {
+-              /* not JSON */
+-            }
+-            break;
++            } catch (_e) { /* not JSON */ }
++            break
+ 
+-          case "done":
+-            setIsTyping(false);
+-            setLlmStatus({ stage: "idle" });
+-            // Freeze the response timer on the last assistant message.
++          case 'done':
++            setIsTyping(false)
++            setLlmStatus({ stage: 'idle' })
+             {
+-              const start = responseStartRef.current;
++              const start = responseStartRef.current
+               if (start) {
+-                const finalMs = Date.now() - start;
++                const finalMs = Date.now() - start
+                 setMessages((prev) => {
+-                  const updated = [...prev];
+-                  const lastIdx = updated.length - 1;
+-                  if (lastIdx >= 0 && updated[lastIdx].role === "assistant") {
++                  const updated = [...prev]
++                  const lastIdx = updated.length - 1
++                  if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') {
+                     updated[lastIdx] = {
+                       ...updated[lastIdx],
+                       durationMs: finalMs,
+                       startedAt: updated[lastIdx].startedAt ?? start,
+-                    };
++                    }
+                   }
+-                  return updated;
+-                });
++                  return updated
++                })
+               }
+-              responseStartRef.current = null;
++              responseStartRef.current = null
              }
 -            // Track token usage if provided
              if (event.usage) {
                setTokenUsageHistory((prev) => {
-                 const updated = [...prev, event.usage]
-@@ -556,7 +571,6 @@ export default function App() {
-                 return updated
-               })
+-                const updated = [...prev, event.usage];
+-                tokenUsageRef.current = updated;
+-                return updated;
+-              });
++                const updated = [...prev, event.usage]
++                tokenUsageRef.current = updated
++                return updated
++              })
              }
 -            // Compute last response stats from the streamed content
              {
                const lastWords = streamBufferRef.current
-                 ? streamBufferRef.current.trim().split(/\s+/).filter(Boolean).length
-@@ -569,9 +583,7 @@ export default function App() {
+-                ? streamBufferRef.current.trim().split(/\s+/).filter(Boolean)
+-                    .length
+-                : 0;
+-              const lastTokens = event.usage
+-                ? event.usage.completion_tokens || 0
+-                : 0;
+-              const lastPromptTokens = event.usage
+-                ? event.usage.prompt_tokens || 0
+-                : 0;
++                ? streamBufferRef.current.trim().split(/\s+/).filter(Boolean).length
++                : 0
++              const lastTokens = event.usage ? (event.usage.completion_tokens || 0) : 0
++              const lastPromptTokens = event.usage ? (event.usage.prompt_tokens || 0) : 0
+               setLastResponseStats({
+                 words: lastWords,
+                 tokens: lastTokens,
                  promptTokens: lastPromptTokens,
-               })
+-              });
++              })
              }
 -            // Auto-save conversation when response is complete
              setMessages((prev) => {
 -              // Use a timeout to ensure state is settled
                setTimeout(async () => {
-                 const savedId = await persistConversation(prev, currentConvId, tokenUsageRef.current)
+-                const savedId = await persistConversation(
+-                  prev,
+-                  currentConvId,
+-                  tokenUsageRef.current,
+-                );
++                const savedId = await persistConversation(prev, currentConvId, tokenUsageRef.current)
                  if (savedId && !currentConvId) {
-@@ -591,7 +603,7 @@ export default function App() {
+-                  setActiveConversationId(savedId);
+-                  currentConvId = savedId;
++                  setActiveConversationId(savedId)
++                  currentConvId = savedId
+                 }
+-              }, 100);
+-              return prev;
+-            });
+-            break;
+-
+-          case "error":
+-            setIsTyping(false);
+-            setLlmStatus({ stage: "error", detail: event.content });
+-            responseStartRef.current = null;
++              }, 100)
++              return prev
++            })
++            break
++
++          case 'error':
++            setIsTyping(false)
++            setLlmStatus({ stage: 'error', detail: event.content })
++            responseStartRef.current = null
+             setMessages((prev) => [
                ...prev,
                {
-                 role: 'assistant',
+-                role: "assistant",
 -                content: `\u26a0\ufe0f ${event.content}`,
++                role: 'assistant',
 +                content: `⚠️ ${event.content}`,
                },
-             ])
-             break
-@@ -600,7 +612,6 @@ export default function App() {
-     )
-   }, [inputValue, messages, selectedModel, selectedTools, selectedFiles, sendMessage, activeConversationId, persistConversation])
- 
+-            ]);
+-            break;
++            ])
++            break
+         }
+-      },
+-    );
+-  }, [
+-    inputValue,
+-    messages,
+-    selectedModel,
+-    selectedTools,
+-    selectedFiles,
+-    sendMessage,
+-    activeConversationId,
+-    persistConversation,
+-  ]);
+-
 -  // New chat
++      }
++    )
++  }, [inputValue, messages, selectedModel, selectedTools, selectedFiles, sendMessage, activeConversationId, persistConversation])
++
    const handleNewChat = () => {
-     setMessages([])
-     setActiveConversationId(null)
-@@ -613,9 +624,26 @@ export default function App() {
-     setLlmStatus({ stage: 'idle' })
-   }
- 
+-    setMessages([]);
+-    setActiveConversationId(null);
+-    setInputValue("");
+-    setSidebarOpen(false);
+-    setCanvasData(null);
+-    setTokenUsageHistory([]);
+-    tokenUsageRef.current = [];
+-    setLastResponseStats(null);
+-    setLlmStatus({ stage: "idle" });
+-  };
++    setMessages([])
++    setActiveConversationId(null)
++    setInputValue('')
++    setSidebarOpen(false)
++    setCanvasData(null)
++    setTokenUsageHistory([])
++    tokenUsageRef.current = []
++    setLastResponseStats(null)
++    setLlmStatus({ stage: 'idle' })
++  }
++
 +  if (!authChecked) {
 +    return (
 +      <div className="splash-screen">
@@ -1387,14 +2176,14 @@ index 2862fbb..9fd7450 100644
 +  if (showSplash) {
 +    return <SplashScreen user={user} onStart={() => setShowSplash(false)} onLogout={handleLogout} />
 +  }
-+
+ 
    return (
      <div className="app-layout">
 -      {showSplash && <SplashScreen onStart={dismissSplash} />}
        <Sidebar
          models={models}
          selectedModel={selectedModel}
-@@ -625,6 +653,8 @@ export default function App() {
+@@ -761,6 +653,8 @@ export default function App() {
          onToggleTool={toggleTool}
          mcpServers={mcpServers}
          onReconnectMCP={handleReconnectMCP}
@@ -1403,7 +2192,7 @@ index 2862fbb..9fd7450 100644
          files={files}
          selectedFiles={selectedFiles}
          onToggleFile={toggleFile}
-@@ -638,6 +668,8 @@ export default function App() {
+@@ -774,6 +668,8 @@ export default function App() {
          onNewChat={handleNewChat}
          isOpen={sidebarOpen}
          onClose={() => setSidebarOpen(false)}
@@ -1412,13 +2201,10 @@ index 2862fbb..9fd7450 100644
        />
  
        <div className="main-content">
-@@ -655,12 +687,63 @@ export default function App() {
+@@ -791,19 +687,62 @@ export default function App() {
                <span className="header-model-badge">{selectedModel}</span>
              )}
            </div>
--          <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: isConnected ? 'var(--success)' : 'var(--error)', fontSize: 12 }}>
--            {isConnected ? <Wifi size={14} /> : <WifiOff size={14} />}
--            {isConnected ? 'Connected' : 'Disconnected'}
 +          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
 +            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: isConnected ? 'var(--success)' : 'var(--error)', fontSize: 12 }}>
 +              {isConnected ? <Wifi size={14} /> : <WifiOff size={14} />}
@@ -1440,16 +2226,21 @@ index 2862fbb..9fd7450 100644
 +            >
 +              <LogOut size={18} />
 +            </button>
-           </div>
-         </div>
- 
++          </div>
++        </div>
++
 +        {showAccount && (
 +          <AccountPopup user={user} onClose={() => setShowAccount(false)} onLogout={handleLogout} />
 +        )}
 +
 +        {showAdmin && (
-+          <div
-+            style={{
+           <div
+             style={{
+-              display: "flex",
+-              alignItems: "center",
+-              gap: 6,
+-              color: isConnected ? "var(--success)" : "var(--error)",
+-              fontSize: 12,
 +              position: 'absolute',
 +              top: 52,
 +              left: 12,
@@ -1460,10 +2251,13 @@ index 2862fbb..9fd7450 100644
 +              boxShadow: '0 8px 24px rgba(0,0,0,0.12)',
 +              zIndex: 200,
 +              padding: 16,
-+            }}
-+          >
+             }}
+           >
+-            {isConnected ? <Wifi size={14} /> : <WifiOff size={14} />}
+-            {isConnected ? "Connected" : "Disconnected"}
 +            <AdminPanel onClose={() => setShowAdmin(false)} onLogout={handleLogout} />
-+          </div>
+           </div>
+-        </div>
 +        )}
 +
 +        {showMcpDiscovery && (
@@ -1475,10 +2269,40 @@ index 2862fbb..9fd7450 100644
 +            }}
 +          />
 +        )}
-+
+ 
          {/* Chat Area */}
          <div className="chat-area" ref={chatAreaRef}>
-           <div className="chat-container">
+@@ -815,8 +754,8 @@ export default function App() {
+                 </div>
+                 <div className="empty-state-title">Start a conversation</div>
+                 <div className="empty-state-hint">
+-                  Select a model and tools from the sidebar, then type your
+-                  message below. Upload files for RAG-enhanced responses.
++                  Select a model and tools from the sidebar, then type your message below.
++                  Upload files for RAG-enhanced responses.
+                 </div>
+               </div>
+             ) : (
+@@ -867,12 +806,6 @@ export default function App() {
+           <CanvasPanel
+             image={canvasData.image}
+             figureJson={canvasData.figureJson}
+-            content={canvasData.content}
+-            contentType={canvasData.contentType}
+-            chunks={canvasData.chunks}
+-            filename={canvasData.filename}
+-            previewUrl={canvasData.previewUrl}
+-            sandboxSessionId={canvasData.sandboxSessionId}
+             title={canvasData.title}
+             onClose={() => setCanvasData(null)}
+             style={canvasWidth ? { width: canvasWidth } : undefined}
+@@ -880,5 +813,5 @@ export default function App() {
+         </>
+       )}
+     </div>
+-  );
++  )
+ }
 diff --git a/frontend/src/components/AccountPopup.jsx b/frontend/src/components/AccountPopup.jsx
 new file mode 100644
 index 0000000..39e9fbc
@@ -2170,7 +2994,7 @@ index 0000000..579222e
 +  )
 +}
 diff --git a/frontend/src/components/Sidebar.jsx b/frontend/src/components/Sidebar.jsx
-index 560b084..e196ab1 100644
+index c764fab..b8a5bab 100644
 --- a/frontend/src/components/Sidebar.jsx
 +++ b/frontend/src/components/Sidebar.jsx
 @@ -3,7 +3,7 @@ import {
@@ -2182,7 +3006,7 @@ index 560b084..e196ab1 100644
  } from 'lucide-react'
  import NexusLogoIcon from './NexusLogoIcon'
  
-@@ -109,6 +109,8 @@ export default function Sidebar({
+@@ -110,6 +110,8 @@ export default function Sidebar({
    onToggleTool,
    mcpServers,
    onReconnectMCP,
@@ -2191,7 +3015,7 @@ index 560b084..e196ab1 100644
    files,
    selectedFiles,
    onToggleFile,
-@@ -122,6 +124,8 @@ export default function Sidebar({
+@@ -123,6 +125,8 @@ export default function Sidebar({
    onNewChat,
    isOpen,
    onClose,
@@ -2200,7 +3024,7 @@ index 560b084..e196ab1 100644
  }) {
    const fileInputRef = React.useRef(null)
  
-@@ -245,6 +249,19 @@ export default function Sidebar({
+@@ -246,6 +250,19 @@ export default function Sidebar({
            </select>
          </div>
  
@@ -2220,7 +3044,7 @@ index 560b084..e196ab1 100644
          <div className="sidebar-body">
            {/* Built-in Tools */}
            <AccordionSection
-@@ -276,103 +293,128 @@ export default function Sidebar({
+@@ -277,103 +294,128 @@ export default function Sidebar({
            </AccordionSection>
  
            {/* MCP Servers */}
@@ -2885,10 +3709,10 @@ index 52d6e3b..b7e6fb6 100644
      ws.onopen = () => setIsConnected(true)
      ws.onclose = () => {
 diff --git a/requirements.txt b/requirements.txt
-index 2268fa1..27577c0 100644
+index 76f822a..4933765 100644
 --- a/requirements.txt
 +++ b/requirements.txt
-@@ -9,9 +9,8 @@ httpx==0.27.2
+@@ -9,12 +9,12 @@ httpx==0.27.2
  python-multipart==0.0.9
  aiofiles==24.1.0
  
@@ -2900,67 +3724,7 @@ index 2268fa1..27577c0 100644
  
  # RAG
  chromadb==0.5.5
-diff --git a/scripts/update-from-upstream.sh b/scripts/update-from-upstream.sh
-new file mode 100755
-index 0000000..78dab7d
---- /dev/null
-+++ b/scripts/update-from-upstream.sh
-@@ -0,0 +1,58 @@
-+#!/usr/bin/env bash
-+set -euo pipefail
-+
-+# Nexus Chat Server — Update from Upstream Script
-+# Pulls latest changes from upstream main and re-applies server patches.
-+
-+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-+PATCH_DIR="$ROOT_DIR/scripts/server-patches"
-+
-+cd "$ROOT_DIR"
-+
-+# Ensure upstream remote exists
-+if ! git remote get-url upstream >/dev/null 2>&1; then
-+    echo "[INFO] Adding upstream remote..."
-+    git remote add upstream git@github.com:aashiquear/nexus-chat.git
-+fi
-+
-+echo "[INFO] Fetching upstream/main..."
-+git fetch upstream main
-+
-+# Warn if there are server-side commits not yet captured as a patch
-+LAST_PATCH_COMMIT=$(git log --oneline --grep="Re-apply server patches" -1 | awk '{print $1}')
-+if [ -n "$LAST_PATCH_COMMIT" ]; then
-+    UNPATCHED=$(git log --oneline "$LAST_PATCH_COMMIT"..HEAD -- . ':!scripts/server-patches' | wc -l)
-+else
-+    UNPATCHED=$(git log --oneline 553e80c..HEAD -- . ':!scripts/server-patches' | wc -l)
-+fi
-+if [ "$UNPATCHED" -gt 0 ]; then
-+    echo "[WARN] $UNPATCHED server-side commit(s) since the last patch re-apply are not in $PATCH_DIR/nexus-chat-server.patch."
-+    echo "       Consider regenerating the patch before merging:"
-+    echo "       git diff 553e80c..HEAD -- . ':!scripts/server-patches' > $PATCH_DIR/nexus-chat-server.patch"
-+fi
-+
-+echo "[INFO] Merging upstream/main into current branch (preferring upstream changes)..."
-+if ! git merge -X theirs upstream/main --no-edit; then
-+    echo "[ERROR] Merge conflict detected. Please resolve manually and re-run."
-+    exit 1
-+fi
-+
-+echo "[INFO] Re-applying server patches..."
-+for patch in "$PATCH_DIR"/*.patch; do
-+    if [ -f "$patch" ]; then
-+        echo "[INFO] Applying $(basename "$patch")..."
-+        if ! git apply "$patch"; then
-+            echo "[WARN] Patch $(basename "$patch") failed to apply. Skipping."
-+        fi
-+    fi
-+done
-+
-+echo "[INFO] Staging patch-applied changes..."
-+git add -A
-+git diff --cached --quiet || git commit -m "Re-apply server patches after upstream merge" || true
-+
-+echo "[SUCCESS] Upstream updates merged and server patches applied."
-+echo "          If new server-only changes were made since the last update, regenerate the patch:"
-+echo "          git diff 553e80c..HEAD -- . ':!scripts/server-patches' > $PATCH_DIR/nexus-chat-server.patch"
-+echo "          Run 'docker compose build' and 'docker compose up -d' to deploy."
++posthog>=2.4.0,<4.0.0
+ sentence-transformers==3.0.1
+ 
+ # File processing
