@@ -315,8 +315,9 @@ tools:
 # ------------------------------------------------------------
 mcp_servers:
   # Example: SQLite database server (see examples/mcp-database-server)
+  # Requires: docker compose --profile mcp up
   database:
-    enabled: true
+    enabled: false
     name: "Database"
     description: "Query and manage a SQLite database"
     url: "http://mcp-database:8100" # Docker service name
@@ -324,7 +325,7 @@ mcp_servers:
     timeout: 30
 
   moose:
-    enabled: true
+    enabled: false
     name: "MOOSE Simulator"
     description: "Build, run, and post-process MOOSE framework simulations"
     # Native mode: use host.docker.internal to reach the host from Docker
@@ -335,7 +336,7 @@ mcp_servers:
     timeout: 120
 
   statflow:
-    enabled: true
+    enabled: false
     name: "StatFlow - Statistical Analysis"
     url: "http://statflow-mcp:9000" # container name on nexus-net
     icon: "chart-bar"
