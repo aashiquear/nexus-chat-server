@@ -47,9 +47,11 @@ import backend.tools.file_generator
 import backend.tools.graph_plotter
 import backend.tools.image_synthesizer
 import backend.tools.svg_diagram
-from backend import conversations
+from backend import auth, conversations
 from backend.config import get_config, load_config
+from backend.mcp.client import _load_user_mcp_servers, _save_user_mcp_servers
 from backend.orchestrator import ChatOrchestrator
+from starlette import status
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
