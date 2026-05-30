@@ -11,6 +11,8 @@ import ChatMessage, { TypingIndicator } from "./components/ChatMessage";
 import ChatInput from "./components/ChatInput";
 import CanvasPanel from "./components/CanvasPanel";
 import SplashScreen from "./components/SplashScreen";
+import SignInScreen from "./components/SignInScreen";
+import AccountPopup from "./components/AccountPopup";
 import { useChat } from "./hooks/useChat";
 import {
   fetchModels,
@@ -25,6 +27,7 @@ import {
   fetchConversation,
   saveConversation,
   deleteConversation,
+  fetchAuthMe,
 } from "./hooks/api";
 
 export default function App() {
@@ -43,6 +46,11 @@ export default function App() {
     } catch {}
     setShowSplash(false);
   }, []);
+
+  // Auth state
+  const [user, setUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [showAccount, setShowAccount] = useState(false);
 
   // State
   const [models, setModels] = useState([]);
@@ -90,9 +98,21 @@ export default function App() {
 
   // Validate auth on mount
   useEffect(() => {
-    connect();
-    loadData();
-  }, [connect]);
+    const token = localStorage.getItem('nexus_token');
+    if (token) {
+      fetchAuthMe()
+        .then((u) => {
+          if (u) {
+            setUser(u);
+            connect();
+            loadData();
+          }
+        })
+        .finally(() => setAuthChecked(true));
+    } else {
+      setAuthChecked(true);
+    }
+  }, []);
 
   const handleLogout = () => {
     localStorage.removeItem('nexus_token')
