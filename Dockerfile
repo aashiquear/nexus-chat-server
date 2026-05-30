@@ -34,6 +34,10 @@ COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 # Create data directories
 RUN mkdir -p data/uploads data/vector_store data/files data/downloads
 
+# Pre-download ONNX embedding model so it's available offline at runtime
+ENV ANONYMIZED_TELEMETRY=False
+RUN python -c "from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2; ONNXMiniLM_L6_V2()" || true
+
 # Expose port
 EXPOSE 8000
 

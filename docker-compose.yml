@@ -19,6 +19,7 @@ services:
       - NEXUS_JWT_SECRET=${NEXUS_JWT_SECRET:-change-me-in-production}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       - OLLAMA_API_KEY=${OLLAMA_API_KEY:-}
+      - ANONYMIZED_TELEMETRY=False
     volumes:
       # Mount config for easy editing without rebuild
       - ./config:/app/config:ro
