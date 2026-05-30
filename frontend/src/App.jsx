@@ -13,6 +13,8 @@ import CanvasPanel from "./components/CanvasPanel";
 import SplashScreen from "./components/SplashScreen";
 import SignInScreen from "./components/SignInScreen";
 import AccountPopup from "./components/AccountPopup";
+import AdminPanel from "./components/AdminPanel";
+import MCPDiscoveryPanel from "./components/MCPDiscoveryPanel";
 import { useChat } from "./hooks/useChat";
 import {
   fetchModels,
@@ -51,6 +53,8 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [showAccount, setShowAccount] = useState(false);
+  const [showAdmin, setShowAdmin] = useState(false);
+  const [showMcpDiscovery, setShowMcpDiscovery] = useState(false);
 
   // State
   const [models, setModels] = useState([]);
