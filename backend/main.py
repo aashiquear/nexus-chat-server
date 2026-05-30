@@ -9,8 +9,6 @@ import logging
 import os
 import sys
 import uuid
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -24,6 +22,7 @@ from fastapi import (
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
+    status,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -35,7 +34,13 @@ load_dotenv()
 # Ensure backend is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from backend.config import load_config, get_config
+from backend.orchestrator import ChatOrchestrator
+from backend import conversations
+import backend.auth as auth
+
 import backend.mcp  # noqa: F401 – MCP client module
+from backend.mcp.client import _load_user_mcp_servers, _save_user_mcp_servers
 
 # Import providers and tools to trigger registration
 import backend.providers.anthropic_provider
@@ -47,11 +52,6 @@ import backend.tools.file_generator
 import backend.tools.graph_plotter
 import backend.tools.image_synthesizer
 import backend.tools.svg_diagram
-from backend import auth, conversations
-from backend.config import get_config, load_config
-from backend.mcp.client import _load_user_mcp_servers, _save_user_mcp_servers
-from backend.orchestrator import ChatOrchestrator
-from starlette import status
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -60,35 +60,9 @@ logger = logging.getLogger(__name__)
 config = load_config()
 app_config = config.get("app", {})
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
-    await orchestrator.init_mcp()
-    if orchestrator.rag_engine:
-        await orchestrator.rag_engine.sync_uploads(upload_dir)
-
-    file_gen_cfg = config.get("tools", {}).get("file_generator", {})
-    if file_gen_cfg.get("enabled", False):
-        cache_dir = file_gen_cfg.get("config", {}).get("model_cache_dir")
-
-        async def _warmup_diffusion():
-            try:
-                from backend.tools.file_generator import _ensure_diffusion_loaded
-
-                logger.info("Pre-loading diffusion model in background …")
-                await asyncio.to_thread(_ensure_diffusion_loaded, cache_dir)
-                logger.info("Diffusion model pre-loaded successfully.")
-            except Exception as e:
-                logger.warning("Diffusion model pre-load failed (will retry on first use): %s", e)
-
-        asyncio.create_task(_warmup_diffusion())
-
-    yield
-
-
 app = FastAPI(
     title=app_config.get("name", "Nexus Chat"),
     version=app_config.get("version", "0.1.0"),
-    lifespan=lifespan,
 )
 
 # CORS
@@ -113,6 +87,35 @@ sandbox_dir.mkdir(parents=True, exist_ok=True)
 files_dir = Path("./data/files")
 files_dir.mkdir(parents=True, exist_ok=True)
 
+
+# ------ Startup event: initialize async services ------
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize auth, MCP connections, sync uploads, and pre-load heavy models."""
+    await auth.init_admin_user()
+    await orchestrator.init_mcp()
+    # Re-ingest any uploaded files missing from the vector store (e.g. after restart)
+    if orchestrator.rag_engine:
+        await orchestrator.rag_engine.sync_uploads(upload_dir)
+
+    # ── Pre-load diffusion model in background so first PNG generation is fast ──
+    file_gen_cfg = config.get("tools", {}).get("file_generator", {})
+    if file_gen_cfg.get("enabled", False):
+        cache_dir = file_gen_cfg.get("config", {}).get("model_cache_dir")
+
+        async def _warmup_diffusion():
+            try:
+                from backend.tools.file_generator import _ensure_diffusion_loaded
+
+                logger.info("Pre-loading diffusion model in background …")
+                await asyncio.to_thread(_ensure_diffusion_loaded, cache_dir)
+                logger.info("Diffusion model pre-loaded successfully.")
+            except Exception as e:
+                logger.warning("Diffusion model pre-load failed (will retry on first use): %s", e)
+
+        asyncio.create_task(_warmup_diffusion())
 
 
 # ------ REST API Endpoints ------

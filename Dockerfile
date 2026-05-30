@@ -32,7 +32,7 @@ COPY config/ ./config/
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
 # Create data directories
-RUN mkdir -p data/uploads data/vector_store data/files data/downloads
+RUN mkdir -p data/uploads data/vector_store data/files data/downloads data/conversations
 
 # Pre-download ONNX embedding model so it's available offline at runtime
 ENV ANONYMIZED_TELEMETRY=False
