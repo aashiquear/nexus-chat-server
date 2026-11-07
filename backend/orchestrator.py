@@ -28,6 +28,8 @@ from backend.providers import (
 )
 from backend.rag.engine import RAGEngine
 from backend.tools import BaseTool, ToolContext, get_tool_class, reset_context, set_context
+from backend.tools.catalog import CATALOG_BY_ID, CATEGORY_ORDER
+from backend.tools.discovery import ToolIndex, build_docs
 
 logger = logging.getLogger(__name__)
 
@@ -104,12 +106,80 @@ class ChatOrchestrator:
                 logger.info(f"Provider '{name}' loaded")
 
     def _init_tools(self):
+        """Register enabled tools *lazily*: only the config is kept here;
+        the module is imported and the class instantiated on first use so
+        startup stays fast however many tools are enabled."""
+        self._tool_configs: dict[str, dict] = {}
         for name, cfg in get_enabled_tools().items():
-            cls = get_tool_class(name)
-            if cls:
-                tool = cls(cfg.get("config", {}))
-                self._tools[name] = tool
-                logger.info(f"Tool '{name}' loaded")
+            if name in CATALOG_BY_ID or get_tool_class(name) is not None:
+                self._tool_configs[name] = cfg.get("config", {}) or {}
+            else:
+                logger.warning("Tool '%s' is enabled in settings.yaml but no implementation was found", name)
+        logger.info("%d tool(s) enabled (loaded on demand)", len(self._tool_configs))
+
+    def get_tool(self, name: str) -> BaseTool | None:
+        """Instantiate (once) and return a built-in tool."""
+        tool = self._tools.get(name)
+        if tool is not None:
+            return tool
+        if name not in self._tool_configs:
+            return None
+        cls = get_tool_class(name)
+        if cls is None:
+            return None
+        tool = cls(self._tool_configs[name])
+        self._tools[name] = tool
+        logger.info("Tool '%s' loaded", name)
+        return tool
+
+    @property
+    def enabled_tool_ids(self) -> list[str]:
+        return list(self._tool_configs)
+
+    def tool_selection_config(self) -> dict:
+        cfg = dict(self.config.get("tool_selection") or {})
+        cfg.setdefault("mode", "auto")
+        cfg.setdefault("max_tools", 8)
+        cfg.setdefault("min_score", 0.25)
+        cfg.setdefault("include_core", True)
+        return cfg
+
+    def builtin_tool_meta(self, name: str) -> dict:
+        tool_cfg = get_enabled_tools().get(name, {})
+        meta = CATALOG_BY_ID.get(name, {})
+        tool = self._tools.get(name)
+        description = tool_cfg.get("description") or (tool.description if tool else meta.get("summary", ""))
+        return {
+            "id": name,
+            "name": tool_cfg.get("name", name.replace("_", " ").title()),
+            "description": description,
+            "summary": meta.get("summary", description),
+            "icon": tool_cfg.get("icon", "wrench"),
+            "source": "builtin",
+            "category": meta.get("category", "Other"),
+            "tags": meta.get("tags", []),
+            "risk": meta.get("risk", "low"),
+            "permission": meta.get("permission", "auto"),
+            "offline": meta.get("offline", True),
+            "core": bool(meta.get("core")),
+            "hidden": bool(meta.get("hidden")),
+            "loaded": name in self._tools,
+        }
+
+    def _tool_index(self, visible_mcp: set[str] | None = None) -> ToolIndex:
+        builtin = [self.builtin_tool_meta(n) for n in self._tool_configs if not CATALOG_BY_ID.get(n, {}).get("hidden")]
+        mcp = [t for t in self._mcp.get_tool_info(visible_mcp)]
+        return ToolIndex(build_docs(builtin, mcp))
+
+    def discover(self, query: str, limit: int = 8, visible_mcp: set[str] | None = None) -> list[dict]:
+        cfg = self.tool_selection_config()
+        idx = self._tool_index(visible_mcp)
+        out = []
+        for doc, score in idx.rank(query, limit=limit, min_score=float(cfg["min_score"])):
+            if doc.permission != "auto":
+                continue
+            out.append({"id": doc.id, "name": doc.name, "summary": doc.summary, "category": doc.category, "score": score, "source": doc.source})
+        return out
 
     def _init_rag(self):
         rag_config = self.config.get("rag", {})
@@ -264,21 +334,20 @@ class ChatOrchestrator:
         await self._mcp.init_from_config(mcp_config)
         logger.info("MCP manager initialized")
 
-    def get_available_tools(self) -> list[dict]:
-        """Return all available tools (built-in + MCP)."""
-        tool_configs = get_enabled_tools()
+    def get_available_tools(self, visible_mcp: set[str] | None = None) -> list[dict]:
+        """Return all available tools (built-in + MCP) with catalog metadata
+        (category, tags, risk, core) used by the sidebar and the discovery
+        router. Built-in modules are *not* imported here."""
         result = []
-        for name, tool in self._tools.items():
-            cfg = tool_configs.get(name, {})
-            result.append({
-                "id": name,
-                "name": cfg.get("name", name),
-                "description": cfg.get("description", tool.description),
-                "icon": cfg.get("icon", "wrench"),
-                "source": "builtin",
-            })
-        # Append MCP tools
-        result.extend(self._mcp.get_tool_info())
+        order = {c: i for i, c in enumerate(CATEGORY_ORDER)}
+        for name in self._tool_configs:
+            meta = self.builtin_tool_meta(name)
+            if meta["hidden"]:
+                continue
+            result.append(meta)
+        result.sort(key=lambda m: (order.get(m["category"], 99), m["name"]))
+        for t in self._mcp.get_tool_info(visible_mcp):
+            result.append({**t, "category": f"MCP · {t.get('server_name', t.get('server'))}", "risk": "medium", "permission": "auto", "core": False})
         return result
 
     def get_mcp_servers(self) -> list[dict]:
@@ -350,7 +419,7 @@ class ChatOrchestrator:
                 except Exception as e:
                     return json.dumps({"error": str(e)})
 
-        tool = self._tools.get(tool_name)
+        tool = self.get_tool(tool_name)
         if not tool:
             return json.dumps({"error": f"Tool '{tool_name}' not found"})
         try:
@@ -371,7 +440,7 @@ class ChatOrchestrator:
             yield {"type": "tool_result", "name": tool_name, "result": result}
             return
 
-        tool = self._tools.get(tool_name)
+        tool = self.get_tool(tool_name)
         if not tool:
             yield {
                 "type": "tool_result",
@@ -470,6 +539,18 @@ class ChatOrchestrator:
             )
         if "csv_viewer" in tools:
             parts.append("Use `csv_viewer` to inspect uploaded CSV/TSV/Excel files before analysing or plotting them.")
+        if "discover_tools" in tools:
+            parts.append(
+                "Only a few tools relevant to this request are attached. If the task needs a capability you "
+                "do not see (unit conversion, symbolic math, SQL over uploaded data, academic papers, currency, "
+                "date arithmetic, memory, to-do list, document search, decision matrix, change tracking…), call "
+                "`discover_tools` with a short description and the matching tools will be attached for your next step."
+            )
+        if "memory" in tools:
+            parts.append(
+                "You have a `memory` tool. Save durable facts the user shares about themselves or their work "
+                "(preferences, projects, decisions) and search it when a question depends on earlier context."
+            )
         parts.append(
             "Format answers in Markdown. Put code in fenced blocks with a language tag."
         )
@@ -618,9 +699,17 @@ class ChatOrchestrator:
         compaction_state: dict | None = None,
         tool_context: ToolContext | None = None,
         rag_where: dict | None = None,
+        tool_mode: str | None = None,
+        visible_mcp: set[str] | None = None,
     ) -> AsyncIterator[dict]:
         """
         Stream a chat response, handling tool calls in an agentic loop.
+
+        ``tool_mode`` is ``"auto"`` (default from settings) or ``"manual"``.
+        In auto mode the discovery router attaches core tools plus the
+        tools most relevant to the latest user message; ``selected_tools``
+        act as user pins that are always attached. In manual mode only
+        ``selected_tools`` are attached (legacy behaviour).
 
         Yields dicts with:
           {"type": "status", "stage": "initiated|compacting|..."}
@@ -650,37 +739,96 @@ class ChatOrchestrator:
             async for event in self._chat_stream_inner(
                 messages, model_id, provider, model_cfg, selected_tools,
                 selected_files, system_prompt, generation, compaction_state, rag_where,
+                tool_mode, visible_mcp,
             ):
                 yield event
         finally:
             if ctx_token is not None:
                 reset_context(ctx_token)
 
+    def _tool_definition(self, tool_id: str, visible_mcp: set[str] | None = None) -> ToolDefinition | None:
+        if tool_id.startswith("mcp:"):
+            parts = tool_id.split(":", 2)
+            if len(parts) == 3:
+                for mcp_tool in self._mcp.get_all_tools(visible_mcp):
+                    if mcp_tool.get("_mcp_server") == parts[1] and mcp_tool["name"] == parts[2]:
+                        return ToolDefinition(
+                            name=tool_id,
+                            description=mcp_tool.get("description", ""),
+                            parameters=mcp_tool.get("parameters") or mcp_tool.get("inputSchema") or {"type": "object", "properties": {}},
+                        )
+            return None
+        tool = self.get_tool(tool_id)
+        if tool:
+            return ToolDefinition(**tool.to_definition())
+        return None
+
+    def select_tools(self, messages: list[dict], pinned: list[str] | None, tool_mode: str | None,
+                     visible_mcp: set[str] | None = None) -> tuple[list[str], dict]:
+        """Decide which tool ids to attach for this turn.
+
+        Returns ``(tool_ids, info)`` where ``info`` describes the choice for
+        the UI (``mode``, ``core``, ``matched`` with scores, ``pinned``)."""
+        cfg = self.tool_selection_config()
+        mode = (tool_mode or cfg["mode"] or "auto").lower()
+        pinned = [t for t in (pinned or []) if t in self._tool_configs or t.startswith("mcp:")]
+        if mode != "auto":
+            return pinned, {"mode": "manual", "pinned": pinned, "core": [], "matched": []}
+
+        # Query = latest user message plus a little of the previous turn for context.
+        user_msgs = [m.get("content", "") for m in messages if m.get("role") == "user" and isinstance(m.get("content"), str)]
+        query = user_msgs[-1] if user_msgs else ""
+        if len(user_msgs) > 1 and len(query) < 80:
+            query = user_msgs[-2][-300:] + " " + query
+        has_images = any(m.get("images") for m in messages[-1:])
+        has_files = bool(self._rag)  # files selected are handled by RAG; csv tools matched by query
+
+        core = [n for n in self._tool_configs if CATALOG_BY_ID.get(n, {}).get("core")] if cfg.get("include_core", True) else []
+        matched = self.discover(query, limit=int(cfg["max_tools"]), visible_mcp=visible_mcp) if query.strip() else []
+        selected: list[str] = []
+        for tid in pinned + core + [m["id"] for m in matched]:
+            if tid not in selected:
+                selected.append(tid)
+        # Hard cap keeps the schema payload small for local models.
+        cap = int(cfg["max_tools"]) + len(core) + len(pinned)
+        selected = selected[:cap]
+        if has_images and "image_synthesizer" in self._tool_configs and "image_synthesizer" not in selected:
+            pass  # vision models see images directly; the fallback tool stays discoverable
+        return selected, {"mode": "auto", "pinned": pinned, "core": core, "matched": matched, "query": query[:200]}
+
     async def _chat_stream_inner(
         self, messages, model_id, provider, model_cfg, selected_tools,
         selected_files, system_prompt, generation, compaction_state, rag_where,
+        tool_mode=None, visible_mcp=None,
     ) -> AsyncIterator[dict]:
-        # Build tool definitions (built-in + MCP)
-        tool_defs = []
-        if selected_tools:
-            for tool_id in selected_tools:
-                if tool_id.startswith("mcp:"):
-                    parts = tool_id.split(":", 2)
-                    if len(parts) == 3:
-                        for mcp_tool in self._mcp.get_all_tools():
-                            if mcp_tool.get("_mcp_server") == parts[1] and mcp_tool["name"] == parts[2]:
-                                tool_defs.append(ToolDefinition(
-                                    name=tool_id,
-                                    description=mcp_tool.get("description", ""),
-                                    parameters=mcp_tool.get("parameters")
-                                    or mcp_tool.get("inputSchema")
-                                    or {"type": "object", "properties": {}},
-                                ))
-                                break
-                else:
-                    tool = self._tools.get(tool_id)
-                    if tool:
-                        tool_defs.append(ToolDefinition(**tool.to_definition()))
+        # Decide which tools to attach (auto discovery or manual selection)
+        tool_ids, selection_info = self.select_tools(messages, selected_tools, tool_mode, visible_mcp)
+        yield {"type": "tools_selected", **selection_info, "tools": tool_ids}
+
+        tool_defs: list[ToolDefinition] = []
+        attached: set[str] = set()
+        for tool_id in tool_ids:
+            td = self._tool_definition(tool_id, visible_mcp)
+            if td:
+                tool_defs.append(td)
+                attached.add(tool_id)
+
+        # Wire the discover_tools meta tool to this request so the model can
+        # pull in more tools mid-conversation.
+        newly_attached: list[dict] = []
+        discover_tool = self.get_tool("discover_tools") if "discover_tools" in attached else None
+        if discover_tool is not None:
+            def _resolve(query: str, limit: int) -> list[dict]:
+                found = [m for m in self.discover(query, limit=limit, visible_mcp=visible_mcp) if m["id"] not in attached]
+                for m in found:
+                    td = self._tool_definition(m["id"], visible_mcp)
+                    if td:
+                        tool_defs.append(td)
+                        attached.add(m["id"])
+                        newly_attached.append(m)
+                return found
+            discover_tool.resolver = _resolve
+        selected_tools = list(attached)
 
         # Get RAG context
         last_user_msg = ""
@@ -855,6 +1003,12 @@ class ChatOrchestrator:
             if consecutive_failures >= max_consecutive_failures:
                 yield {"type": "text", "content": "\n\n*Stopping: too many consecutive tool failures.*"}
                 break
+
+            if newly_attached:
+                yield {"type": "tools_selected", "mode": "discover", "tools": list(attached),
+                       "matched": list(newly_attached), "core": [], "pinned": []}
+                newly_attached.clear()
+                request.tools = tool_defs
 
             # Append assistant + tool results to messages for the next round.
             names = ", ".join(c["name"] for c, _ in round_results)

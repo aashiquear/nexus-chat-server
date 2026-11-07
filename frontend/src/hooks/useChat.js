@@ -35,7 +35,7 @@ export function useChat() {
   }, [])
 
   const sendMessage = useCallback(
-    ({ messages, model, tools, files, system_prompt, generation, compaction_state }, onEvent) => {
+    ({ messages, model, tools, files, system_prompt, generation, compaction_state, tool_mode }, onEvent) => {
       const ws = wsRef.current
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         onEvent({ type: 'error', content: 'Not connected to server' })
@@ -57,7 +57,7 @@ export function useChat() {
       }
 
       ws.send(
-        JSON.stringify({ messages, model, tools, files, system_prompt, generation, compaction_state })
+        JSON.stringify({ messages, model, tools, files, system_prompt, generation, compaction_state, tool_mode })
       )
     },
     []

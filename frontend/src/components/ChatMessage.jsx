@@ -1604,6 +1604,22 @@ export default function ChatMessage({ message, onOpenCanvas, onRunCode }) {
           })
         )}
 
+        {/* Which tools the router attached for this turn (auto mode) */}
+        {!isUser && message.toolSelection && message.toolSelection.mode !== "manual" && (message.toolSelection.matched || []).length > 0 && (
+          <div className="tool-selection-row" title={`Core tools: ${(message.toolSelection.core || []).join(", ")}`}>
+            <Wrench size={11} />
+            <span>{message.toolSelection.discovered ? "Tools attached (incl. on-demand):" : "Tools attached:"}</span>
+            {(message.toolSelection.matched || []).slice(0, 8).map((m) => (
+              <span key={m.id} className="tool-selection-chip" title={m.summary || ""}>
+                {m.name || m.id}
+              </span>
+            ))}
+            {(message.toolSelection.pinned || []).length > 0 && (
+              <span className="tool-selection-chip pinned">+{message.toolSelection.pinned.length} pinned</span>
+            )}
+          </div>
+        )}
+
         {/* Provider notices (tools disabled, images ignored, compaction…) */}
         {!isUser && message.notices && message.notices.length > 0 && (
           <div className="message-notices">

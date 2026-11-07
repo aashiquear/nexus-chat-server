@@ -47,6 +47,9 @@ class ToolContext:
     files_dir: Path = Path("./data/files")
     downloads_dir: Path = Path("./data/downloads")
     plots_dir: Path = Path("./data")
+    # Persistent per-user state (memory, tasks, snapshots). The server
+    # edition points this at data/users/<u>/state.
+    state_dir: Path = Path("./data/state")
     username: str | None = None
     extra: dict = field(default_factory=dict)
 
@@ -137,7 +140,32 @@ def register_tool(name: str):
 
 
 def get_tool_class(name: str) -> type[BaseTool] | None:
-    return _tools.get(name)
+    """Return the tool class, importing its module lazily on first use.
+
+    Modules are looked up in :mod:`backend.tools.catalog`, so heavy
+    dependencies (SymPy, DuckDB, pandas, torch…) are only imported when a
+    tool is actually needed.
+    """
+    cls = _tools.get(name)
+    if cls is not None:
+        return cls
+    try:
+        from .catalog import CATALOG_BY_ID
+    except Exception:  # pragma: no cover
+        return None
+    meta = CATALOG_BY_ID.get(name)
+    if meta and meta.get("module"):
+        import importlib
+
+        try:
+            importlib.import_module(meta["module"])
+        except Exception as e:  # missing optional dependency etc.
+            import logging
+
+            logging.getLogger(__name__).warning("Could not load tool '%s' from %s: %s", name, meta["module"], e)
+            return None
+        cls = _tools.get(name)
+    return cls
 
 
 def get_all_tool_classes() -> dict[str, type[BaseTool]]:

@@ -19,51 +19,6 @@ from . import BaseTool, register_tool
 logger = logging.getLogger(__name__)
 
 
-@register_tool("calculator")
-class CalculatorTool(BaseTool):
-    name = "calculator"
-    description = "Evaluate mathematical expressions safely. Supports basic arithmetic, powers, sqrt, trig, and common math functions."
-    parameters = {
-        "type": "object",
-        "properties": {
-            "expression": {
-                "type": "string",
-                "description": "Mathematical expression to evaluate, e.g. '2 + 3 * 4' or 'sqrt(16)'",
-            }
-        },
-        "required": ["expression"],
-    }
-
-    SAFE_FUNCTIONS = {
-        "sqrt": math.sqrt,
-        "abs": abs,
-        "round": round,
-        "sin": math.sin,
-        "cos": math.cos,
-        "tan": math.tan,
-        "log": math.log,
-        "log10": math.log10,
-        "log2": math.log2,
-        "pi": math.pi,
-        "e": math.e,
-        "pow": pow,
-        "floor": math.floor,
-        "ceil": math.ceil,
-    }
-
-    async def execute(self, **kwargs) -> str:
-        expr = kwargs.get("expression", "")
-        try:
-            # Replace common function names for eval safety
-            for name, func in self.SAFE_FUNCTIONS.items():
-                if callable(func):
-                    pass  # handled in namespace
-            result = eval(expr, {"__builtins__": {}}, self.SAFE_FUNCTIONS)
-            return json.dumps({"result": result, "expression": expr})
-        except Exception as e:
-            return json.dumps({"error": str(e), "expression": expr})
-
-
 @register_tool("datetime_tool")
 class DateTimeTool(BaseTool):
     name = "datetime_tool"

@@ -301,21 +301,130 @@ generation:
         keep_recent: 8
 
 # ------------------------------------------------------------
+# Tool selection (dynamic discovery)
+# ------------------------------------------------------------
+# With mode "auto" the router attaches only the tools relevant to each
+# request: the "core" set (calculator, date/time, web search, web browser,
+# code executor, memory, discover_tools) plus up to max_tools matches
+# ranked by keyword + embedding similarity against the catalog
+# (backend/tools/catalog.py) and connected MCP tools. The model can pull
+# in more with the discover_tools meta tool. Tools the user ticks in the
+# sidebar are "pinned" and always attached. mode "manual" restores the
+# classic behaviour (only ticked tools). Tool modules are imported lazily,
+# so enabling every tool below does not slow startup.
+# ------------------------------------------------------------
+tool_selection:
+  mode: "auto"
+  max_tools: 8
+  min_score: 0.25
+  include_core: true
+
+# ------------------------------------------------------------
 # Tools
 # ------------------------------------------------------------
-# Each tool is a Python module in backend/tools/
-# Set enabled: true/false to toggle tools.
+# Each tool is a Python module in backend/tools/ (see catalog.py for the
+# module map and metadata). Set enabled: true/false to toggle tools.
 # To add a new tool:
-#   1. Create a Python file in backend/tools/
-#   2. Implement the Tool base class
+#   1. Create a Python file in backend/tools/ and @register_tool it
+#   2. Add it to backend/tools/catalog.py (module, category, tags)
 #   3. Add an entry here
 # ------------------------------------------------------------
 tools:
   calculator:
     enabled: true
     name: "Calculator"
-    description: "Evaluate mathematical expressions"
+    description: "Exact arithmetic with a safe expression parser"
     icon: "calculator"
+
+  math_solver:
+    enabled: true
+    name: "Math Solver"
+    description: "Symbolic algebra & calculus (SymPy): solve, simplify, differentiate, integrate, matrices"
+    icon: "sigma"
+
+  unit_converter:
+    enabled: true
+    name: "Unit Converter"
+    description: "Convert physical units with dimensional checking"
+    icon: "ruler"
+
+  statistics_analyze:
+    enabled: true
+    name: "Statistics"
+    description: "Descriptive stats, correlation, regression, t-tests on numbers or uploaded columns"
+    icon: "bar-chart"
+
+  datetime_calculate:
+    enabled: true
+    name: "Date Calculator"
+    description: "Date differences, business days, holidays, timezone conversion"
+    icon: "calendar"
+
+  currency_convert:
+    enabled: true
+    name: "Currency"
+    description: "Currency conversion with dated ECB rates"
+    icon: "coins"
+
+  text_utilities:
+    enabled: true
+    name: "Text Utilities"
+    description: "Counts, diffs, regex, hashes, encodings, random values"
+    icon: "type"
+
+  json_tools:
+    enabled: true
+    name: "JSON Tools"
+    description: "Validate, query, transform JSON/YAML; JSON Schema validation"
+    icon: "braces"
+
+  document_search:
+    enabled: true
+    name: "Document Search"
+    description: "Find passages in uploaded documents with page numbers; extract tables"
+    icon: "file-search"
+
+  data_sql:
+    enabled: true
+    name: "SQL on Files"
+    description: "Run SQL (DuckDB) across uploaded CSV/Parquet/JSON/Excel files"
+    icon: "database"
+
+  academic_search:
+    enabled: true
+    name: "Academic Search"
+    description: "Search arXiv, Crossref and OpenAlex; resolve DOIs; BibTeX"
+    icon: "graduation-cap"
+
+  change_tracker:
+    enabled: true
+    name: "Change Tracker"
+    description: "Snapshot web pages or files and report what changed"
+    icon: "git-compare"
+
+  memory:
+    enabled: true
+    name: "Memory"
+    description: "Long-term memory of user facts, preferences and decisions"
+    icon: "brain"
+
+  tasks_manage:
+    enabled: true
+    name: "Tasks"
+    description: "Personal to-do list with due dates and priorities"
+    icon: "list-checks"
+
+  decision_compare:
+    enabled: true
+    name: "Decision Matrix"
+    description: "Weighted criteria comparison with sensitivity analysis"
+    icon: "scale"
+
+  discover_tools:
+    enabled: true
+    name: "Tool Discovery"
+    description: "Lets the model attach additional tools on demand"
+    icon: "search"
 
   web_search:
     enabled: true

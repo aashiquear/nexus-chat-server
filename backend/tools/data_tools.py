@@ -395,3 +395,110 @@ class WebBrowserTool(BaseTool):
             return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
         except ValueError:
             return False
+
+
+# ----------------------------------------------------------------------
+# SQL over uploaded files (DuckDB)
+# ----------------------------------------------------------------------
+@register_tool("data_sql")
+class DataSQLTool(BaseTool):
+    name = "data_sql"
+    description = (
+        "Run SQL (DuckDB dialect) over the user's uploaded data files. Every CSV/TSV/Parquet/JSON/XLSX upload is "
+        "available as a table named after the file without extension (e.g. sales.csv → sales; non-alphanumeric "
+        "characters become _). Supports joins, GROUP BY, window functions, CTEs, date functions. Call "
+        "operation=tables first to see tables and columns. Read-only; results are returned as an interactive table "
+        "(max 500 rows) — use LIMIT/aggregation for large outputs."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "operation": {"type": "string", "enum": ["query", "tables"], "default": "query"},
+            "sql": {"type": "string", "description": "SELECT statement."},
+            "max_rows": {"type": "integer", "default": 200},
+        },
+        "required": [],
+    }
+    EXTS = {".csv", ".tsv", ".parquet", ".json", ".jsonl", ".xlsx", ".xls"}
+
+    def _tables(self) -> dict[str, Path]:
+        import re as _re
+
+        out = {}
+        for p in sorted(self.upload_dir().iterdir()):
+            if p.is_file() and p.suffix.lower() in self.EXTS:
+                name = _re.sub(r"[^A-Za-z0-9_]", "_", p.stem)
+                if name and name[0].isdigit():
+                    name = "t_" + name
+                out[name] = p
+        return out
+
+    async def execute(self, **kwargs) -> str:
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(self._run, kwargs), timeout=60)
+        except asyncio.TimeoutError:
+            return json.dumps({"error": "query timed out (60s)"})
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    def _run(self, k: dict) -> str:
+        import duckdb
+
+        con = duckdb.connect(database=":memory:")
+        tables = self._tables()
+        for name, p in tables.items():
+            ext = p.suffix.lower()
+            q = str(p).replace("'", "''")
+            try:
+                if ext in (".csv", ".tsv"):
+                    con.execute(f"CREATE VIEW \"{name}\" AS SELECT * FROM read_csv_auto('{q}', header=true)")
+                elif ext == ".parquet":
+                    con.execute(f"CREATE VIEW \"{name}\" AS SELECT * FROM read_parquet('{q}')")
+                elif ext in (".json", ".jsonl"):
+                    con.execute(f"CREATE VIEW \"{name}\" AS SELECT * FROM read_json_auto('{q}')")
+                elif ext in (".xlsx", ".xls"):
+                    import pandas as pd
+
+                    df = pd.read_excel(p)
+                    con.register(name, df)
+            except Exception as e:  # unreadable file → skip but report
+                logger.debug("data_sql: skip %s: %s", p.name, e)
+        if (k.get("operation") or "query") == "tables":
+            info = []
+            for name, p in tables.items():
+                try:
+                    cols = con.execute(f'DESCRIBE "{name}"').fetchall()
+                    n = con.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
+                    info.append({"table": name, "file": p.name, "rows": n, "columns": [{"name": c[0], "type": c[1]} for c in cols]})
+                except Exception as e:
+                    info.append({"table": name, "file": p.name, "error": str(e)})
+            return json.dumps({"tables": info, "hint": "query with: SELECT … FROM <table>"})
+        sql = (k.get("sql") or "").strip().rstrip(";")
+        if not sql:
+            return json.dumps({"error": "sql is required"})
+        if re.match(r"^\s*(insert|update|delete|drop|alter|create|copy|attach|install|load|pragma|export|import)\b", sql, re.I):
+            return json.dumps({"error": "only SELECT queries are allowed"})
+        max_rows = max(1, min(int(k.get("max_rows") or 200), 500))
+        cur = con.execute(sql)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchmany(max_rows + 1)
+        truncated = len(rows) > max_rows
+        rows = rows[:max_rows]
+
+        def cell(v):
+            if v is None or isinstance(v, (int, float, str, bool)):
+                return v
+            return str(v)
+
+        out_rows = [[cell(v) for v in r] for r in rows]
+        kinds = []
+        for i, c in enumerate(cols):
+            sample = next((r[i] for r in rows if r[i] is not None), None)
+            kinds.append({"name": c, "kind": "number" if isinstance(sample, (int, float)) and not isinstance(sample, bool) else "text"})
+        return json.dumps({
+            "title": f"SQL result ({len(out_rows)} rows{' – truncated' if truncated else ''})",
+            "sql": sql, "columns": cols, "row_count": len(out_rows), "truncated": truncated,
+            "rows": out_rows[:50],
+            "csv_preview": {"filename": "query_result", "total_rows": len(out_rows), "filtered_rows": len(out_rows), "offset": 0,
+                            "returned_rows": len(out_rows), "columns": kinds, "rows": out_rows, "stats": None},
+        }, default=str)
