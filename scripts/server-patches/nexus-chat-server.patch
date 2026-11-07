@@ -793,7 +793,7 @@ index c003187..4ab2d62 100644
          path.unlink()
          return True
 diff --git a/backend/main.py b/backend/main.py
-index abb5f59..c3343ae 100644
+index abb5f59..b8e912e 100644
 --- a/backend/main.py
 +++ b/backend/main.py
 @@ -17,13 +17,16 @@ from pathlib import Path
@@ -844,7 +844,7 @@ index abb5f59..c3343ae 100644
  
      # ── Pre-load diffusion model in background so first PNG generation is fast ──
      file_gen_cfg = config.get("tools", {}).get("file_generator", {})
-@@ -146,16 +156,173 @@ def _find_file(name: str, *dirs: Path) -> Path | None:
+@@ -146,16 +156,177 @@ def _find_file(name: str, *dirs: Path) -> Path | None:
      return None
  
  
@@ -955,6 +955,10 @@ index abb5f59..c3343ae 100644
 +            orchestrator.rag_engine._get_collection().delete(where=rag_where(current_user))
 +        except Exception as e:
 +            logger.warning("Could not purge vectors for %s: %s", current_user["username"], e)
++    # Disconnect the account's personal MCP servers so a later account with
++    # the same name cannot inherit live, authenticated connections.
++    for sid in [i["id"] for i in orchestrator.mcp.get_servers_info() if i.get("owner") == current_user["username"]]:
++        await orchestrator.mcp.remove_server(sid)
 +    auth.clear_session_cookie(response)
 +    return {"deleted": current_user["username"]}
 +
@@ -1020,7 +1024,7 @@ index abb5f59..c3343ae 100644
      """Return all configured LLM models, annotated with whether each is
      currently available on its provider's remote server plus capability
      metadata (vision / tools / thinking / context length / quantization)."""
-@@ -163,7 +330,7 @@ async def list_models():
+@@ -163,7 +334,7 @@ async def list_models():
  
  
  @app.get("/api/models/{model_id:path}/info")
@@ -1029,7 +1033,7 @@ index abb5f59..c3343ae 100644
      """Capability details for one model (Ollama ``/api/show`` etc.)."""
      resolved = orchestrator._resolve_provider(model_id)
      if not resolved:
-@@ -174,7 +341,7 @@ async def model_info(model_id: str):
+@@ -174,7 +345,7 @@ async def model_info(model_id: str):
  
  
  @app.post("/api/models/pull")
@@ -1038,7 +1042,7 @@ index abb5f59..c3343ae 100644
      """Pull a model tag (e.g. a different quantization such as
      ``llama3.2:3b-instruct-q8_0``) onto the connected Ollama server.
      Streams Ollama's progress events as SSE."""
-@@ -207,29 +374,33 @@ async def pull_model(request: Request):
+@@ -207,29 +378,33 @@ async def pull_model(request: Request):
  
  
  @app.get("/api/settings/generation")
@@ -1081,7 +1085,7 @@ index abb5f59..c3343ae 100644
      """Upload a file for RAG and tool use.
  
      The request body is streamed to disk in 1 MiB chunks so multi-GB
-@@ -248,7 +419,9 @@ async def upload_file(file: UploadFile = File(...)):
+@@ -248,7 +423,9 @@ async def upload_file(file: UploadFile = File(...)):
          raise HTTPException(400, f"File type '{ext}' not allowed. Allowed: {allowed}")
  
      # Stream to disk in chunks; abort early if the size limit is exceeded.
@@ -1092,7 +1096,7 @@ index abb5f59..c3343ae 100644
      written = 0
      try:
          with open(filepath, "wb") as out:
-@@ -268,6 +441,13 @@ async def upload_file(file: UploadFile = File(...)):
+@@ -268,6 +445,13 @@ async def upload_file(file: UploadFile = File(...)):
                          f"File too large. Max: {max_size // (1024 * 1024)} MB",
                      )
                  out.write(chunk)
@@ -1106,7 +1110,7 @@ index abb5f59..c3343ae 100644
      finally:
          await file.close()
  
-@@ -278,9 +458,11 @@ async def upload_file(file: UploadFile = File(...)):
+@@ -278,9 +462,11 @@ async def upload_file(file: UploadFile = File(...)):
          rag = orchestrator.rag_engine
          rag._set_progress(filename, stage="queued", current=0, total=0, percent=0)
  
@@ -1119,7 +1123,7 @@ index abb5f59..c3343ae 100644
              except Exception as e:
                  logger.error("Background ingestion failed for %s: %s", filename, e)
                  rag._set_progress(filename, stage="error", percent=0)
-@@ -296,7 +478,7 @@ async def upload_file(file: UploadFile = File(...)):
+@@ -296,7 +482,7 @@ async def upload_file(file: UploadFile = File(...)):
  
  
  @app.get("/api/upload/progress/{filename}")
@@ -1128,7 +1132,7 @@ index abb5f59..c3343ae 100644
      """Poll the embedding progress for an uploaded file."""
      if not orchestrator.rag_engine:
          return {"stage": "unknown", "percent": 0}
-@@ -307,13 +489,14 @@ async def upload_progress(filename: str):
+@@ -307,13 +493,14 @@ async def upload_progress(filename: str):
  
  
  @app.get("/api/files")
@@ -1147,7 +1151,7 @@ index abb5f59..c3343ae 100644
          if f.is_file() and not f.name.startswith("."):
              files.append(
                  {
-@@ -326,10 +509,10 @@ async def list_files():
+@@ -326,10 +513,10 @@ async def list_files():
  
  
  @app.delete("/api/files/{filename}")
@@ -1161,7 +1165,7 @@ index abb5f59..c3343ae 100644
      if not filepath.exists():
          raise HTTPException(404, "File not found")
  
-@@ -337,7 +520,7 @@ async def delete_file(filename: str):
+@@ -337,7 +524,7 @@ async def delete_file(filename: str):
  
      # Remove from RAG
      if orchestrator.rag_engine:
@@ -1170,7 +1174,7 @@ index abb5f59..c3343ae 100644
  
      return {"deleted": filename}
  
-@@ -346,10 +529,10 @@ async def delete_file(filename: str):
+@@ -346,10 +533,10 @@ async def delete_file(filename: str):
  
  
  @app.get("/api/plots/{filename}")
@@ -1184,7 +1188,7 @@ index abb5f59..c3343ae 100644
      if filepath is None:
          raise HTTPException(404, "Plot file not found")
      return FileResponse(filepath, media_type="image/png")
-@@ -359,10 +542,10 @@ async def serve_plot_file(filename: str):
+@@ -359,10 +546,10 @@ async def serve_plot_file(filename: str):
  
  
  @app.get("/api/download/{filename}")
@@ -1198,7 +1202,7 @@ index abb5f59..c3343ae 100644
      if filepath is None:
          raise HTTPException(404, "File not found")
      return FileResponse(filepath, media_type="application/octet-stream", filename=filename)
-@@ -423,10 +606,10 @@ MAX_PREVIEW_TEXT_BYTES = 4 * 1024 * 1024
+@@ -423,10 +610,10 @@ MAX_PREVIEW_TEXT_BYTES = 4 * 1024 * 1024
  
  
  @app.get("/api/files/{filename}")
@@ -1211,7 +1215,7 @@ index abb5f59..c3343ae 100644
      if filepath is None:
          raise HTTPException(404, "File not found")
      media_type = _EXT_MEDIA_TYPES.get(filepath.suffix.lower(), "application/octet-stream")
-@@ -435,7 +618,7 @@ async def serve_generated_file(filename: str):
+@@ -435,7 +622,7 @@ async def serve_generated_file(filename: str):
  
  
  @app.get("/api/preview/{filename}")
@@ -1220,7 +1224,7 @@ index abb5f59..c3343ae 100644
      """Return file content for canvas preview.
  
      Looks in the downloads, files, data and uploads directories. Binary
-@@ -444,7 +627,7 @@ async def preview_file(filename: str):
+@@ -444,7 +631,7 @@ async def preview_file(filename: str):
      formats (code, markdown, csv, json, svg …) are returned inline.
      """
      filename = safe_filename(filename)
@@ -1229,7 +1233,7 @@ index abb5f59..c3343ae 100644
      if filepath is None:
          raise HTTPException(404, "File not found")
  
-@@ -505,7 +688,7 @@ async def preview_file(filename: str):
+@@ -505,7 +692,7 @@ async def preview_file(filename: str):
  
  
  @app.get("/api/sandbox/languages")
@@ -1238,7 +1242,7 @@ index abb5f59..c3343ae 100644
      """Which languages the sandbox container can execute right now."""
      tool = orchestrator.get_tool("code_executor")
      if tool is None:
-@@ -530,7 +713,7 @@ async def sandbox_languages():
+@@ -530,7 +717,7 @@ async def sandbox_languages():
  
  
  @app.post("/api/sandbox/run")
@@ -1247,7 +1251,7 @@ index abb5f59..c3343ae 100644
      """Run a code block directly (without the model) and stream the
      output as SSE. Used by the Run button on code blocks."""
      body = await request.json()
-@@ -550,8 +733,11 @@ async def sandbox_run(request: Request):
+@@ -550,8 +737,11 @@ async def sandbox_run(request: Request):
          "input_files": body.get("input_files") or [],
      }
  
@@ -1259,7 +1263,7 @@ index abb5f59..c3343ae 100644
          try:
              async for chunk in tool.stream_execute(**kwargs):
                  chunks.append(chunk)
-@@ -568,6 +754,8 @@ async def sandbox_run(request: Request):
+@@ -568,6 +758,8 @@ async def sandbox_run(request: Request):
              yield f"data: {json.dumps(result)}\n\n"
          except Exception as e:
              yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
@@ -1268,7 +1272,7 @@ index abb5f59..c3343ae 100644
  
      return StreamingResponse(stream(), media_type="text/event-stream")
  
-@@ -588,10 +776,16 @@ async def sandbox_interact(websocket: WebSocket, session_id: str):
+@@ -588,10 +780,16 @@ async def sandbox_interact(websocket: WebSocket, session_id: str):
  
      from backend.sandbox_sessions import peek_session
  
@@ -1286,7 +1290,7 @@ index abb5f59..c3343ae 100644
          await websocket.send_text(
              json.dumps({"type": "stderr", "data": "Unknown or expired session"})
          )
-@@ -642,7 +836,7 @@ MAX_PLOTLY_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
+@@ -642,7 +840,7 @@ MAX_PLOTLY_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
  
  
  @app.post("/api/plots/from-json")
@@ -1295,7 +1299,7 @@ index abb5f59..c3343ae 100644
      """Convert Plotly figure JSON to a PNG file and return the filename."""
      try:
          import plotly.io as pio
-@@ -662,8 +856,7 @@ async def plotly_json_to_png(request: Request):
+@@ -662,8 +860,7 @@ async def plotly_json_to_png(request: Request):
              json.dumps(figure_json) if isinstance(figure_json, dict) else figure_json
          )
          filename = f"plotly-{uuid.uuid4().hex[:8]}.png"
@@ -1305,7 +1309,7 @@ index abb5f59..c3343ae 100644
          await asyncio.to_thread(fig.write_image, str(filepath), width=1200, height=700, scale=2)
  
          return JSONResponse({"filename": filename})
-@@ -679,14 +872,51 @@ async def plotly_json_to_png(request: Request):
+@@ -679,14 +876,51 @@ async def plotly_json_to_png(request: Request):
  
  
  @app.get("/api/mcp/servers")
@@ -1361,7 +1365,7 @@ index abb5f59..c3343ae 100644
      ok = await orchestrator.reconnect_mcp(server_id)
      if not ok:
          client = orchestrator.mcp.get_client(server_id)
-@@ -702,12 +932,13 @@ def _server_id_from_payload(payload: dict) -> str:
+@@ -702,12 +936,13 @@ def _server_id_from_payload(payload: dict) -> str:
  
  
  @app.post("/api/mcp/servers/discover")
@@ -1376,7 +1380,7 @@ index abb5f59..c3343ae 100644
      temp_id = "discover-" + uuid.uuid4().hex[:6]
      try:
          client = MCPClient(temp_id, {**payload, "timeout": payload.get("timeout", 60)})
-@@ -723,15 +954,20 @@ async def discover_mcp_server(payload: dict):
+@@ -723,15 +958,20 @@ async def discover_mcp_server(payload: dict):
  
  
  @app.post("/api/mcp/servers")
@@ -1402,7 +1406,7 @@ index abb5f59..c3343ae 100644
      except ValueError as e:
          raise HTTPException(400, str(e))
      if not info:
-@@ -741,8 +977,16 @@ async def add_mcp_server(payload: dict):
+@@ -741,8 +981,16 @@ async def add_mcp_server(payload: dict):
  
  
  @app.delete("/api/mcp/servers/{server_id}")
@@ -1421,7 +1425,7 @@ index abb5f59..c3343ae 100644
      ok = await orchestrator.remove_mcp_server(server_id)
      if not ok:
          raise HTTPException(404, f"MCP server '{server_id}' not found")
-@@ -750,7 +994,7 @@ async def remove_mcp_server(server_id: str):
+@@ -750,7 +998,7 @@ async def remove_mcp_server(server_id: str):
  
  
  @app.get("/api/mcp/registry/search")
@@ -1430,7 +1434,7 @@ index abb5f59..c3343ae 100644
      """Search the official MCP Registry (GitHub / Claude / ChatGPT
      marketplace catalog) for installable servers."""
      try:
-@@ -760,7 +1004,7 @@ async def mcp_registry_search(q: str = "", limit: int = 30, cursor: str | None =
+@@ -760,7 +1008,7 @@ async def mcp_registry_search(q: str = "", limit: int = 30, cursor: str | None =
  
  
  @app.post("/api/mcp/import")
@@ -1439,7 +1443,7 @@ index abb5f59..c3343ae 100644
      """Import an ``mcpServers`` JSON block (Claude Desktop / ChatGPT /
      Cursor / VS Code format) and connect every server in it."""
      raw = payload.get("config") if "config" in payload else payload
-@@ -771,8 +1015,17 @@ async def mcp_import(payload: dict):
+@@ -771,8 +1019,17 @@ async def mcp_import(payload: dict):
      if not servers:
          raise HTTPException(400, "No MCP servers found in config")
      results = []
@@ -1459,7 +1463,7 @@ index abb5f59..c3343ae 100644
          client = orchestrator.mcp.get_client(sid)
          results.append({
              "id": sid,
-@@ -784,14 +1037,18 @@ async def mcp_import(payload: dict):
+@@ -784,14 +1041,18 @@ async def mcp_import(payload: dict):
  
  
  @app.get("/api/mcp/servers/{server_id}/resources")
@@ -1481,7 +1485,7 @@ index abb5f59..c3343ae 100644
      uri = payload.get("uri")
      if not uri:
          raise HTTPException(400, "uri is required")
-@@ -806,12 +1063,12 @@ async def mcp_ingest_resource(server_id: str, payload: dict):
+@@ -806,12 +1067,12 @@ async def mcp_ingest_resource(server_id: str, payload: dict):
      if "." not in name:
          name += ".md"
      name = safe_filename(f"mcp-{server_id}-{name}")
@@ -1496,7 +1500,7 @@ index abb5f59..c3343ae 100644
          )
      return result
  
-@@ -822,23 +1079,23 @@ from starlette.requests import Request as StarletteRequest
+@@ -822,23 +1083,23 @@ from starlette.requests import Request as StarletteRequest
  
  
  @app.get("/api/conversations")
@@ -1528,7 +1532,7 @@ index abb5f59..c3343ae 100644
      body = await request.json()
      result = conversations.save_conversation(
          conversation_id=body.get("id"),
-@@ -849,14 +1106,15 @@ async def save_conversation_post(request: StarletteRequest):
+@@ -849,14 +1110,15 @@ async def save_conversation_post(request: StarletteRequest):
              k: body[k] for k in ("compaction_state", "generation", "selected_tools", "selected_files")
              if k in body
          },
@@ -1547,7 +1551,7 @@ index abb5f59..c3343ae 100644
      if not ok:
          raise HTTPException(404, "Conversation not found")
      return {"deleted": conversation_id}
-@@ -867,8 +1125,16 @@ async def delete_conversation_endpoint(conversation_id: str):
+@@ -867,8 +1129,16 @@ async def delete_conversation_endpoint(conversation_id: str):
  
  @app.websocket("/ws/chat")
  async def websocket_chat(websocket: WebSocket):
@@ -1565,7 +1569,7 @@ index abb5f59..c3343ae 100644
  
      try:
          while True:
-@@ -877,7 +1143,7 @@ async def websocket_chat(websocket: WebSocket):
+@@ -877,7 +1147,7 @@ async def websocket_chat(websocket: WebSocket):
  
              messages = request.get("messages", [])
              model = request.get("model", "")
@@ -1574,7 +1578,7 @@ index abb5f59..c3343ae 100644
              files = request.get("files", [])
              system = request.get("system_prompt", "")
              generation = request.get("generation") or None
-@@ -893,6 +1159,9 @@ async def websocket_chat(websocket: WebSocket):
+@@ -893,6 +1163,9 @@ async def websocket_chat(websocket: WebSocket):
                  generation=generation,
                  compaction_state=compaction_state,
                  tool_mode=tool_mode,

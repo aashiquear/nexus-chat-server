@@ -262,6 +262,10 @@ async def delete_account(request: Request, response: Response, current_user: dic
             orchestrator.rag_engine._get_collection().delete(where=rag_where(current_user))
         except Exception as e:
             logger.warning("Could not purge vectors for %s: %s", current_user["username"], e)
+    # Disconnect the account's personal MCP servers so a later account with
+    # the same name cannot inherit live, authenticated connections.
+    for sid in [i["id"] for i in orchestrator.mcp.get_servers_info() if i.get("owner") == current_user["username"]]:
+        await orchestrator.mcp.remove_server(sid)
     auth.clear_session_cookie(response)
     return {"deleted": current_user["username"]}
 
