@@ -35,11 +35,39 @@ _CONSTS = {"pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf}
 _MAX_POW = 10_000
 
 
+_THOUSANDS_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?!\d)")
+
+
+def _strip_thousands_separators(expr: str) -> str:
+    """Remove thousands separators (1,234,567) only at bracket depth 0.
+
+    Inside parentheses or brackets a comma is an argument/list separator
+    (``max(1,234)``, ``sum([1,234])``), so it is left untouched there. At the
+    top level a comma has no other meaning, so ``1,234 * 2`` is 2468.
+    """
+    out = []
+    depth = 0
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        if depth == 0 and ch.isdigit():
+            m = _THOUSANDS_RE.match(expr, i)
+            if m:
+                out.append(m.group(0).replace(",", ""))
+                i = m.end()
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def safe_eval(expr: str):
     expr = expr.strip().replace("^", "**").replace("×", "*").replace("÷", "/")
-    # Thousands separators (1,234,567) are dropped only when the comma sits
-    # between digit groups of exactly three; argument/list separators stay.
-    expr = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", expr)
+    expr = _strip_thousands_separators(expr)
     # Postfix percentage (15%, 15% * 80, (15%)) vs binary modulo (10 % 3):
     # '%' is a percentage only when it is followed by the end of the
     # expression, a closing bracket/comma, or a * / ^ operator; when a
