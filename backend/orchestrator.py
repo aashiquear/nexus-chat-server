@@ -29,7 +29,7 @@ from backend.providers import (
 from backend.rag.engine import RAGEngine
 from backend.tools import BaseTool, ToolContext, get_tool_class, reset_context, set_context
 from backend.tools.catalog import CATALOG_BY_ID, CATEGORY_ORDER
-from backend.tools.discovery import ToolIndex, build_docs
+from backend.tools.discovery import ToolIndex, build_docs, reset_resolver, set_resolver
 
 logger = logging.getLogger(__name__)
 
@@ -816,8 +816,8 @@ class ChatOrchestrator:
         # Wire the discover_tools meta tool to this request so the model can
         # pull in more tools mid-conversation.
         newly_attached: list[dict] = []
-        discover_tool = self.get_tool("discover_tools") if "discover_tools" in attached else None
-        if discover_tool is not None:
+        resolver_token = None
+        if "discover_tools" in attached:
             def _resolve(query: str, limit: int) -> list[dict]:
                 found = [m for m in self.discover(query, limit=limit, visible_mcp=visible_mcp) if m["id"] not in attached]
                 for m in found:
@@ -827,8 +827,23 @@ class ChatOrchestrator:
                         attached.add(m["id"])
                         newly_attached.append(m)
                 return found
-            discover_tool.resolver = _resolve
+            # Request-local: concurrent streams each get their own resolver.
+            resolver_token = set_resolver(_resolve)
         selected_tools = list(attached)
+        try:
+            async for event in self._run_agent_loop(
+                messages, model_id, provider, model_cfg, selected_tools, selected_files, system_prompt,
+                generation, compaction_state, rag_where, tool_defs, attached, newly_attached, model_entry=None,
+            ):
+                yield event
+        finally:
+            if resolver_token is not None:
+                reset_resolver(resolver_token)
+
+    async def _run_agent_loop(
+        self, messages, model_id, provider, model_cfg, selected_tools, selected_files, system_prompt,
+        generation, compaction_state, rag_where, tool_defs, attached, newly_attached, model_entry=None,
+    ) -> AsyncIterator[dict]:
 
         # Get RAG context
         last_user_msg = ""

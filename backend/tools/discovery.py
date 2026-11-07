@@ -21,6 +21,7 @@ import logging
 import math
 import re
 import threading
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 from . import BaseTool, register_tool
@@ -203,6 +204,19 @@ def build_docs(builtin_meta: list[dict], mcp_tools: list[dict]) -> list[ToolDoc]
 # ----------------------------------------------------------------------
 # Meta tool
 # ----------------------------------------------------------------------
+_resolver_var: ContextVar = ContextVar("nexus_discover_resolver", default=None)
+
+
+def set_resolver(resolver):
+    """Install the resolver for the current chat stream; returns a token
+    for :func:`reset_resolver`."""
+    return _resolver_var.set(resolver)
+
+
+def reset_resolver(token) -> None:
+    _resolver_var.reset(token)
+
+
 @register_tool("discover_tools")
 class DiscoverToolsTool(BaseTool):
     name = "discover_tools"
@@ -223,18 +237,17 @@ class DiscoverToolsTool(BaseTool):
         "required": ["query"],
     }
 
-    # The orchestrator injects a callable that performs the ranking over the
-    # live tool set (built-in + MCP) and attaches the results.
-    def __init__(self, config: dict | None = None):
-        super().__init__(config)
-        self.resolver = None
-
+    # The orchestrator installs a request-local resolver (see
+    # ``set_resolver``) that ranks the live tool set and attaches the
+    # results to *that* chat stream. A ContextVar keeps concurrent streams
+    # (several tabs / users) from clobbering each other's resolver.
     async def execute(self, **kwargs) -> str:
         query = kwargs.get("query", "")
         limit = max(1, min(int(kwargs.get("limit") or 4), 8))
-        if self.resolver is None:
+        resolver = _resolver_var.get()
+        if resolver is None:
             return json.dumps({"error": "tool discovery is not available in this context"})
-        matches = self.resolver(query, limit)
+        matches = resolver(query, limit)
         if not matches:
             return json.dumps({"query": query, "attached": [], "message": "No matching tools. Answer without tools or use code_executor."})
         return json.dumps({

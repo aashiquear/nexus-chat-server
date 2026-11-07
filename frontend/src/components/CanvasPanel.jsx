@@ -428,8 +428,16 @@ export default function CanvasPanel({
     }
 
     if (effectiveContentType === "svg") {
+      // Always render SVG through <img>: scripts, event handlers and
+      // foreignObject HTML inside the file cannot execute there, unlike
+      // when the markup is injected into the page DOM.
       if (effectiveContent) {
-        return <div className="canvas-svg" dangerouslySetInnerHTML={{ __html: effectiveContent }} />;
+        const src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(effectiveContent)}`;
+        return (
+          <div className="canvas-svg">
+            <img src={src} alt={title || "SVG"} className="canvas-panel-image" />
+          </div>
+        );
       }
       if (effectivePreviewUrl) return <img src={effectivePreviewUrl} alt={title || "SVG"} className="canvas-panel-image" />;
     }

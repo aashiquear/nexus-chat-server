@@ -36,7 +36,10 @@ _MAX_POW = 10_000
 
 
 def safe_eval(expr: str):
-    expr = expr.strip().replace("^", "**").replace("×", "*").replace("÷", "/").replace(",", "")
+    expr = expr.strip().replace("^", "**").replace("×", "*").replace("÷", "/")
+    # Thousands separators (1,234,567) are dropped only when the comma sits
+    # between digit groups of exactly three; argument/list separators stay.
+    expr = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", expr)
     expr = re.sub(r"(\d+(?:\.\d+)?)\s*%", r"(\1/100)", expr)  # 15% → (15/100)
     tree = ast.parse(expr, mode="eval")
 
@@ -311,6 +314,14 @@ class StatisticsTool(BaseTool):
             if not p.exists():
                 raise FileNotFoundError(f"{k['filename']} not uploaded")
             df = pd.read_excel(p) if p.suffix.lower() in (".xlsx", ".xls") else pd.read_csv(p, sep=None, engine="python")
+            if k.get("column") and k.get("column2"):
+                # Paired analyses: drop a row when *either* value is missing
+                # so observations stay aligned.
+                pair = pd.DataFrame({
+                    "a": pd.to_numeric(df[k["column"]], errors="coerce"),
+                    "b": pd.to_numeric(df[k["column2"]], errors="coerce"),
+                }).dropna()
+                return pair["a"].to_numpy(), pair["b"].to_numpy(), df
             a = pd.to_numeric(df[k["column"]], errors="coerce").dropna().to_numpy() if k.get("column") else None
             b = pd.to_numeric(df[k["column2"]], errors="coerce").dropna().to_numpy() if k.get("column2") else None
             return a, b, df

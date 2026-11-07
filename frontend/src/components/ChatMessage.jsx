@@ -1661,10 +1661,13 @@ export default function ChatMessage({ message, onOpenCanvas, onRunCode }) {
                 {parsed.title && (
                   <div className="svg-diagram-title">{parsed.title}</div>
                 )}
-                <div
-                  className="svg-diagram-render"
-                  dangerouslySetInnerHTML={{ __html: parsed.svg }}
-                />
+                <div className="svg-diagram-render">
+                  <img
+                    src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(parsed.svg)}`}
+                    alt={parsed.title || "Diagram"}
+                    style={{ maxWidth: "100%", height: "auto" }}
+                  />
+                </div>
                 {parsed.filename && (
                   <div className="svg-diagram-footer">
                     Saved as {parsed.filename}
