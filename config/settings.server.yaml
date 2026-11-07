@@ -36,6 +36,14 @@ providers:
     # Keep the curated list from settings.yaml; models pulled on the
     # server that are not listed are discovered automatically.
 
+tools:
+  code_executor:
+    config:
+      # Never run user code in the backend process on a shared server: if
+      # the nexus-sandbox container is down, execution fails closed.
+      # (NEXUS_ALLOW_LOCAL_EXEC=1 overrides for local development.)
+      allow_local_fallback: false
+
 # Tool/plot output is written to each user's workspace; these global
 # paths are only used before a user context exists.
 uploads:

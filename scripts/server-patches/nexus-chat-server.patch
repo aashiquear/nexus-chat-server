@@ -64,7 +64,7 @@ index c7a89c2..05b89ba 100644
  # Expose port
  EXPOSE 8000
 diff --git a/README.md b/README.md
-index e8869c8..a209c57 100644
+index e8869c8..30e7f9b 100644
 --- a/README.md
 +++ b/README.md
 @@ -1,24 +1,84 @@
@@ -101,7 +101,7 @@ index e8869c8..a209c57 100644
 +| Conversations | `data/conversations/` | per user, including compaction state and tool/file selection |
 +| Generation settings | per browser (localStorage) | per user on the server (`settings.json`), follow the account across devices |
 +| MCP servers | one registry | admin-managed **server-wide** servers + **personal** servers per user (`users_can_add_mcp`, `users_can_run_stdio_mcp` policies) |
-+| Sandbox | shared | runs with the user's workspace; interactive consoles are bound to their owner |
++| Sandbox | shared; falls back to local execution in dev | runs with the user's workspace, interactive consoles bound to their owner, per-run isolated directories; **no local fallback** (fails closed if the sandbox container is down) |
 +| Quotas | — | optional per-user storage quota (`auth.user_quota_mb`) |
 +
 +## Quick Start
@@ -641,7 +641,7 @@ index 0000000..ed2c187
 +    ensure_user_dirs(user["username"])
 +    return user
 diff --git a/backend/config.py b/backend/config.py
-index 4f6f858..3ddffa3 100644
+index 1899c02..75397e0 100644
 --- a/backend/config.py
 +++ b/backend/config.py
 @@ -12,6 +12,18 @@ from typing import Any
@@ -1586,10 +1586,10 @@ index abb5f59..c3343ae 100644
  
 diff --git a/config/settings.server.yaml b/config/settings.server.yaml
 new file mode 100644
-index 0000000..7dcd8f6
+index 0000000..963cf73
 --- /dev/null
 +++ b/config/settings.server.yaml
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,50 @@
 +# ============================================================
 +# Nexus Chat Server — Config Override
 +# This file is deep-merged over config/settings.yaml.
@@ -1627,6 +1627,14 @@ index 0000000..7dcd8f6
 +    api_key: "${OLLAMA_API_KEY}"
 +    # Keep the curated list from settings.yaml; models pulled on the
 +    # server that are not listed are discovered automatically.
++
++tools:
++  code_executor:
++    config:
++      # Never run user code in the backend process on a shared server: if
++      # the nexus-sandbox container is down, execution fails closed.
++      # (NEXUS_ALLOW_LOCAL_EXEC=1 overrides for local development.)
++      allow_local_fallback: false
 +
 +# Tool/plot output is written to each user's workspace; these global
 +# paths are only used before a user context exists.

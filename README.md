@@ -14,7 +14,7 @@ This repository tracks `nexus-chat` as its upstream. Everything that is not serv
 | Conversations | `data/conversations/` | per user, including compaction state and tool/file selection |
 | Generation settings | per browser (localStorage) | per user on the server (`settings.json`), follow the account across devices |
 | MCP servers | one registry | admin-managed **server-wide** servers + **personal** servers per user (`users_can_add_mcp`, `users_can_run_stdio_mcp` policies) |
-| Sandbox | shared | runs with the user's workspace; interactive consoles are bound to their owner |
+| Sandbox | shared; falls back to local execution in dev | runs with the user's workspace, interactive consoles bound to their owner, per-run isolated directories; **no local fallback** (fails closed if the sandbox container is down) |
 | Quotas | — | optional per-user storage quota (`auth.user_quota_mb`) |
 
 ## Quick Start
