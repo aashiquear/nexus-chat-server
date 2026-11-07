@@ -444,6 +444,10 @@ tools:
       timeout: 120
       max_memory_mb: 512
       # sandbox_url: "http://nexus-sandbox:8500"   # or set NEXUS_SANDBOX_URL
+      # Run code in the backend process when the sandbox is unreachable.
+      # Handy for `python -m backend.main` dev runs; keep false on any
+      # shared deployment (env NEXUS_ALLOW_LOCAL_EXEC overrides).
+      allow_local_fallback: true
 
   web_browser:
     enabled: true

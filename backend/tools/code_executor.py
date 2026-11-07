@@ -19,9 +19,23 @@ import shutil
 import sys
 import uuid
 from collections.abc import AsyncIterator
+from contextvars import ContextVar
 from pathlib import Path
 
 from . import BaseTool, register_tool
+from backend.config import as_bool
+
+# Per-invocation result state. One CodeExecutorTool instance serves every
+# chat and every /api/sandbox/run, so results must never live on the
+# instance: a ContextVar keeps them local to the task that is executing.
+_exec_state: ContextVar[dict | None] = ContextVar("nexus_code_exec_state", default=None)
+_STATE_DEFAULTS = {
+    "return_code": 0,
+    "language": "python",
+    "session_id": None,
+    "artifacts": None,
+    "preview": None,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -88,14 +102,76 @@ class CodeExecutorTool(BaseTool):
 
     DEFAULT_SANDBOX_URL = "http://nexus-sandbox:8500"
 
+    # Marker the orchestrator uses to detect the code-executor result shape.
+    _last_output = ""
+
     def __init__(self, config: dict | None = None):
         super().__init__(config)
-        self._last_output = ""
-        self._last_return_code = 0
-        self._last_language = "python"
-        self._last_session_id: str | None = None
-        self._last_artifacts: list[dict] | None = None
-        self._last_preview: dict | None = None
+
+    # ---- task-local result state ----------------------------------
+    def _state(self) -> dict:
+        st = _exec_state.get()
+        if st is None:
+            st = dict(_STATE_DEFAULTS)
+            _exec_state.set(st)
+        return st
+
+    def _reset_state(self) -> dict:
+        st = dict(_STATE_DEFAULTS)
+        _exec_state.set(st)
+        return st
+
+    @property
+    def _last_return_code(self) -> int:
+        return self._state()["return_code"]
+
+    @_last_return_code.setter
+    def _last_return_code(self, value: int) -> None:
+        self._state()["return_code"] = value
+
+    @property
+    def _last_language(self) -> str:
+        return self._state()["language"]
+
+    @_last_language.setter
+    def _last_language(self, value: str) -> None:
+        self._state()["language"] = value
+
+    @property
+    def _last_session_id(self) -> str | None:
+        return self._state()["session_id"]
+
+    @_last_session_id.setter
+    def _last_session_id(self, value) -> None:
+        self._state()["session_id"] = value
+
+    @property
+    def _last_artifacts(self) -> list[dict] | None:
+        return self._state()["artifacts"]
+
+    @_last_artifacts.setter
+    def _last_artifacts(self, value) -> None:
+        self._state()["artifacts"] = value
+
+    @property
+    def _last_preview(self) -> dict | None:
+        return self._state()["preview"]
+
+    @_last_preview.setter
+    def _last_preview(self, value) -> None:
+        self._state()["preview"] = value
+
+    @property
+    def allow_local_fallback(self) -> bool:
+        """Whether code may run in the backend process when the sandbox is
+        unreachable. Convenient for single-user dev runs, but it executes
+        untrusted code with the backend's privileges, so the multi-user
+        server edition turns it off (config ``allow_local_fallback: false``
+        or env ``NEXUS_ALLOW_LOCAL_EXEC=0``)."""
+        env = os.environ.get("NEXUS_ALLOW_LOCAL_EXEC")
+        if env is not None:
+            return as_bool(env)
+        return as_bool(self.config.get("allow_local_fallback", True), True)
 
     @property
     def sandbox_url(self) -> str:
@@ -181,11 +257,8 @@ class CodeExecutorTool(BaseTool):
         timeout = int(kwargs.get("timeout") or self.config.get("timeout", 120))
         packages = [str(p) for p in (kwargs.get("packages") or [])]
 
-        self._last_session_id = None
-        self._last_return_code = 0
+        self._reset_state()
         self._last_language = language
-        self._last_artifacts = None
-        self._last_preview = None
 
         if language not in SUPPORTED_LANGUAGES:
             yield f"[stderr]: unsupported language '{language}'. Supported: {', '.join(SUPPORTED_LANGUAGES)}"
@@ -292,6 +365,14 @@ class CodeExecutorTool(BaseTool):
                     except Exception as e:  # pragma: no cover - best effort
                         logger.debug("sandbox run cleanup failed: %s", e)
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+            if not self.allow_local_fallback:
+                logger.error("Sandbox unreachable (%s) and local execution is disabled.", e)
+                yield (
+                    "[stderr]: code sandbox is unavailable and local execution is disabled on this "
+                    "server; ask the administrator to start the nexus-sandbox container."
+                )
+                self._last_return_code = 1
+                return
             logger.warning("Sandbox unreachable (%s); falling back to local subprocess.", e)
             async for chunk in self._local_fallback(code, language, timeout, kwargs.get("stdin"), input_files):
                 yield chunk
