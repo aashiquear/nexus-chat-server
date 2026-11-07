@@ -560,15 +560,17 @@ class ChatOrchestrator:
     # Context compaction
     # ------------------------------------------------------------------
     def _context_budget(self, provider: BaseLLMProvider, gen: dict, model_entry: dict, caps: dict | None) -> int:
+        """Token budget used for compaction decisions: the configured
+        window (num_ctx locally, context_window for cloud), never above
+        the limit the model actually reports."""
+        model_limit = int(caps["context_length"]) if caps and caps.get("context_length") else 0
         if getattr(provider, "kind", "cloud") == "local":
-            budget = int(gen.get("num_ctx") or 0)
-            if not budget and caps and caps.get("context_length"):
-                budget = int(caps["context_length"])
-            return budget or 8192
-        budget = int(gen.get("context_window") or 0)
-        if not budget and caps and caps.get("context_length"):
-            budget = int(caps["context_length"])
-        return budget or 200000
+            budget = int(gen.get("num_ctx") or 0) or model_limit or 8192
+        else:
+            budget = int(gen.get("context_window") or 0) or model_limit or 200000
+        if model_limit:
+            budget = min(budget, model_limit)
+        return budget
 
     async def _compact(
         self,

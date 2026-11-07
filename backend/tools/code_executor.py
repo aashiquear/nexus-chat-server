@@ -284,11 +284,13 @@ class CodeExecutorTool(BaseTool):
                         yield "[status]: produced " + ", ".join(a["original_name"] for a in stored)
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
             logger.warning("Sandbox unreachable (%s); falling back to local subprocess.", e)
-            async for chunk in self._local_fallback(code, language, timeout, kwargs.get("stdin")):
+            async for chunk in self._local_fallback(code, language, timeout, kwargs.get("stdin"), input_files):
                 yield chunk
 
     # ------------------------------------------------------------------
-    async def _local_fallback(self, code: str, language: str, timeout: int, stdin_text: str | None) -> AsyncIterator[str]:
+    async def _local_fallback(
+        self, code: str, language: str, timeout: int, stdin_text: str | None, input_files: dict[str, str] | None = None
+    ) -> AsyncIterator[str]:
         """Last-resort local execution when the sandbox is unreachable.
 
         Runs a one-shot subprocess in a temp directory with no shell. This
@@ -311,6 +313,15 @@ class CodeExecutorTool(BaseTool):
         run_dir.mkdir(parents=True, exist_ok=True)
         code_file = run_dir / f"main.{LOCAL_EXT.get(language, 'txt')}"
         code_file.write_text(code, encoding="utf-8")
+        # Materialise uploaded input files exactly as the sandbox would.
+        input_names: set[str] = set()
+        for name, b64 in (input_files or {}).items():
+            safe = Path(name).name
+            try:
+                (run_dir / safe).write_bytes(base64.b64decode(b64))
+                input_names.add(safe)
+            except Exception as e:
+                yield f"[stderr]: could not write input file {name}: {e}"
 
         env = dict(os.environ)
         env["MPLBACKEND"] = "Agg"
@@ -358,7 +369,7 @@ class CodeExecutorTool(BaseTool):
             # Collect artifacts written next to the script.
             stored = []
             for p in sorted(run_dir.iterdir()):
-                if p.is_file() and p != code_file and p.stat().st_size <= 50 * 1024 * 1024:
+                if p.is_file() and p != code_file and p.name not in input_names and p.stat().st_size <= 50 * 1024 * 1024:
                     stored.append(self._store_artifact(p.name, p.read_bytes()))
             if stored:
                 self._last_artifacts = stored
