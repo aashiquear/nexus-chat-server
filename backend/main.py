@@ -894,7 +894,22 @@ def _mcp_scope(payload: dict, user: dict) -> tuple[str, Path | None, str]:
         raise HTTPException(403, "Adding MCP servers is disabled for users")
     if payload.get("command") and not user.get("is_admin") and not acfg.get("users_can_run_stdio_mcp", False):
         raise HTTPException(403, "Stdio (command) MCP servers are limited to admins on this server; use a remote URL")
-    return "user", auth.user_root(user["username"]) / "mcp_servers.json", f"u-{user['username']}-"
+    # '~' cannot appear in usernames ([A-Za-z0-9._-]) or in sanitised server
+    # ids, so the namespace is unambiguous: u~alice~foo never equals u~a~…
+    return "user", auth.user_root(user["username"]) / "mcp_servers.json", f"u~{user['username']}~"
+
+
+def _assert_mcp_id_free(server_id: str, scope: str, user: dict) -> None:
+    """Refuse to replace an MCP server that belongs to another scope/user."""
+    existing = next((i for i in orchestrator.mcp.get_servers_info() if i["id"] == server_id), None)
+    if existing is None:
+        return
+    owner = existing.get("owner")
+    if scope == "global" and owner is None:
+        return  # admin re-adding / updating a global server
+    if scope == "user" and owner == user["username"]:
+        return  # user updating their own server
+    raise HTTPException(409, f"An MCP server with id '{server_id}' already exists in another scope")
 
 
 @app.post("/api/mcp/servers/{server_id}/reconnect")
@@ -946,6 +961,7 @@ async def add_mcp_server(payload: dict, current_user: dict = Depends(auth.get_cu
         raise HTTPException(400, "url or command is required")
     scope, registry_path, prefix = _mcp_scope(payload, current_user)
     server_id = prefix + _server_id_from_payload(payload)
+    _assert_mcp_id_free(server_id, scope, current_user)
     cfg = {k: v for k, v in payload.items() if k not in ("id", "scope")}
     cfg.setdefault("source", "user")
     if scope == "user":
@@ -1002,6 +1018,11 @@ async def mcp_import(payload: dict, current_user: dict = Depends(auth.get_curren
     for raw_sid, cfg in servers.items():
         scope, registry_path, prefix = _mcp_scope({**cfg, "scope": payload.get("scope")}, current_user)
         sid = prefix + raw_sid
+        try:
+            _assert_mcp_id_free(sid, scope, current_user)
+        except HTTPException as e:
+            results.append({"id": sid, "connected": False, "tools": [], "error": e.detail})
+            continue
         if scope == "user":
             cfg["owner"] = current_user["username"]
         info = await orchestrator.mcp.add_server(sid, cfg, registry_path=registry_path)

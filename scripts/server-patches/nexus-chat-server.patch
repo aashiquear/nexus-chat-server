@@ -793,7 +793,7 @@ index c003187..4ab2d62 100644
          path.unlink()
          return True
 diff --git a/backend/main.py b/backend/main.py
-index abb5f59..7b28890 100644
+index abb5f59..c3343ae 100644
 --- a/backend/main.py
 +++ b/backend/main.py
 @@ -17,13 +17,16 @@ from pathlib import Path
@@ -1305,7 +1305,7 @@ index abb5f59..7b28890 100644
          await asyncio.to_thread(fig.write_image, str(filepath), width=1200, height=700, scale=2)
  
          return JSONResponse({"filename": filename})
-@@ -679,14 +872,36 @@ async def plotly_json_to_png(request: Request):
+@@ -679,14 +872,51 @@ async def plotly_json_to_png(request: Request):
  
  
  @app.get("/api/mcp/servers")
@@ -1334,7 +1334,22 @@ index abb5f59..7b28890 100644
 +        raise HTTPException(403, "Adding MCP servers is disabled for users")
 +    if payload.get("command") and not user.get("is_admin") and not acfg.get("users_can_run_stdio_mcp", False):
 +        raise HTTPException(403, "Stdio (command) MCP servers are limited to admins on this server; use a remote URL")
-+    return "user", auth.user_root(user["username"]) / "mcp_servers.json", f"u-{user['username']}-"
++    # '~' cannot appear in usernames ([A-Za-z0-9._-]) or in sanitised server
++    # ids, so the namespace is unambiguous: u~alice~foo never equals u~a~…
++    return "user", auth.user_root(user["username"]) / "mcp_servers.json", f"u~{user['username']}~"
++
++
++def _assert_mcp_id_free(server_id: str, scope: str, user: dict) -> None:
++    """Refuse to replace an MCP server that belongs to another scope/user."""
++    existing = next((i for i in orchestrator.mcp.get_servers_info() if i["id"] == server_id), None)
++    if existing is None:
++        return
++    owner = existing.get("owner")
++    if scope == "global" and owner is None:
++        return  # admin re-adding / updating a global server
++    if scope == "user" and owner == user["username"]:
++        return  # user updating their own server
++    raise HTTPException(409, f"An MCP server with id '{server_id}' already exists in another scope")
  
  
  @app.post("/api/mcp/servers/{server_id}/reconnect")
@@ -1346,7 +1361,7 @@ index abb5f59..7b28890 100644
      ok = await orchestrator.reconnect_mcp(server_id)
      if not ok:
          client = orchestrator.mcp.get_client(server_id)
-@@ -702,12 +917,13 @@ def _server_id_from_payload(payload: dict) -> str:
+@@ -702,12 +932,13 @@ def _server_id_from_payload(payload: dict) -> str:
  
  
  @app.post("/api/mcp/servers/discover")
@@ -1361,7 +1376,7 @@ index abb5f59..7b28890 100644
      temp_id = "discover-" + uuid.uuid4().hex[:6]
      try:
          client = MCPClient(temp_id, {**payload, "timeout": payload.get("timeout", 60)})
-@@ -723,15 +939,19 @@ async def discover_mcp_server(payload: dict):
+@@ -723,15 +954,20 @@ async def discover_mcp_server(payload: dict):
  
  
  @app.post("/api/mcp/servers")
@@ -1376,6 +1391,7 @@ index abb5f59..7b28890 100644
 -    cfg = {k: v for k, v in payload.items() if k != "id"}
 +    scope, registry_path, prefix = _mcp_scope(payload, current_user)
 +    server_id = prefix + _server_id_from_payload(payload)
++    _assert_mcp_id_free(server_id, scope, current_user)
 +    cfg = {k: v for k, v in payload.items() if k not in ("id", "scope")}
      cfg.setdefault("source", "user")
 +    if scope == "user":
@@ -1386,7 +1402,7 @@ index abb5f59..7b28890 100644
      except ValueError as e:
          raise HTTPException(400, str(e))
      if not info:
-@@ -741,8 +961,16 @@ async def add_mcp_server(payload: dict):
+@@ -741,8 +977,16 @@ async def add_mcp_server(payload: dict):
  
  
  @app.delete("/api/mcp/servers/{server_id}")
@@ -1405,7 +1421,7 @@ index abb5f59..7b28890 100644
      ok = await orchestrator.remove_mcp_server(server_id)
      if not ok:
          raise HTTPException(404, f"MCP server '{server_id}' not found")
-@@ -750,7 +978,7 @@ async def remove_mcp_server(server_id: str):
+@@ -750,7 +994,7 @@ async def remove_mcp_server(server_id: str):
  
  
  @app.get("/api/mcp/registry/search")
@@ -1414,7 +1430,7 @@ index abb5f59..7b28890 100644
      """Search the official MCP Registry (GitHub / Claude / ChatGPT
      marketplace catalog) for installable servers."""
      try:
-@@ -760,7 +988,7 @@ async def mcp_registry_search(q: str = "", limit: int = 30, cursor: str | None =
+@@ -760,7 +1004,7 @@ async def mcp_registry_search(q: str = "", limit: int = 30, cursor: str | None =
  
  
  @app.post("/api/mcp/import")
@@ -1423,7 +1439,7 @@ index abb5f59..7b28890 100644
      """Import an ``mcpServers`` JSON block (Claude Desktop / ChatGPT /
      Cursor / VS Code format) and connect every server in it."""
      raw = payload.get("config") if "config" in payload else payload
-@@ -771,8 +999,12 @@ async def mcp_import(payload: dict):
+@@ -771,8 +1015,17 @@ async def mcp_import(payload: dict):
      if not servers:
          raise HTTPException(400, "No MCP servers found in config")
      results = []
@@ -1432,13 +1448,18 @@ index abb5f59..7b28890 100644
 +    for raw_sid, cfg in servers.items():
 +        scope, registry_path, prefix = _mcp_scope({**cfg, "scope": payload.get("scope")}, current_user)
 +        sid = prefix + raw_sid
++        try:
++            _assert_mcp_id_free(sid, scope, current_user)
++        except HTTPException as e:
++            results.append({"id": sid, "connected": False, "tools": [], "error": e.detail})
++            continue
 +        if scope == "user":
 +            cfg["owner"] = current_user["username"]
 +        info = await orchestrator.mcp.add_server(sid, cfg, registry_path=registry_path)
          client = orchestrator.mcp.get_client(sid)
          results.append({
              "id": sid,
-@@ -784,14 +1016,18 @@ async def mcp_import(payload: dict):
+@@ -784,14 +1037,18 @@ async def mcp_import(payload: dict):
  
  
  @app.get("/api/mcp/servers/{server_id}/resources")
@@ -1460,7 +1481,7 @@ index abb5f59..7b28890 100644
      uri = payload.get("uri")
      if not uri:
          raise HTTPException(400, "uri is required")
-@@ -806,12 +1042,12 @@ async def mcp_ingest_resource(server_id: str, payload: dict):
+@@ -806,12 +1063,12 @@ async def mcp_ingest_resource(server_id: str, payload: dict):
      if "." not in name:
          name += ".md"
      name = safe_filename(f"mcp-{server_id}-{name}")
@@ -1475,7 +1496,7 @@ index abb5f59..7b28890 100644
          )
      return result
  
-@@ -822,23 +1058,23 @@ from starlette.requests import Request as StarletteRequest
+@@ -822,23 +1079,23 @@ from starlette.requests import Request as StarletteRequest
  
  
  @app.get("/api/conversations")
@@ -1507,7 +1528,7 @@ index abb5f59..7b28890 100644
      body = await request.json()
      result = conversations.save_conversation(
          conversation_id=body.get("id"),
-@@ -849,14 +1085,15 @@ async def save_conversation_post(request: StarletteRequest):
+@@ -849,14 +1106,15 @@ async def save_conversation_post(request: StarletteRequest):
              k: body[k] for k in ("compaction_state", "generation", "selected_tools", "selected_files")
              if k in body
          },
@@ -1526,7 +1547,7 @@ index abb5f59..7b28890 100644
      if not ok:
          raise HTTPException(404, "Conversation not found")
      return {"deleted": conversation_id}
-@@ -867,8 +1104,16 @@ async def delete_conversation_endpoint(conversation_id: str):
+@@ -867,8 +1125,16 @@ async def delete_conversation_endpoint(conversation_id: str):
  
  @app.websocket("/ws/chat")
  async def websocket_chat(websocket: WebSocket):
@@ -1544,7 +1565,7 @@ index abb5f59..7b28890 100644
  
      try:
          while True:
-@@ -877,7 +1122,7 @@ async def websocket_chat(websocket: WebSocket):
+@@ -877,7 +1143,7 @@ async def websocket_chat(websocket: WebSocket):
  
              messages = request.get("messages", [])
              model = request.get("model", "")
@@ -1553,7 +1574,7 @@ index abb5f59..7b28890 100644
              files = request.get("files", [])
              system = request.get("system_prompt", "")
              generation = request.get("generation") or None
-@@ -893,6 +1138,9 @@ async def websocket_chat(websocket: WebSocket):
+@@ -893,6 +1159,9 @@ async def websocket_chat(websocket: WebSocket):
                  generation=generation,
                  compaction_state=compaction_state,
                  tool_mode=tool_mode,
@@ -1612,7 +1633,7 @@ index 0000000..7dcd8f6
 +uploads:
 +  upload_directory: "./data/uploads"
 diff --git a/docker-compose.yml b/docker-compose.yml
-index dae621e..fe7972e 100644
+index 6c30300..1ee42bf 100644
 --- a/docker-compose.yml
 +++ b/docker-compose.yml
 @@ -9,20 +9,26 @@ networks:
@@ -1647,7 +1668,7 @@ index dae621e..fe7972e 100644
      extra_hosts:
        # Allow container to reach Ollama on the host machine
        - "host.docker.internal:host-gateway"
-@@ -81,6 +87,7 @@ services:
+@@ -82,6 +88,7 @@ services:
        retries: 3
  
  volumes:
@@ -1656,7 +1677,7 @@ index dae621e..fe7972e 100644
    sandbox-pylib:
    sandbox-npm-cache:
 diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
-index eb4358d..6e288e3 100644
+index 59dc17f..76b301e 100644
 --- a/frontend/src/App.jsx
 +++ b/frontend/src/App.jsx
 @@ -5,13 +5,16 @@ import React, {
@@ -1786,7 +1807,7 @@ index eb4358d..6e288e3 100644
  
        // Default-select a model that is both provider-configured *and*
        // confirmed on the remote (when probe info is available).
-@@ -861,9 +918,23 @@ export default function App() {
+@@ -869,9 +926,23 @@ export default function App() {
        }
      : null;
  
@@ -1811,7 +1832,7 @@ index eb4358d..6e288e3 100644
        <Sidebar
          models={models}
          selectedModel={selectedModel}
-@@ -893,11 +964,14 @@ export default function App() {
+@@ -901,11 +972,14 @@ export default function App() {
          toolMode={toolMode}
          onToolModeChange={handleToolModeChange}
          lastToolSelection={lastToolSelection}
@@ -1827,7 +1848,7 @@ index eb4358d..6e288e3 100644
        {resourcesServer && (
          <MCPResourcesDialog
            server={resourcesServer}
-@@ -926,12 +1000,22 @@ export default function App() {
+@@ -934,12 +1008,22 @@ export default function App() {
                </span>
              )}
            </div>
