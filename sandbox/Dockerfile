@@ -42,9 +42,14 @@ RUN pip install --no-cache-dir \
 
 COPY server.py /sandbox/server.py
 
+# The run root is root-owned with mode 1733: the sandbox user can create
+# and enter run directories (random 128-bit names) but cannot list the
+# root or change its permissions, so one run cannot discover another's
+# files even though every run executes as the same OS user.
 RUN useradd -m -u 10001 sandbox && \
     mkdir -p /sandbox/pylib /sandbox/npm-cache /tmp/nexus-sandbox && \
-    chown -R sandbox:sandbox /sandbox /tmp/nexus-sandbox
+    chown -R sandbox:sandbox /sandbox && \
+    chown root:root /tmp/nexus-sandbox && chmod 1733 /tmp/nexus-sandbox
 USER sandbox
 
 ENV SANDBOX_PIP_TARGET=/sandbox/pylib \

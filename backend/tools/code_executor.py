@@ -263,6 +263,8 @@ class CodeExecutorTool(BaseTool):
                             artifacts_meta = ev.get("files") or []
                         elif kind == "exit":
                             self._last_return_code = int(ev.get("code", 0))
+                            if ev.get("run_id"):
+                                run_id = ev["run_id"]
 
                 # Pull produced files back from the sandbox.
                 if run_id and artifacts_meta:
@@ -282,6 +284,13 @@ class CodeExecutorTool(BaseTool):
                     if stored:
                         self._last_artifacts = stored
                         yield "[status]: produced " + ", ".join(a["original_name"] for a in stored)
+                # The run directory (inputs + outputs) is no longer needed on
+                # the sandbox side; remove it so nothing lingers between users.
+                if run_id:
+                    try:
+                        await client.delete(f"{self.sandbox_url.rstrip('/')}/artifacts/{run_id}")
+                    except Exception as e:  # pragma: no cover - best effort
+                        logger.debug("sandbox run cleanup failed: %s", e)
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
             logger.warning("Sandbox unreachable (%s); falling back to local subprocess.", e)
             async for chunk in self._local_fallback(code, language, timeout, kwargs.get("stdin"), input_files):

@@ -553,6 +553,14 @@ export default function App() {
       if (activeConversationId === id) {
         setMessages([]);
         setActiveConversationId(null);
+        // Drop the deleted thread's compaction summary and stats so they
+        // cannot leak into the next conversation.
+        setCompactionState(null);
+        compactionRef.current = null;
+        setContextInfo(null);
+        setTokenUsageHistory([]);
+        tokenUsageRef.current = [];
+        setLastResponseStats(null);
       }
     } catch (err) {
       console.error("Delete conversation failed:", err);

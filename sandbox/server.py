@@ -58,6 +58,18 @@ app = FastAPI(title="Nexus Sandbox", version="0.2.0")
 
 SANDBOX_ROOT = Path(os.environ.get("SANDBOX_ROOT", "/tmp/nexus-sandbox"))
 SANDBOX_ROOT.mkdir(parents=True, exist_ok=True)
+# Isolation between runs: every run gets a directory with an unguessable
+# 128-bit name, mode 0700, and the parent is made non-listable (the image
+# creates it root-owned with mode 1733 so the sandbox user cannot relax
+# that). Code in one run therefore cannot enumerate or open another run's
+# inputs/outputs even though all runs share one OS user. Run directories
+# are deleted as soon as the backend has collected the artifacts (see
+# DELETE /artifacts/{run_id}) and otherwise expire after RUN_TTL.
+try:
+    if os.access(SANDBOX_ROOT, os.W_OK) and SANDBOX_ROOT.stat().st_uid == os.getuid():
+        os.chmod(SANDBOX_ROOT, 0o733)
+except OSError:
+    pass
 # Persistent location for pip-installed packages so repeat runs are fast.
 PIP_TARGET = Path(os.environ.get("SANDBOX_PIP_TARGET", "/sandbox/pylib"))
 PIP_TARGET.mkdir(parents=True, exist_ok=True)
@@ -68,8 +80,11 @@ EXEC_TIMEOUT = int(os.environ.get("SANDBOX_TIMEOUT", "120"))
 INSTALL_TIMEOUT = int(os.environ.get("SANDBOX_INSTALL_TIMEOUT", "300"))
 MAX_ARTIFACT_BYTES = int(os.environ.get("SANDBOX_MAX_ARTIFACT_MB", "50")) * 1024 * 1024
 MAX_OUTPUT_LINES = int(os.environ.get("SANDBOX_MAX_OUTPUT_LINES", "4000"))
-# Runs older than this are purged (seconds).
-RUN_TTL = int(os.environ.get("SANDBOX_RUN_TTL", str(6 * 3600)))
+# Runs older than this are purged (seconds). Kept short: the backend
+# deletes a run right after fetching its artifacts, this is the fallback.
+RUN_TTL = int(os.environ.get("SANDBOX_RUN_TTL", str(30 * 60)))
+# Run directories created by this process (the root is not listable).
+_RUNS: dict[str, float] = {}
 
 
 class ExecRequest(BaseModel):
@@ -197,23 +212,33 @@ def detect_node_packages(code: str) -> list[str]:
 # Helpers
 # ----------------------------------------------------------------------
 def _new_run_dir() -> tuple[str, Path]:
+    import secrets
+    import time
+
     _purge_old_runs()
-    run_id = uuid.uuid4().hex[:12]
+    run_id = secrets.token_hex(16)
     d = SANDBOX_ROOT / run_id
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(parents=True, exist_ok=False, mode=0o700)
+    _RUNS[run_id] = time.time()
     return run_id, d
+
+
+def _remove_run(run_id: str) -> bool:
+    _RUNS.pop(run_id, None)
+    d = SANDBOX_ROOT / run_id
+    if d.is_dir():
+        shutil.rmtree(d, ignore_errors=True)
+        return True
+    return False
 
 
 def _purge_old_runs() -> None:
     import time
 
     now = time.time()
-    try:
-        for d in SANDBOX_ROOT.iterdir():
-            if d.is_dir() and now - d.stat().st_mtime > RUN_TTL:
-                shutil.rmtree(d, ignore_errors=True)
-    except OSError:
-        pass
+    for run_id, created in list(_RUNS.items()):
+        if now - created > RUN_TTL:
+            _remove_run(run_id)
 
 
 def _safe_name(name: str | None, default: str) -> str:
@@ -237,6 +262,7 @@ def _env_for(run_dir: Path) -> dict:
     env["PYTHONUNBUFFERED"] = "1"
     env["MPLBACKEND"] = "Agg"
     env["HOME"] = str(run_dir)
+    env["TMPDIR"] = str(run_dir)
     env["NODE_PATH"] = str(run_dir / "node_modules")
     env["npm_config_cache"] = str(NPM_CACHE)
     env["GOPATH"] = str(SANDBOX_ROOT / ".gopath")
@@ -430,9 +456,17 @@ async def languages():
     }
 
 
+@app.delete("/artifacts/{run_id}")
+async def delete_run(run_id: str):
+    """Remove a run directory once the backend has collected its files."""
+    if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        raise HTTPException(404, "Unknown run")
+    return {"deleted": _remove_run(run_id)}
+
+
 @app.get("/artifacts/{run_id}/{path:path}")
 async def download_artifact(run_id: str, path: str):
-    if not re.fullmatch(r"[0-9a-f]{12}", run_id):
+    if not re.fullmatch(r"[0-9a-f]{32}", run_id):
         raise HTTPException(404, "Unknown run")
     base = (SANDBOX_ROOT / run_id).resolve()
     target = (base / path).resolve()
@@ -498,7 +532,7 @@ async def exec_code(req: ExecRequest):
                 logger.exception("Run failed")
                 await emit("stderr", f"Sandbox error: {e}")
             finally:
-                await queue.put({"type": "exit", "code": exit_code})
+                await queue.put({"type": "exit", "code": exit_code, "run_id": run_id})
                 await queue.put(None)
 
         task = asyncio.create_task(worker())

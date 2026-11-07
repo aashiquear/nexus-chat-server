@@ -52,6 +52,7 @@ services:
     environment:
       - SANDBOX_TIMEOUT=120
       - SANDBOX_INSTALL_TIMEOUT=300
+      - SANDBOX_RUN_TTL=1800
     volumes:
       # Persist on-the-fly installed packages so repeat runs are instant
       - sandbox-pylib:/sandbox/pylib
