@@ -258,7 +258,16 @@ class MathSolverTool(BaseTool):
             point = parse(str(k.get("lower") or "0"))
             res = sp.series(e, var, point, int(k.get("order") or 6))
         elif op == "evaluate":
-            subs = {sp.Symbol(a): sp.sympify(b) for a, b in (k.get("substitutions") or {}).items()}
+            # Substitution keys must be plain symbols and values go through the
+            # same validated parser as expressions (sympify() would eval
+            # arbitrary Python).
+            subs = {}
+            for name, value in (k.get("substitutions") or {}).items():
+                if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,2}", str(name)):
+                    raise ValueError(f"invalid substitution variable '{name}'")
+                if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                    raise ValueError(f"substitution for '{name}' must be a number or expression string")
+                subs[sp.Symbol(str(name))] = sp.nsimplify(value) if isinstance(value, (int, float)) else parse(str(value))
             res = sp.N(e.subs(subs), 15)
         elif op == "latex":
             res = e
