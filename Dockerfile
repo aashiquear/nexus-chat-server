@@ -36,11 +36,8 @@ COPY config/ ./config/
 # Copy built frontend
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
-# Create data directories (per-user workspaces live under data/users/)
-RUN mkdir -p data/uploads data/vector_store data/files data/downloads data/conversations data/sandbox data/users
-
-# Pre-download the ONNX embedding model so RAG works offline at runtime
-RUN python -c "from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2; ONNXMiniLM_L6_V2()._download_model_if_not_exists()" || true
+# Create data directories
+RUN mkdir -p data/uploads data/vector_store data/files data/downloads data/conversations data/sandbox
 
 # Expose port
 EXPOSE 8000

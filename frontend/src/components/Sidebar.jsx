@@ -4,7 +4,8 @@ import {
   Wrench, Trash2, Paperclip, MessageSquarePlus,
   Database, Server, RefreshCw, ChevronDown, ChevronRight, Image,
   MessageCircle, BarChart3, Eye, Globe, Table, Plus, Store, BookOpen,
-  Brain, Cpu, Shield,
+  Brain, Cpu, Sparkles, Hand, Pin, Sigma, Ruler, Calendar, Coins, Type, Braces, FileSearch,
+  GraduationCap, GitCompare, ListChecks, Scale,
 } from 'lucide-react'
 import NexusLogoIcon from './NexusLogoIcon'
 
@@ -22,7 +23,21 @@ const ICON_MAP = {
   'file-generator': FileText,
   globe: Globe,
   table: Table,
+  sigma: Sigma,
+  ruler: Ruler,
+  calendar: Calendar,
+  coins: Coins,
+  type: Type,
+  braces: Braces,
+  'file-search': FileSearch,
+  'graduation-cap': GraduationCap,
+  'git-compare': GitCompare,
+  brain: Brain,
+  'list-checks': ListChecks,
+  scale: Scale,
 }
+
+const CATEGORY_ORDER = ['Utilities', 'Research', 'Files', 'Data', 'Create', 'Personal', 'Other']
 
 const PREVIEWABLE_EXT = new Set([
   '.csv', '.tsv', '.json', '.md', '.txt', '.html', '.htm', '.pdf', '.png', '.jpg', '.jpeg', '.gif',
@@ -152,8 +167,9 @@ export default function Sidebar({
   onNewChat,
   isOpen,
   onClose,
-  user,
-  onOpenAdmin,
+  toolMode,
+  onToolModeChange,
+  lastToolSelection,
 }) {
   const fileInputRef = React.useRef(null)
 
@@ -181,6 +197,21 @@ export default function Sidebar({
 
   const builtinTools = tools.filter((t) => t.source !== 'mcp')
   const activeBuiltinCount = builtinTools.filter((t) => selectedTools.includes(t.id)).length
+  const isAuto = toolMode !== 'manual'
+  const autoAttached = new Set([...(lastToolSelection?.core || []), ...((lastToolSelection?.matched || []).map((m) => m.id))])
+  const toolGroups = {}
+  builtinTools.forEach((t) => {
+    const cat = t.category || 'Other'
+    if (!toolGroups[cat]) toolGroups[cat] = []
+    toolGroups[cat].push(t)
+  })
+  const categories = Object.keys(toolGroups).sort((a, b) => {
+    const ia = CATEGORY_ORDER.indexOf(a)
+    const ib = CATEGORY_ORDER.indexOf(b)
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib)
+  })
+  const [openCats, setOpenCats] = useState({})
+  const catOpen = (c) => openCats[c] ?? (isAuto ? false : true)
   const mcpToolCount = tools.filter((t) => t.source === 'mcp' && selectedTools.includes(t.id)).length
   const activeFileCount = selectedFiles.length
 
@@ -292,38 +323,70 @@ export default function Sidebar({
           })()}
         </div>
 
-        {user?.is_admin && (
-          <button className="new-chat-btn" style={{ margin: '8px 16px 0' }} onClick={onOpenAdmin}>
-            <Shield size={14} />
-            Admin Panel
-          </button>
-        )}
-
         <div className="sidebar-body">
           {/* Built-in Tools */}
           <AccordionSection
             label="Tools"
-            count={activeBuiltinCount}
+            count={isAuto ? autoAttached.size + activeBuiltinCount : activeBuiltinCount}
             isOpen={openSection === 'tools'}
             onToggle={() => toggleSection('tools')}
           >
-            {builtinTools.map((tool) => {
-              const active = selectedTools.includes(tool.id)
-              const Icon = ICON_MAP[tool.icon] || Wrench
+            <div className="tool-mode-switch" role="radiogroup" aria-label="Tool selection mode">
+              <button className={isAuto ? 'active' : ''} onClick={() => onToolModeChange && onToolModeChange('auto')} title="The router attaches the tools relevant to each message; tick a tool to pin it">
+                <Sparkles size={12} /> Auto
+              </button>
+              <button className={!isAuto ? 'active' : ''} onClick={() => onToolModeChange && onToolModeChange('manual')} title="Only ticked tools are sent to the model">
+                <Hand size={12} /> Manual
+              </button>
+            </div>
+            <div className="tool-mode-hint">
+              {isAuto
+                ? `${builtinTools.length} tools available · relevant ones are attached per message${lastToolSelection?.matched?.length ? ` (last: ${lastToolSelection.matched.map((m) => m.name || m.id).slice(0, 4).join(', ')})` : ''}. Tick to pin.`
+                : 'Only ticked tools are sent to the model.'}
+            </div>
+            {categories.map((cat) => {
+              const list = toolGroups[cat]
+              const open = catOpen(cat)
+              const pinned = list.filter((t) => selectedTools.includes(t.id)).length
+              const attached = list.filter((t) => autoAttached.has(t.id)).length
               return (
-                <div
-                  key={tool.id}
-                  className="toggle-item"
-                  onClick={() => onToggleTool(tool.id)}
-                >
-                  <div className={`toggle-check ${active ? 'active' : ''}`}>
-                    {active && <Check size={11} color="#fff" strokeWidth={3} />}
-                  </div>
-                  <Icon size={15} className="toggle-icon" />
-                  <div className="toggle-text">
-                    <div className="toggle-label">{tool.name}</div>
-                    <ToolDescription text={tool.description} />
-                  </div>
+                <div key={cat} className="tool-category">
+                  <button className="tool-category-header" onClick={() => setOpenCats((p) => ({ ...p, [cat]: !open }))}>
+                    {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                    <span>{cat}</span>
+                    <span className="tool-category-count">
+                      {pinned > 0 && <Pin size={10} />} {pinned > 0 ? pinned : ''}{isAuto && attached > 0 ? ` · ${attached} active` : ''} {!isAuto && pinned === 0 ? '' : ''}
+                      <span className="tool-category-total">{list.length}</span>
+                    </span>
+                  </button>
+                  {open && list.map((tool) => {
+                    const active = selectedTools.includes(tool.id)
+                    const auto = isAuto && autoAttached.has(tool.id)
+                    const Icon = ICON_MAP[tool.icon] || Wrench
+                    return (
+                      <div
+                        key={tool.id}
+                        className={`toggle-item ${auto && !active ? 'auto-attached' : ''}`}
+                        onClick={() => onToggleTool(tool.id)}
+                        title={isAuto ? (active ? 'Pinned — always attached' : auto ? 'Auto-attached for the last message' : 'Click to pin') : ''}
+                      >
+                        <div className={`toggle-check ${active ? 'active' : ''} ${auto && !active ? 'auto' : ''}`}>
+                          {active && (isAuto ? <Pin size={10} color="#fff" strokeWidth={3} /> : <Check size={11} color="#fff" strokeWidth={3} />)}
+                          {!active && auto && <Sparkles size={9} />}
+                        </div>
+                        <Icon size={15} className="toggle-icon" />
+                        <div className="toggle-text">
+                          <div className="toggle-label">
+                            {tool.name}
+                            {tool.core && <span className="tool-badge core" title="Always attached in auto mode">core</span>}
+                            {tool.risk === 'high' && <span className="tool-badge warn" title="Modifies state or spends money">caution</span>}
+                            {tool.offline === false && <span className="tool-badge" title="Needs internet">online</span>}
+                          </div>
+                          <ToolDescription text={tool.description} />
+                        </div>
+                      </div>
+                    )
+                  })}
                 </div>
               )
             })}
@@ -386,8 +449,7 @@ export default function Sidebar({
                         {allSelected && <Check size={11} color="#fff" strokeWidth={3} />}
                         {someSelected && !allSelected && <span style={{ color: '#fff', fontSize: 10, fontWeight: 700 }}>–</span>}
                       </div>
-                      <Server size={13} style={{ opacity: 0.6 }} title={srv.scope === 'user' ? 'Your server' : 'Server-wide'} />
-                      {srv.scope === 'user' && <span className="mcp-badge">mine</span>}
+                      <Server size={13} style={{ opacity: 0.6 }} />
                       <span style={{ fontWeight: 500, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={`${srv.url || ''} (${srv.transport || ''})${srv.error ? `\n${srv.error}` : ''}`}>{srv.name}</span>
                       {srv.resources > 0 && (
                         <button
@@ -423,7 +485,7 @@ export default function Sidebar({
                           <RefreshCw size={12} />
                         </button>
                       )}
-                      {srv.removable && onRemoveMCP && (
+                      {srv.source !== 'config' && onRemoveMCP && (
                         <button
                           style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-tertiary)', padding: 2 }}
                           onClick={(e) => { e.stopPropagation(); onRemoveMCP(srv.id) }}

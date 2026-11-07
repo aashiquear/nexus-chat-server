@@ -5,20 +5,18 @@ import React, {
   useCallback,
   useMemo,
 } from "react";
-import { Menu, MessageCircle, Wifi, WifiOff, Scissors, BookOpen, X, Loader2, Plus, UserCircle, LogOut } from "lucide-react";
+import { Menu, MessageCircle, Wifi, WifiOff, Scissors, BookOpen, X, Loader2, Plus } from "lucide-react";
 import Sidebar, { ModelBadges } from "./components/Sidebar";
 import ChatMessage, { TypingIndicator } from "./components/ChatMessage";
 import ChatInput from "./components/ChatInput";
 import CanvasPanel from "./components/CanvasPanel";
 import SplashScreen from "./components/SplashScreen";
 import MCPMarketplacePanel from "./components/MCPMarketplacePanel";
-import SignInScreen from "./components/SignInScreen";
-import AccountPopup from "./components/AccountPopup";
-import AdminPanel from "./components/AdminPanel";
 import { useChat } from "./hooks/useChat";
 import {
   fetchModels,
   fetchTools,
+  fetchToolsWithPolicy,
   fetchFiles,
   uploadFile,
   deleteFile,
@@ -34,16 +32,11 @@ import {
   deleteConversation,
   fetchGenerationSettings,
   runCode,
-  fetchAuthMe,
-  logout as apiLogout,
-  fetchUserSettings,
-  saveUserSettings,
 } from "./hooks/api";
 
 // ---------------------------------------------------------------------
-// Generation settings persistence — server edition: stored per user on
-// the server (data/users/<u>/settings.json) so they follow the account
-// across browsers. localStorage is only a warm cache for first paint.
+// Generation settings persistence (per browser). The server edition
+// swaps these two helpers for per-user storage.
 // ---------------------------------------------------------------------
 const GEN_STORAGE_KEY = "nexus:generation";
 
@@ -55,15 +48,10 @@ export function loadStoredGeneration() {
   }
 }
 
-let _saveTimer = null;
 export function storeGeneration(value) {
   try {
     localStorage.setItem(GEN_STORAGE_KEY, JSON.stringify(value));
   } catch {}
-  clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(() => {
-    saveUserSettings({ generation: value }).catch((e) => console.error("Settings save failed:", e));
-  }, 400);
 }
 
 // Small modal listing an MCP server's resources with an "add to RAG" action.
@@ -124,12 +112,6 @@ function MCPResourcesDialog({ server, onClose, onIngested }) {
 }
 
 export default function App() {
-  // Auth state (server edition)
-  const [user, setUser] = useState(null);
-  const [authChecked, setAuthChecked] = useState(false);
-  const [showAccount, setShowAccount] = useState(false);
-  const [showAdmin, setShowAdmin] = useState(false);
-
   // Splash / title screen - dismissed after user clicks "Start Chat"
   const [showSplash, setShowSplash] = useState(() => {
     try {
@@ -153,6 +135,15 @@ export default function App() {
   const [mcpServers, setMcpServers] = useState([]);
   const [selectedModel, setSelectedModel] = useState("");
   const [selectedTools, setSelectedTools] = useState([]);
+  // Tool selection mode: "auto" (discovery router + pins) or "manual".
+  const [toolMode, setToolMode] = useState(() => {
+    try {
+      return localStorage.getItem("nexus:toolMode") || "";
+    } catch {
+      return "";
+    }
+  });
+  const [lastToolSelection, setLastToolSelection] = useState(null);
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [messages, setMessages] = useState([]);
   const [inputValue, setInputValue] = useState("");
@@ -197,39 +188,11 @@ export default function App() {
   const userScrolledRef = useRef(false);
   const { connect, sendMessage, isConnected, isStreaming } = useChat();
 
-  // Validate the stored session, then connect + load data.
+  // Initialize
   useEffect(() => {
-    const init = async () => {
-      try {
-        const me = await fetchAuthMe();
-        if (me) {
-          setUser(me);
-          connect();
-          loadData();
-        }
-      } catch (err) {
-        console.error("Auth check failed:", err);
-      } finally {
-        setAuthChecked(true);
-      }
-    };
-    init();
-  }, [connect]);
-
-  const handleSignIn = (u) => {
-    setUser(u);
     connect();
     loadData();
-  };
-
-  const handleLogout = async () => {
-    await apiLogout();
-    try {
-      sessionStorage.removeItem("nexus:splashDismissed");
-      localStorage.removeItem(GEN_STORAGE_KEY);
-    } catch {}
-    window.location.reload();
-  };
+  }, [connect]);
 
   const refreshModels = useCallback(async () => {
     const m = await fetchModels();
@@ -239,30 +202,22 @@ export default function App() {
 
   const loadData = async () => {
     try {
-      const [m, t, f, mcp, convos, gen] = await Promise.all([
+      const [m, tp, f, mcp, convos, gen] = await Promise.all([
         fetchModels(),
-        fetchTools(),
+        fetchToolsWithPolicy(),
         fetchFiles(),
         fetchMCPServers(),
         fetchConversations(),
         fetchGenerationSettings(),
       ]);
+      const t = tp.tools;
       setModels(m);
       setTools(t);
+      setToolMode((prev) => prev || tp.selection?.mode || "auto");
       setFiles(f);
       setMcpServers(mcp);
       setConversations(convos);
-      if (gen) {
-        setGenDefaults(gen);
-        // Server-stored per-user overrides win over the browser cache.
-        const stored = gen.user_overrides && Object.keys(gen.user_overrides).length ? gen.user_overrides : null;
-        if (stored) {
-          setGenOverrides(stored);
-          try {
-            localStorage.setItem(GEN_STORAGE_KEY, JSON.stringify(stored));
-          } catch {}
-        }
-      }
+      if (gen) setGenDefaults(gen);
 
       // Default-select a model that is both provider-configured *and*
       // confirmed on the remote (when probe info is available).
@@ -274,9 +229,11 @@ export default function App() {
       const preferred = m.find(isUsable) || m.find((x) => x.available);
       if (preferred) setSelectedModel((prev) => prev || preferred.id);
 
-      // Sensible default tool set on first load: everything built in.
+      // Manual mode starts with every built-in tool ticked; auto mode
+      // starts with no pins (the router picks per message).
+      const mode = tp.selection?.mode || "auto";
       setSelectedTools((prev) =>
-        prev.length ? prev : t.filter((x) => x.source !== "mcp").map((x) => x.id),
+        prev.length || mode === "auto" ? prev : t.filter((x) => x.source !== "mcp").map((x) => x.id),
       );
     } catch (err) {
       console.error("Failed to load data:", err);
@@ -362,6 +319,19 @@ export default function App() {
       chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages, isTyping]);
+
+  const handleToolModeChange = useCallback(
+    (mode) => {
+      setToolMode(mode);
+      try {
+        localStorage.setItem("nexus:toolMode", mode);
+      } catch {}
+      if (mode === "manual" && selectedTools.length === 0) {
+        setSelectedTools(tools.filter((x) => x.source !== "mcp").map((x) => x.id));
+      }
+    },
+    [selectedTools.length, tools],
+  );
 
   // Toggle helpers
   const toggleTool = (id) => {
@@ -705,9 +675,19 @@ export default function App() {
         files: selectedFiles,
         generation,
         compaction_state: compactionRef.current || undefined,
+        tool_mode: toolMode || undefined,
       },
       async (event) => {
         switch (event.type) {
+          case "tools_selected":
+            setLastToolSelection(event);
+            upsertAssistant((m) => ({
+              toolSelection: event.mode === "discover" && m.toolSelection
+                ? { ...m.toolSelection, matched: [...(m.toolSelection.matched || []), ...(event.matched || [])], discovered: true }
+                : event,
+            }));
+            break;
+
           case "status":
             if (event.stage) setLlmStatus({ stage: event.stage });
             break;
@@ -845,7 +825,7 @@ export default function App() {
         }
       },
     );
-  }, [inputValue, pendingImages, messages, selectedModel, selectedTools, selectedFiles, sendMessage, activeConversationId, persistConversation, generation]);
+  }, [inputValue, pendingImages, messages, selectedModel, selectedTools, selectedFiles, sendMessage, activeConversationId, persistConversation, generation, toolMode]);
 
   // New chat
   const handleNewChat = () => {
@@ -881,23 +861,9 @@ export default function App() {
       }
     : null;
 
-  if (!authChecked) {
-    return (
-      <div className="splash-screen">
-        <div className="splash-content">
-          <div style={{ fontSize: 14, color: "var(--text-secondary)" }}>Loading…</div>
-        </div>
-      </div>
-    );
-  }
-
-  if (!user) {
-    return <SignInScreen onSignIn={handleSignIn} />;
-  }
-
   return (
     <div className="app-layout">
-      {showSplash && <SplashScreen onStart={dismissSplash} onLogout={handleLogout} user={user} />}
+      {showSplash && <SplashScreen onStart={dismissSplash} />}
       <Sidebar
         models={models}
         selectedModel={selectedModel}
@@ -924,14 +890,14 @@ export default function App() {
         onNewChat={handleNewChat}
         isOpen={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
-        user={user}
-        onOpenAdmin={() => setShowAdmin(true)}
+        toolMode={toolMode}
+        onToolModeChange={handleToolModeChange}
+        lastToolSelection={lastToolSelection}
       />
 
       {showMarketplace && (
-        <MCPMarketplacePanel onClose={() => setShowMarketplace(false)} onAdded={refreshToolsAndMcp} user={user} />
+        <MCPMarketplacePanel onClose={() => setShowMarketplace(false)} onAdded={refreshToolsAndMcp} />
       )}
-      {showAdmin && <AdminPanel onClose={() => setShowAdmin(false)} currentUser={user} />}
       {resourcesServer && (
         <MCPResourcesDialog
           server={resourcesServer}
@@ -960,21 +926,11 @@ export default function App() {
               </span>
             )}
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, color: isConnected ? "var(--success)" : "var(--error)", fontSize: 12 }}>
-              {isConnected ? <Wifi size={14} /> : <WifiOff size={14} />}
-              {isConnected ? "Connected" : "Disconnected"}
-            </div>
-            <button className="sidebar-toggle" onClick={() => setShowAccount((v) => !v)} title={`Account: ${user.username}`} style={{ display: "flex" }}>
-              <UserCircle size={18} />
-            </button>
-            <button className="sidebar-toggle" onClick={handleLogout} title="Log out" style={{ display: "flex" }}>
-              <LogOut size={18} />
-            </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, color: isConnected ? "var(--success)" : "var(--error)", fontSize: 12 }}>
+            {isConnected ? <Wifi size={14} /> : <WifiOff size={14} />}
+            {isConnected ? "Connected" : "Disconnected"}
           </div>
         </div>
-
-        {showAccount && <AccountPopup user={user} onClose={() => setShowAccount(false)} onLogout={handleLogout} />}
 
         {/* Chat Area */}
         <div className="chat-area" ref={chatAreaRef}>

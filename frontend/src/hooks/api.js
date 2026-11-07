@@ -5,31 +5,11 @@ const BASE = ''
 // build sends nothing, the multi-user server edition injects a bearer
 // token here (and nowhere else), which keeps the two code bases aligned.
 // ---------------------------------------------------------------------
-export function getToken() {
-  try {
-    return localStorage.getItem('nexus_token') || ''
-  } catch {
-    return ''
-  }
-}
-
 export function authHeaders() {
-  const token = getToken()
-  return token ? { Authorization: `Bearer ${token}` } : {}
+  return {}
 }
 
-export function clearSession() {
-  try {
-    localStorage.removeItem('nexus_token')
-    localStorage.removeItem('nexus_user')
-  } catch {}
-}
-
-export function onUnauthorized(_res) {
-  if (!getToken()) return
-  clearSession()
-  window.location.reload()
-}
+export function onUnauthorized(_res) {}
 
 export async function apiFetch(url, options = {}) {
   const headers = { ...(options.headers || {}), ...authHeaders() }
@@ -74,6 +54,19 @@ export async function fetchTools() {
   const res = await apiFetch(`/api/tools`)
   const data = await res.json()
   return data.tools || []
+}
+
+// Tools plus the server's tool-selection policy ({mode, max_tools, …}).
+export async function fetchToolsWithPolicy() {
+  const res = await apiFetch(`/api/tools`)
+  const data = await res.json()
+  return { tools: data.tools || [], selection: data.selection || { mode: 'auto' } }
+}
+
+export async function discoverTools(query, limit = 8) {
+  const res = await apiFetch(`/api/tools/discover?q=${encodeURIComponent(query)}&limit=${limit}`)
+  if (!res.ok) return []
+  return (await res.json()).matches || []
 }
 
 export async function fetchGenerationSettings() {
@@ -251,11 +244,11 @@ export async function searchMCPRegistry(query, cursor) {
   return jsonOrThrow(res, 'Registry search failed')
 }
 
-export async function importMCPConfig(configText, scope) {
+export async function importMCPConfig(configText) {
   const res = await apiFetch(`/api/mcp/import`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ config: configText, scope }),
+    body: JSON.stringify({ config: configText }),
   })
   return jsonOrThrow(res, 'Import failed')
 }
@@ -301,98 +294,4 @@ export async function saveConversation({ id, messages, model, token_usage, compa
 export async function deleteConversation(id) {
   const res = await apiFetch(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' })
   return res.json()
-}
-
-// ---- Auth (server edition) ----
-
-export async function login(username, password) {
-  const res = await apiFetch(`/api/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
-    credentials: 'same-origin',
-  })
-  const data = await jsonOrThrow(res, 'Login failed')
-  localStorage.setItem('nexus_token', data.token)
-  localStorage.setItem('nexus_user', JSON.stringify(data.user))
-  return data.user
-}
-
-export async function logout() {
-  try {
-    await apiFetch(`/api/auth/logout`, { method: 'POST' })
-  } catch (_e) {}
-  clearSession()
-}
-
-export async function fetchAuthMe() {
-  if (!getToken()) return null
-  const res = await apiFetch(`/api/auth/me`)
-  if (!res.ok) return null
-  return res.json()
-}
-
-export async function changePassword(current_password, new_password) {
-  const res = await apiFetch(`/api/auth/change-password`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ current_password, new_password }),
-  })
-  return jsonOrThrow(res, 'Failed to change password')
-}
-
-export async function deleteOwnAccount(password) {
-  const res = await apiFetch(`/api/auth/account`, {
-    method: 'DELETE',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ password }),
-  })
-  return jsonOrThrow(res, 'Failed to delete account')
-}
-
-// ---- User settings (generation defaults persisted per user) ----
-
-export async function fetchUserSettings() {
-  const res = await apiFetch(`/api/settings/user`)
-  if (!res.ok) return {}
-  return (await res.json()).settings || {}
-}
-
-export async function saveUserSettings(partial) {
-  const res = await apiFetch(`/api/settings/user`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(partial),
-  })
-  return jsonOrThrow(res, 'Failed to save settings')
-}
-
-// ---- Admin ----
-
-export async function adminListUsers() {
-  const res = await apiFetch(`/api/admin/users`)
-  return (await jsonOrThrow(res, 'Failed to load users')).users || []
-}
-
-export async function adminCreateUser(username, password, is_admin) {
-  const res = await apiFetch(`/api/admin/users`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password, is_admin }),
-  })
-  return jsonOrThrow(res, 'Failed to create user')
-}
-
-export async function adminDeleteUser(username) {
-  const res = await apiFetch(`/api/admin/users/${encodeURIComponent(username)}`, { method: 'DELETE' })
-  return jsonOrThrow(res, 'Failed to delete user')
-}
-
-export async function adminResetPassword(username, new_password) {
-  const res = await apiFetch(`/api/admin/users/${encodeURIComponent(username)}/password`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ new_password }),
-  })
-  return jsonOrThrow(res, 'Failed to reset password')
 }
