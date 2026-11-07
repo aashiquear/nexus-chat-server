@@ -25,6 +25,49 @@ logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
+# Filter expression validation (pandas DataFrame.query is eval-based)
+# ----------------------------------------------------------------------
+_FILTER_TOKEN_RE = re.compile(
+    r"\s*(?:(`[^`]*`)|(\"(?:[^\"\\\\]|\\\\.)*\"|'(?:[^'\\\\]|\\\\.)*')|(\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+)"
+    r"|([A-Za-z_][A-Za-z0-9_]*)|(==|!=|<=|>=|<|>|&|\||~|[-+*/%()\[\],])|(.))"
+)
+_FILTER_KEYWORDS = {"and", "or", "not", "in", "True", "False", "None"}
+
+
+def validate_filter_expression(expr: str, columns: list[str]) -> None:
+    """Allow only column references, literals, comparison/boolean operators
+    and arithmetic in a pandas ``query`` filter. Rejects ``@`` scope
+    references, attribute access, function calls on names and anything that
+    is not a known column, so the eval-based engine cannot reach Python."""
+    if len(expr) > 1000:
+        raise ValueError("filter too long")
+    if "@" in expr or "__" in expr:
+        raise ValueError("'@' variables and dunder names are not allowed in filters")
+    col_set = set(columns)
+    prev_ident = None
+    for m in _FILTER_TOKEN_RE.finditer(expr):
+        backtick, string, num, ident, op, bad = m.groups()
+        if bad is not None and bad.strip():
+            raise ValueError(f"character {bad!r} is not allowed in filters")
+        if backtick is not None and backtick[1:-1] not in col_set:
+            raise ValueError(f"unknown column {backtick}")
+        if ident is not None:
+            if ident in _FILTER_KEYWORDS:
+                pass
+            elif ident in col_set:
+                pass
+            else:
+                raise ValueError(f"unknown column or name '{ident}' (available: {', '.join(columns[:30])})")
+            if prev_ident is not None and op is None:
+                pass
+        if op == "(" and prev_ident is not None and prev_ident not in _FILTER_KEYWORDS:
+            raise ValueError("function calls are not allowed in filters")
+        prev_ident = ident if ident is not None else None
+    if re.search(r"[A-Za-z_`\])]\s*\.", expr):
+        raise ValueError("attribute access is not allowed in filters")
+
+
+# ----------------------------------------------------------------------
 # CSV viewer
 # ----------------------------------------------------------------------
 @register_tool("csv_viewer")
@@ -125,7 +168,9 @@ class CSVViewerTool(BaseTool):
         query = kwargs.get("query")
         if query:
             try:
-                df = df.query(query)
+                validate_filter_expression(query, [str(c) for c in df.columns])
+                # No access to the calling scope: only column names and literals.
+                df = df.query(query, local_dict={}, global_dict={})
             except Exception as e:
                 return json.dumps({"error": f"Invalid query '{query}': {e}"})
         filtered_rows = int(len(df))
@@ -444,23 +489,29 @@ class DataSQLTool(BaseTool):
     def _run(self, k: dict) -> str:
         import duckdb
 
-        con = duckdb.connect(database=":memory:")
+        import pandas as pd
+
+        # External access is disabled at connection time (it cannot be
+        # changed afterwards and the configuration is locked), so the
+        # query cannot read or write files, attach databases or install
+        # extensions. Uploads are loaded with pandas and registered as
+        # in-memory tables instead of DuckDB file readers.
+        con = duckdb.connect(database=":memory:", config={"enable_external_access": False, "lock_configuration": True})
         tables = self._tables()
         for name, p in tables.items():
             ext = p.suffix.lower()
-            q = str(p).replace("'", "''")
             try:
                 if ext in (".csv", ".tsv"):
-                    con.execute(f"CREATE VIEW \"{name}\" AS SELECT * FROM read_csv_auto('{q}', header=true)")
+                    df = pd.read_csv(p, sep="\t" if ext == ".tsv" else None, engine="python", on_bad_lines="skip")
                 elif ext == ".parquet":
-                    con.execute(f"CREATE VIEW \"{name}\" AS SELECT * FROM read_parquet('{q}')")
+                    df = pd.read_parquet(p)
                 elif ext in (".json", ".jsonl"):
-                    con.execute(f"CREATE VIEW \"{name}\" AS SELECT * FROM read_json_auto('{q}')")
+                    df = pd.read_json(p, lines=(ext == ".jsonl"))
                 elif ext in (".xlsx", ".xls"):
-                    import pandas as pd
-
                     df = pd.read_excel(p)
-                    con.register(name, df)
+                else:
+                    continue
+                con.register(name, df)
             except Exception as e:  # unreadable file → skip but report
                 logger.debug("data_sql: skip %s: %s", p.name, e)
         if (k.get("operation") or "query") == "tables":
@@ -473,11 +524,15 @@ class DataSQLTool(BaseTool):
                 except Exception as e:
                     info.append({"table": name, "file": p.name, "error": str(e)})
             return json.dumps({"tables": info, "hint": "query with: SELECT … FROM <table>"})
-        sql = (k.get("sql") or "").strip().rstrip(";")
+        sql = (k.get("sql") or "").strip().rstrip(";").strip()
         if not sql:
             return json.dumps({"error": "sql is required"})
-        if re.match(r"^\s*(insert|update|delete|drop|alter|create|copy|attach|install|load|pragma|export|import)\b", sql, re.I):
-            return json.dumps({"error": "only SELECT queries are allowed"})
+        if ";" in sql:
+            return json.dumps({"error": "only a single statement is allowed"})
+        if not re.match(r"^\s*(select|with|describe|show|explain|summarize|from|pivot|unpivot)\b", sql, re.I):
+            return json.dumps({"error": "only read-only SELECT/WITH queries are allowed"})
+        if re.search(r"\b(insert|update|delete|drop|alter|create|copy|attach|detach|install|load|pragma|export|import|call|set|reset|checkpoint|vacuum)\b", sql, re.I):
+            return json.dumps({"error": "statement contains a keyword that is not allowed in read-only queries"})
         max_rows = max(1, min(int(k.get("max_rows") or 200), 500))
         cur = con.execute(sql)
         cols = [d[0] for d in cur.description]

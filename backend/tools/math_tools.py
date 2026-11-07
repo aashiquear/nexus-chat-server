@@ -133,28 +133,81 @@ class MathSolverTool(BaseTool):
         except Exception as e:
             return json.dumps({"error": str(e)})
 
+    # SymPy's parse_expr ultimately eval()s Python, so untrusted input is
+    # validated against a restricted grammar first: only numbers, operators,
+    # brackets, commas, '=' and identifiers that are either allow-listed
+    # SymPy functions/constants or short symbol names. No attribute access,
+    # strings, keywords or dunder names ever reach the parser.
+    ALLOWED_NAMES = {
+        "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+        "exp", "log", "ln", "sqrt", "cbrt", "root", "Abs", "abs", "sign", "floor", "ceiling", "ceil", "factorial",
+        "gamma", "binomial", "Rational", "Integer", "Float", "pi", "E", "I", "oo", "zoo", "nan", "Eq", "Ne",
+        "Lt", "Le", "Gt", "Ge", "And", "Or", "Not", "Max", "Min", "Sum", "Product", "Piecewise", "Derivative",
+        "Integral", "Limit", "Symbol", "symbols", "diff", "integrate", "limit", "simplify", "expand", "factor",
+        "sec", "csc", "cot", "erf", "re", "im", "conjugate", "Matrix", "det", "inf", "infinity",
+    }
+    _TOKEN_RE = re.compile(r"\s*(?:(\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+)|([A-Za-z_][A-Za-z0-9_]*)|(\*\*|<=|>=|==|!=|[-+*/^(),=<>\[\]{}'!])|(.))")
+    _MAX_EXPR_LEN = 2000
+
+    @classmethod
+    def validate_expression(cls, text: str) -> None:
+        if len(text) > cls._MAX_EXPR_LEN:
+            raise ValueError("expression too long")
+        if "__" in text or re.search(r"[A-Za-z_)\]]\s*\.", text):
+            raise ValueError("attribute access is not allowed in expressions")
+        pos = 0
+        for m in cls._TOKEN_RE.finditer(text):
+            num, ident, op, bad = m.groups()
+            if bad is not None and bad.strip():
+                raise ValueError(f"character {bad!r} is not allowed in expressions")
+            if ident is not None:
+                if ident in ("lambda", "import", "exec", "eval", "open", "def", "class", "global", "nonlocal", "yield", "return", "del"):
+                    raise ValueError(f"'{ident}' is not allowed in expressions")
+                if ident not in cls.ALLOWED_NAMES and len(ident) > 3:
+                    raise ValueError(
+                        f"unknown name '{ident}'. Use single-letter symbols (x, y, t, a1…) and SymPy functions "
+                        f"like sin, cos, exp, log, sqrt, pi, E."
+                    )
+            pos = m.end()
+        if pos < len(text.rstrip()):
+            raise ValueError("could not tokenise expression")
+
     def _run(self, k: dict) -> str:
         import sympy as sp
         from sympy.parsing.sympy_parser import (convert_xor, implicit_multiplication_application, parse_expr,
                                                 standard_transformations)
 
         tr = standard_transformations + (implicit_multiplication_application, convert_xor)
+        # Explicit, minimal namespace: only the allow-listed SymPy names.
+        global_dict = {name: getattr(sp, name) for name in self.ALLOWED_NAMES if hasattr(sp, name)}
+        global_dict.update({"ln": sp.log, "ceil": sp.ceiling, "abs": sp.Abs, "inf": sp.oo, "infinity": sp.oo})
         local = {}
 
         def parse(text: str):
             text = text.strip()
+            self.validate_expression(text)
             if "=" in text and "==" not in text and "<=" not in text and ">=" not in text and not text.startswith("Eq("):
                 lhs, rhs = text.split("=", 1)
-                return sp.Eq(parse_expr(lhs, transformations=tr, local_dict=local), parse_expr(rhs, transformations=tr, local_dict=local))
-            return parse_expr(text, transformations=tr, local_dict=local)
+                return sp.Eq(parse_expr(lhs, transformations=tr, local_dict=local, global_dict=dict(global_dict)),
+                             parse_expr(rhs, transformations=tr, local_dict=local, global_dict=dict(global_dict)))
+            return parse_expr(text, transformations=tr, local_dict=local, global_dict=dict(global_dict))
 
         op = k["operation"]
         expr_text = k["expression"]
-        var = sp.Symbol(k.get("variable") or "x")
+        var_name = k.get("variable") or "x"
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,2}", var_name):
+            raise ValueError("variable must be a short symbol name like x, y, t")
+        var = sp.Symbol(var_name)
         out: dict = {"operation": op, "input": expr_text}
 
         if op == "matrix":
-            M = sp.Matrix(json.loads(expr_text)) if expr_text.strip().startswith("[") else sp.Matrix(sp.sympify(expr_text))
+            raw = expr_text.strip()
+            if not raw.startswith("["):
+                raise ValueError("matrix must be given as a JSON-style list of rows, e.g. [[1,2],[3,4]]")
+            rows = json.loads(raw)
+            if not isinstance(rows, list) or not all(isinstance(r, list) for r in rows):
+                raise ValueError("matrix must be a list of rows")
+            M = sp.Matrix([[parse(str(c)) if isinstance(c, str) else sp.nsimplify(c) for c in r] for r in rows])
             mop = k.get("matrix_op") or "det"
             res = {
                 "det": lambda: M.det(), "inverse": lambda: M.inv(), "eigenvalues": lambda: M.eigenvals(),
@@ -314,9 +367,10 @@ class StatisticsTool(BaseTool):
             if not p.exists():
                 raise FileNotFoundError(f"{k['filename']} not uploaded")
             df = pd.read_excel(p) if p.suffix.lower() in (".xlsx", ".xls") else pd.read_csv(p, sep=None, engine="python")
-            if k.get("column") and k.get("column2"):
+            if k.get("column") and k.get("column2") and k.get("analysis") in ("correlation", "regression"):
                 # Paired analyses: drop a row when *either* value is missing
-                # so observations stay aligned.
+                # so observations stay aligned. Independent-sample tests
+                # (ttest) keep each column's own non-missing values.
                 pair = pd.DataFrame({
                     "a": pd.to_numeric(df[k["column"]], errors="coerce"),
                     "b": pd.to_numeric(df[k["column2"]], errors="coerce"),
