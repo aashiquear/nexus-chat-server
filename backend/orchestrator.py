@@ -1004,10 +1004,20 @@ class ChatOrchestrator:
                 yield {"type": "tool_call", "name": call["name"], "arguments": args}
 
                 result = json.dumps({"error": "tool produced no result"})
-                async for event in self._stream_tool(call["name"], args):
-                    yield event
-                    if event["type"] == "tool_result":
-                        result = event["result"]
+                if call["name"] not in attached:
+                    # Authorise at execution time, not only when advertising
+                    # schemas: a model may name a tool that was never attached
+                    # (e.g. another user's MCP server). Refuse it.
+                    result = json.dumps({
+                        "error": f"Tool '{call['name']}' is not available in this conversation. "
+                                 "Use discover_tools to find an appropriate tool.",
+                    })
+                    yield {"type": "tool_result", "name": call["name"], "result": result}
+                else:
+                    async for event in self._stream_tool(call["name"], args):
+                        yield event
+                        if event["type"] == "tool_result":
+                            result = event["result"]
 
                 try:
                     parsed_result = json.loads(result)
