@@ -550,6 +550,7 @@ async def interact(ws: WebSocket):
 
         timeout = min(max(5, int(payload.get("timeout") or EXEC_TIMEOUT)), 3600)
         run_id, run_dir = _new_run_dir()
+        _write_input_files(run_dir, payload.get("files"))
         env = _env_for(run_dir)
 
         async def emit(kind, data):
@@ -626,7 +627,8 @@ async def interact(ws: WebSocket):
         await asyncio.gather(*pump_tasks, return_exceptions=True)
         stdin_task.cancel()
 
-        files = _list_artifacts(run_dir, set(), {_main})
+        inputs = {_safe_name(n, "input.bin") for n in (payload.get("files") or {})}
+        files = _list_artifacts(run_dir, inputs, {_main})
         if files:
             await ws.send_text(json.dumps({"type": "artifacts", "run_id": run_id, "files": files}))
         await ws.send_text(json.dumps({"type": "exit", "code": proc.returncode or 0}))

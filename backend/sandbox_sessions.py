@@ -27,14 +27,19 @@ class SandboxSession:
     packages: list[str] = field(default_factory=list)
     timeout: int = 120
     owner: str | None = None
+    # Uploaded input files to materialise in the run directory: {name: base64}
+    files: dict = field(default_factory=dict)
 
     def initial_message(self) -> dict:
-        return {
+        msg = {
             "code": self.code,
             "language": self.language,
             "packages": self.packages,
             "timeout": self.timeout,
         }
+        if self.files:
+            msg["files"] = self.files
+        return msg
 
 
 _SESSIONS: Dict[str, SandboxSession] = {}
@@ -56,6 +61,7 @@ def register_session(
     packages: list[str] | None = None,
     timeout: int = 120,
     owner: str | None = None,
+    files: dict | None = None,
 ) -> None:
     _purge_expired()
     _SESSIONS[session_id] = SandboxSession(
@@ -66,6 +72,7 @@ def register_session(
         packages=list(packages or []),
         timeout=timeout,
         owner=owner,
+        files=dict(files or {}),
     )
 
 

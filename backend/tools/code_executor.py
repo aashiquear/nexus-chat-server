@@ -210,6 +210,7 @@ class CodeExecutorTool(BaseTool):
                 self._last_session_id, code, self.sandbox_url,
                 language=language, packages=packages, timeout=timeout,
                 owner=self.ctx.username,
+                files=self._collect_input_files(kwargs.get("input_files")),
             )
             yield f"[interactive session ready: {self._last_session_id}]"
             yield "Open the canvas terminal to send input and view live output."

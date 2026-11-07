@@ -40,7 +40,11 @@ def safe_eval(expr: str):
     # Thousands separators (1,234,567) are dropped only when the comma sits
     # between digit groups of exactly three; argument/list separators stay.
     expr = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", expr)
-    expr = re.sub(r"(\d+(?:\.\d+)?)\s*%", r"(\1/100)", expr)  # 15% → (15/100)
+    # Postfix percentage (15%, 15% * 80, (15%)) vs binary modulo (10 % 3):
+    # '%' is a percentage only when it is followed by the end of the
+    # expression, a closing bracket/comma, or a * / ^ operator; when a
+    # number, '(' or a sign follows it is Python's modulo operator.
+    expr = re.sub(r"(\d+(?:\.\d+)?)\s*%(?=\s*(?:$|[)\],*/^]|\*\*))", r"(\1/100)", expr)
     tree = ast.parse(expr, mode="eval")
 
     def ev(node):
@@ -72,8 +76,8 @@ def safe_eval(expr: str):
 class CalculatorTool(BaseTool):
     name = "calculator"
     description = (
-        "Evaluate a mathematical expression exactly (safe parser, no code execution). Supports + - * / // % ** ^, "
-        "parentheses, percentages (15% of 80 → 80*15%), constants pi/e, and functions sqrt, log, ln, exp, sin/cos/tan, "
+        "Evaluate a mathematical expression exactly (safe parser, no code execution). Supports + - * / // ** ^, modulo "
+        "(10 % 3), parentheses, postfix percentages (15% * 80, 80 * 15%), constants pi/e, and functions sqrt, log, ln, exp, sin/cos/tan, "
         "round, floor, ceil, factorial, gcd, min/max/sum/avg. Use it for any arithmetic where accuracy matters."
     )
     parameters = {

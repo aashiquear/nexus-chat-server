@@ -362,20 +362,16 @@ class WebBrowserTool(BaseTool):
         parsed = urlparse(url)
         if not parsed.netloc:
             return json.dumps({"error": f"Invalid URL: {url}"})
-        if self.config.get("block_private_hosts", True) and self._is_private_host(parsed.hostname or ""):
-            return json.dumps({"error": "Refusing to open private/internal network addresses."})
+        block_private = self.config.get("block_private_hosts", True)
 
         offset = max(0, int(kwargs.get("offset") or 0))
         max_chars = max(500, min(int(kwargs.get("max_chars") or 12000), 40000))
         timeout = float(self.config.get("timeout", 25))
 
         try:
-            async with httpx.AsyncClient(
-                follow_redirects=True,
-                timeout=timeout,
-                headers={"User-Agent": self.USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/json,text/plain,application/pdf;q=0.9,*/*;q=0.8"},
-            ) as client:
-                resp = await client.get(url)
+            resp = await self._fetch_with_checks(httpx, url, timeout, block_private)
+        except PermissionError as e:
+            return json.dumps({"error": str(e), "url": url})
         except httpx.HTTPError as e:
             return json.dumps({"error": f"Request failed: {e}", "url": url})
 
@@ -416,6 +412,47 @@ class WebBrowserTool(BaseTool):
         if kwargs.get("include_links", True):
             result["links"] = links[:40]
         return json.dumps(result)
+
+    MAX_REDIRECTS = 5
+
+    async def _fetch_with_checks(self, httpx, url: str, timeout: float, block_private: bool):
+        """GET ``url`` following redirects manually so every hop is checked
+        against the private-network policy, with hostnames *resolved* to
+        addresses before connecting (a public name pointing at 10.x or
+        127.0.0.1 is rejected just like a literal address)."""
+        headers = {"User-Agent": self.USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/json,text/plain,application/pdf;q=0.9,*/*;q=0.8"}
+        current = url
+        async with httpx.AsyncClient(follow_redirects=False, timeout=timeout, headers=headers) as client:
+            for _hop in range(self.MAX_REDIRECTS + 1):
+                parsed = urlparse(current)
+                if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                    raise PermissionError(f"Only http(s) URLs are allowed (got {current[:80]})")
+                if block_private:
+                    await self._assert_public_host(parsed.hostname)
+                resp = await client.get(current)
+                if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("location"):
+                    from urllib.parse import urljoin
+
+                    current = urljoin(current, resp.headers["location"])
+                    continue
+                return resp
+        raise PermissionError("Too many redirects")
+
+    async def _assert_public_host(self, host: str) -> None:
+        import asyncio
+        import ipaddress
+        import socket
+
+        if self._is_private_host(host):
+            raise PermissionError("Refusing to open private/internal network addresses.")
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        except socket.gaierror as e:
+            raise PermissionError(f"Could not resolve host {host}: {e}")
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+                raise PermissionError(f"Refusing to open {host}: it resolves to a private/internal address.")
 
     @staticmethod
     def _pdf_text(raw: bytes) -> str:
