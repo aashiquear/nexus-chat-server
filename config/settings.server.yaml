@@ -10,14 +10,33 @@ app:
 auth:
   jwt_secret: "${NEXUS_JWT_SECRET:-change-me-in-production}"
   token_expire_days: 7
+  # Per-user upload quota in MB (0 = unlimited). Counts everything under
+  # data/users/<user>/ (uploads, generated files, plots, conversations).
+  user_quota_mb: 0
+  # Allow non-admin users to add their own MCP servers (stored in their
+  # workspace). Admins can always add server-wide ones.
+  users_can_add_mcp: true
+  # Allow non-admin users to run stdio (command) MCP servers. These spawn
+  # processes inside the container, so leave this off unless you trust
+  # every account. Remote (URL) servers are always allowed.
+  users_can_run_stdio_mcp: false
 
 providers:
+  # Enable cloud providers by setting the keys in .env; they stay off by
+  # default so a self-hosted server never sends data to the cloud unless
+  # the admin opts in.
   anthropic:
-    enabled: false
+    enabled: ${NEXUS_ENABLE_ANTHROPIC:-false}
   openai:
-    enabled: false
+    enabled: ${NEXUS_ENABLE_OPENAI:-false}
   ollama:
     enabled: true
     base_url: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
-    api_key: ""
-    models: []   # empty = dynamic discovery from /api/tags only
+    api_key: "${OLLAMA_API_KEY}"
+    # Keep the curated list from settings.yaml; models pulled on the
+    # server that are not listed are discovered automatically.
+
+# Tool/plot output is written to each user's workspace; these global
+# paths are only used before a user context exists.
+uploads:
+  upload_directory: "./data/uploads"

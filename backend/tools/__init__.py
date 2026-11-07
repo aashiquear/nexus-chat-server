@@ -22,10 +22,61 @@ Example:
 
         async def execute(self, **kwargs) -> str:
             return f"Result: {kwargs['input']}"
+
+Per-request context
+-------------------
+Tools that touch the filesystem (file reader, csv viewer, graph plotter,
+code executor artifacts, …) should resolve directories through
+:func:`get_context` instead of hard-coding ``./data/uploads``. The
+orchestrator populates the context for every chat turn; the multi-user
+server edition points it at the current user's private directories.
 """
 
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, AsyncIterator
+
+
+@dataclass
+class ToolContext:
+    """Where a tool may read uploads from / write generated files to."""
+
+    upload_dir: Path = Path("./data/uploads")
+    files_dir: Path = Path("./data/files")
+    downloads_dir: Path = Path("./data/downloads")
+    plots_dir: Path = Path("./data")
+    username: str | None = None
+    extra: dict = field(default_factory=dict)
+
+    def url_prefix(self) -> str:
+        """Query-string suffix that scopes file URLs to the owner (server
+        edition). Empty for the single-user build."""
+        return self.extra.get("url_suffix", "")
+
+
+_current_context: ContextVar[ToolContext | None] = ContextVar("nexus_tool_context", default=None)
+_default_context = ToolContext()
+
+
+def get_context() -> ToolContext:
+    ctx = _current_context.get()
+    return ctx if ctx is not None else _default_context
+
+
+def set_context(ctx: ToolContext | None):
+    """Set the active tool context; returns a token for :func:`reset_context`."""
+    return _current_context.set(ctx)
+
+
+def reset_context(token) -> None:
+    _current_context.reset(token)
+
+
+def set_default_context(ctx: ToolContext) -> None:
+    global _default_context
+    _default_context = ctx
 
 
 class BaseTool(ABC):
@@ -57,6 +108,18 @@ class BaseTool(ABC):
             "description": self.description,
             "parameters": self.parameters,
         }
+
+    # Convenience accessors -------------------------------------------
+    @property
+    def ctx(self) -> ToolContext:
+        return get_context()
+
+    def upload_dir(self) -> Path:
+        cfg = self.config.get("upload_dir")
+        ctx = get_context()
+        if ctx.username is not None or not cfg:
+            return Path(ctx.upload_dir)
+        return Path(cfg)
 
 
 # --- Tool Registry ---

@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { ArrowRight, LogIn } from 'lucide-react'
+import { login } from '../hooks/api'
 
 export default function SignInScreen({ onSignIn }) {
   const [username, setUsername] = useState('')
@@ -12,21 +13,10 @@ export default function SignInScreen({ onSignIn }) {
     setError('')
     setIsLoading(true)
     try {
-      const res = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
-      })
-      const data = await res.json()
-      if (!res.ok) {
-        setError(data.detail || 'Login failed')
-        return
-      }
-      localStorage.setItem('nexus_token', data.token)
-      localStorage.setItem('nexus_user', JSON.stringify(data.user))
-      onSignIn(data.user)
+      const user = await login(username, password)
+      onSignIn(user)
     } catch (err) {
-      setError('Network error')
+      setError(err.message || 'Login failed')
     } finally {
       setIsLoading(false)
     }

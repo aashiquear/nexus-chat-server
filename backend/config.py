@@ -45,7 +45,7 @@ def _substitute_env_vars(value: Any) -> Any:
 
 
 def load_config(config_path: Path | None = None) -> dict:
-    """Load and cache configuration from YAML file(s)."""
+    """Load and cache configuration from YAML file."""
     global _config
     if _config is not None:
         return _config
@@ -57,7 +57,8 @@ def load_config(config_path: Path | None = None) -> dict:
     with open(path) as f:
         raw = yaml.safe_load(f)
 
-    # Merge server override if present
+    # Server edition: deep-merge config/settings.server.yaml on top so the
+    # upstream settings.yaml can be updated without losing server tweaks.
     if SERVER_CONFIG_PATH.exists():
         with open(SERVER_CONFIG_PATH) as f:
             override = yaml.safe_load(f)

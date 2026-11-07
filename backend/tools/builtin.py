@@ -95,193 +95,12 @@ class DateTimeTool(BaseTool):
         )
 
 
-@register_tool("code_executor")
-class CodeExecutorTool(BaseTool):
-    name = "code_executor"
-    description = (
-        "Execute Python code in a sandboxed environment and return the output. "
-        "Live output is streamed to the canvas terminal during execution. "
-        "Users may interactively send input via the canvas terminal panel."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "code": {"type": "string", "description": "Python code to execute"},
-            "interactive": {
-                "type": "boolean",
-                "description": (
-                    "If true, expose a stdin channel via the canvas terminal so "
-                    "users can type input while the program runs (input(), "
-                    "sys.stdin.read(), etc.). Default false."
-                ),
-            },
-        },
-        "required": ["code"],
-    }
-
-    DEFAULT_SANDBOX_URL = "http://nexus-sandbox:8500"
-
-    def __init__(self, config: dict | None = None):
-        super().__init__(config)
-        self._last_output = ""
-        self._last_return_code = 0
-        # Most recently started interactive session id, exposed to the
-        # orchestrator/frontend so the canvas can connect a WebSocket.
-        self._last_session_id: str | None = None
-
-    @property
-    def sandbox_url(self) -> str:
-        return self.config.get("sandbox_url") or os.environ.get(
-            "NEXUS_SANDBOX_URL",
-            self.DEFAULT_SANDBOX_URL,
-        )
-
-    async def execute(self, **kwargs) -> str:
-        """Non-streaming fallback: collect all chunks and return as JSON."""
-        chunks = []
-        async for chunk in self.stream_execute(**kwargs):
-            chunks.append(chunk)
-        return json.dumps(
-            {
-                "output": "\n".join(chunks).strip() or "(no output)",
-                "return_code": self._last_return_code,
-                "interactive_session": self._last_session_id,
-            }
-        )
-
-    async def stream_execute(self, **kwargs) -> AsyncIterator[str]:
-        """Stream stdout/stderr lines from the sandbox HTTP service in
-        real time. The sandbox runs in a sibling Docker container on the
-        ``nexus-net`` network (see ``docker-compose.yml``). Falls back
-        to a local subprocess if the sandbox endpoint is unreachable —
-        useful for dev runs without docker compose.
-        """
-        import httpx
-
-        code = kwargs.get("code", "")
-        interactive = bool(kwargs.get("interactive", False))
-        timeout = self.config.get("timeout", 60)
-
-        # Reset per-call state so a previous interactive session id or
-        # return code doesn't leak into the current result.
-        self._last_session_id = None
-        self._last_return_code = 0
-
-        if interactive:
-            # Hand off to the WebSocket-driven session. The frontend
-            # connects to /api/sandbox/interact/{session_id} and the
-            # backend proxies to the sandbox container.
-            self._last_session_id = uuid.uuid4().hex[:16]
-            from backend.sandbox_sessions import register_session
-
-            register_session(self._last_session_id, code, self.sandbox_url)
-            yield f"[interactive session ready: {self._last_session_id}]"
-            yield "Open the canvas terminal to send input and view live output."
-            self._last_return_code = 0
-            return
-
-        url = self.sandbox_url.rstrip("/") + "/exec"
-
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout + 10, read=None)) as client:
-                async with client.stream("POST", url, json={"code": code}) as resp:
-                    if resp.status_code >= 400:
-                        body = await resp.aread()
-                        msg = body.decode("utf-8", errors="replace")
-                        yield f"[stderr]: sandbox HTTP {resp.status_code}: {msg}"
-                        self._last_return_code = 1
-                        return
-
-                    async for line in resp.aiter_lines():
-                        if not line or not line.startswith("data:"):
-                            continue
-                        payload_raw = line[len("data:") :].strip()
-                        try:
-                            payload = json.loads(payload_raw)
-                        except json.JSONDecodeError:
-                            yield payload_raw
-                            continue
-                        ev = payload.get("type")
-                        if ev == "stdout":
-                            yield payload.get("data", "")
-                        elif ev == "stderr":
-                            yield "[stderr]: " + payload.get("data", "")
-                        elif ev == "exit":
-                            self._last_return_code = int(payload.get("code", 0))
-        except (httpx.ConnectError, httpx.ReadTimeout) as e:
-            # Sandbox unavailable — try a local fallback so dev sessions
-            # without docker still get *some* output. Limit to safe
-            # behaviour: a one-shot subprocess with no shell.
-            logger.warning("Sandbox unreachable (%s); falling back to local subprocess.", e)
-            async for chunk in self._local_fallback(code, timeout):
-                yield chunk
-
-    async def _local_fallback(self, code: str, timeout: int) -> AsyncIterator[str]:
-        """Last-resort local execution when the sandbox is unreachable.
-
-        Runs a one-shot subprocess in a temp file with no shell. This is
-        clearly less safe than the docker sandbox; we emit a warning
-        line so the user understands the difference.
-        """
-        import sys as _sys
-
-        yield "[stderr]: sandbox container not reachable; running locally"
-
-        sandbox_dir = Path("./data/sandbox")
-        sandbox_dir.mkdir(parents=True, exist_ok=True)
-        code_file = sandbox_dir / f"local-{uuid.uuid4().hex[:8]}.py"
-        code_file.write_text(code, encoding="utf-8")
-
-        proc = await asyncio.create_subprocess_exec(
-            _sys.executable,
-            "-u",
-            str(code_file),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        queue: asyncio.Queue = asyncio.Queue()
-
-        async def pump(stream, prefix):
-            while True:
-                line = await stream.readline()
-                if not line:
-                    break
-                await queue.put(prefix + line.decode("utf-8", errors="replace").rstrip("\n"))
-            await queue.put(None)
-
-        stdout_task = asyncio.create_task(pump(proc.stdout, ""))
-        stderr_task = asyncio.create_task(pump(proc.stderr, "[stderr]: "))
-
-        eofs = 0
-        try:
-            while eofs < 2:
-                try:
-                    item = await asyncio.wait_for(queue.get(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    yield "[stderr]: local execution timed out"
-                    break
-                if item is None:
-                    eofs += 1
-                    continue
-                yield item
-            await proc.wait()
-            self._last_return_code = proc.returncode or 0
-        finally:
-            stdout_task.cancel()
-            stderr_task.cancel()
-            try:
-                code_file.unlink()
-            except OSError:
-                pass
-
-
 @register_tool("file_reader")
 class FileReaderTool(BaseTool):
     name = "file_reader"
     description = (
-        "Read and extract text content from uploaded files (txt, md, csv, json, py, etc.)."
+        "Read and extract text content from uploaded files (txt, md, csv, json, py, pdf, docx, xlsx, etc.). "
+        "For large CSV/Excel files prefer csv_viewer, which pages through rows and computes statistics."
     )
     parameters = {
         "type": "object",
@@ -291,12 +110,18 @@ class FileReaderTool(BaseTool):
         "required": ["filename"],
     }
 
-    async def execute(self, **kwargs) -> str:
-        filename = kwargs.get("filename", "")
-        upload_dir = Path(self.config.get("upload_dir", "./data/uploads"))
-        filepath = upload_dir / filename
+    IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
-        if not filepath.exists():
+    async def execute(self, **kwargs) -> str:
+        filename = Path(kwargs.get("filename", "")).name
+        filepath = None
+        for base in (self.upload_dir(), Path(self.ctx.files_dir), Path(self.ctx.downloads_dir)):
+            candidate = Path(base) / filename
+            if candidate.exists():
+                filepath = candidate
+                break
+
+        if filepath is None:
             return json.dumps({"error": f"File not found: {filename}"})
 
         try:
@@ -305,6 +130,17 @@ class FileReaderTool(BaseTool):
                 return await self._read_pdf(filepath)
             elif ext == ".docx":
                 return await self._read_docx(filepath)
+            elif ext in (".xlsx", ".xlsm", ".xls"):
+                return await asyncio.to_thread(self._read_excel, filepath)
+            elif ext in self.IMAGE_EXTS:
+                return json.dumps({
+                    "filename": filename,
+                    "note": (
+                        "This is an image. Attach it to a message for a vision-capable "
+                        "model, or call image_synthesizer to get a description."
+                    ),
+                    "size": filepath.stat().st_size,
+                })
             else:
                 content = filepath.read_text(errors="replace")
                 # Truncate if very long
@@ -335,6 +171,15 @@ class FileReaderTool(BaseTool):
             )
         except ImportError:
             return json.dumps({"error": "PyPDF2 not installed"})
+
+    def _read_excel(self, path: Path) -> str:
+        import pandas as pd
+
+        sheets = pd.read_excel(path, sheet_name=None, nrows=200)
+        out = {}
+        for name, df in sheets.items():
+            out[name] = df.to_csv(index=False)[:50000]
+        return json.dumps({"filename": path.name, "sheets": out})
 
     async def _read_docx(self, path: Path) -> str:
         try:

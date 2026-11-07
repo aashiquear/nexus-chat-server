@@ -142,8 +142,8 @@ class ImageSynthesizerTool(BaseTool):
         filename = kwargs.get("filename", "")
         user_prompt = kwargs.get("prompt", "").strip()
 
-        upload_dir = Path(self.config.get("upload_dir", "./data/uploads"))
-        filepath = upload_dir / filename
+        upload_dir = self.upload_dir()
+        filepath = upload_dir / Path(filename).name
 
         # ── Validate file ──────────────────────────────────────────
         if not filepath.exists():

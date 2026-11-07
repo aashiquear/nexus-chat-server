@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { X, KeyRound, Trash2, AlertTriangle, LogOut } from 'lucide-react'
+import { changePassword, deleteOwnAccount } from '../hooks/api'
 
 export default function AccountPopup({ user, onClose, onLogout }) {
   const [tab, setTab] = useState('info')
@@ -43,23 +44,13 @@ export default function AccountPopup({ user, onClose, onLogout }) {
     }
     setIsLoading(true)
     try {
-      const token = localStorage.getItem('nexus_token')
-      const res = await fetch('/api/auth/change-password', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
-      })
-      if (!res.ok) {
-        const data = await res.json()
-        setError(data.detail || 'Failed to change password')
-      } else {
-        setSuccess('Password changed successfully')
-        setCurrentPassword('')
-        setNewPassword('')
-        setConfirmPassword('')
-      }
-    } catch {
-      setError('Network error')
+      await changePassword(currentPassword, newPassword)
+      setSuccess('Password changed successfully')
+      setCurrentPassword('')
+      setNewPassword('')
+      setConfirmPassword('')
+    } catch (err) {
+      setError(err.message || 'Failed to change password')
     } finally {
       setIsLoading(false)
     }
@@ -73,20 +64,10 @@ export default function AccountPopup({ user, onClose, onLogout }) {
     }
     setIsLoading(true)
     try {
-      const token = localStorage.getItem('nexus_token')
-      const res = await fetch('/api/auth/account', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ password: deletePassword }),
-      })
-      if (!res.ok) {
-        const data = await res.json()
-        setError(data.detail || 'Failed to delete account')
-      } else {
-        onLogout()
-      }
-    } catch {
-      setError('Network error')
+      await deleteOwnAccount(deletePassword)
+      onLogout()
+    } catch (err) {
+      setError(err.message || 'Failed to delete account')
     } finally {
       setIsLoading(false)
     }

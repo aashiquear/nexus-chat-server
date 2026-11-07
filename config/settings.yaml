@@ -7,12 +7,15 @@
 
 app:
   name: "Nexus Chat"
-  version: "0.1.0"
+  version: "0.3.0"
   host: "0.0.0.0"
   port: 8000
   debug: false
   # Secret key for sessions (change in production!)
   secret_key: "change-me-in-production"
+  # Optional: first paragraph of the default system prompt. Nexus appends
+  # today's date, the knowledge-cutoff reminder and tool guidance.
+  # system_prompt: "You are Nexus, a helpful, precise AI assistant."
 
 # ------------------------------------------------------------
 # LLM Providers
@@ -33,6 +36,9 @@ providers:
       - id: "claude-opus-4-7"
         name: "Claude Opus 4.7"
         max_tokens: 8192
+        context_length: 200000
+        thinking: true
+        thinking_budget_tokens: 4096
       - id: "claude-opus-4-6"
         name: "Claude Opus 4.6"
         max_tokens: 8192
@@ -152,17 +158,52 @@ providers:
         name: "Devstral 2 123B (cloud)"
         max_tokens: 8192
 
-      # --- Local models: general ---
+      # --- Local models: general (vision-capable models flagged with
+      #     ``vision: true``; the /api/show probe confirms this live) ---
       - id: "gemma4:latest"
         name: "Gemma 4"
         max_tokens: 8192
         thinking: true
         thinking_level: "medium"
+        vision: true
       - id: "gemma4:31b"
         name: "Gemma 4 31B"
         max_tokens: 8192
         thinking: true
         thinking_level: "medium"
+        vision: true
+      - id: "gemma3:12b"
+        name: "Gemma 3 12B"
+        max_tokens: 8192
+        vision: true
+      - id: "qwen3.5-vl:latest"
+        name: "Qwen 3.5 VL"
+        max_tokens: 8192
+        vision: true
+      - id: "qwen3-vl:8b"
+        name: "Qwen 3 VL 8B"
+        max_tokens: 8192
+        vision: true
+      - id: "llama4:scout"
+        name: "Llama 4 Scout"
+        max_tokens: 8192
+        vision: true
+      - id: "mistral-small3.2:latest"
+        name: "Mistral Small 3.2"
+        max_tokens: 8192
+        vision: true
+      - id: "llava:13b"
+        name: "LLaVA 13B"
+        max_tokens: 4096
+        vision: true
+      - id: "minicpm-v:latest"
+        name: "MiniCPM-V"
+        max_tokens: 4096
+        vision: true
+      - id: "granite3.2-vision:latest"
+        name: "Granite 3.2 Vision"
+        max_tokens: 4096
+        vision: true
       - id: "devstral-small-2:24b"
         name: "Devstral Small 2 24B"
         max_tokens: 8192
@@ -172,6 +213,7 @@ providers:
       - id: "llama4:latest"
         name: "Llama 4"
         max_tokens: 8192
+        vision: true
       - id: "qwen3.6:latest"
         name: "Qwen 3.6"
         max_tokens: 8192
@@ -224,6 +266,41 @@ providers:
         thinking_level: "medium"
 
 # ------------------------------------------------------------
+# Generation & context defaults
+# ------------------------------------------------------------
+# Defaults for the prompt-box settings control. "local" applies to
+# Ollama (self-hosted) models, "cloud" to Anthropic / OpenAI / Ollama
+# Cloud. Users can change every value from the UI (stored per browser;
+# per user in the server edition). Compaction keeps long chats inside the
+# context window: "off" | "truncate" (drop oldest turns) | "summarize"
+# (replace oldest turns with a model-written summary) once the prompt
+# exceeds threshold × context size.
+# ------------------------------------------------------------
+generation:
+  context_sizes: [2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+  defaults:
+    local:
+      num_ctx: 8192
+      max_tokens: 4096
+      temperature: 0.7
+      top_p: 0.9
+      top_k: 40
+      repeat_penalty: 1.1
+      keep_alive: "10m"
+      compaction:
+        mode: "summarize"
+        threshold: 0.8
+        keep_recent: 6
+    cloud:
+      context_window: 200000
+      max_tokens: 4096
+      temperature: 0.7
+      compaction:
+        mode: "summarize"
+        threshold: 0.85
+        keep_recent: 8
+
+# ------------------------------------------------------------
 # Tools
 # ------------------------------------------------------------
 # Each tool is a Python module in backend/tools/
@@ -252,11 +329,27 @@ tools:
   code_executor:
     enabled: true
     name: "Code Executor"
-    description: "Execute Python code in a sandboxed environment"
+    description: "Run Python, JavaScript/TypeScript, Bash, Java, C/C++, Go, Rust, R or HTML in the sandbox; installs packages on the fly and returns produced files"
     icon: "code"
     config:
-      timeout: 30
-      max_memory_mb: 256
+      timeout: 120
+      max_memory_mb: 512
+      # sandbox_url: "http://nexus-sandbox:8500"   # or set NEXUS_SANDBOX_URL
+
+  web_browser:
+    enabled: true
+    name: "Web Browser"
+    description: "Open a URL and read the page text (HTML, PDF, JSON) — lets the model read sources newer than its training data"
+    icon: "globe"
+    config:
+      timeout: 25
+      block_private_hosts: true
+
+  csv_viewer:
+    enabled: true
+    name: "CSV Viewer"
+    description: "Inspect CSV/TSV/Excel uploads: columns, types, preview rows and statistics, shown as an interactive table"
+    icon: "table"
 
   datetime_tool:
     enabled: true
@@ -309,11 +402,52 @@ tools:
 # ------------------------------------------------------------
 # MCP Servers (Model Context Protocol)
 # ------------------------------------------------------------
-# MCP servers are now added dynamically via the UI.
-# Use the "+" button in the MCP Servers sidebar panel to
-# discover and add a server by its URL.
+# Nexus speaks every MCP transport:
+#   url:     "http://host:port/mcp"        → streamable-http (auto-detected)
+#   url:     "http://host:port/sse"        → legacy HTTP+SSE
+#   url:     "http://host:port"            → legacy Nexus /rpc servers
+#   command: "npx" args: ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+#                                           → stdio (marketplace / Claude
+#                                             Desktop style servers)
+# Servers can also be added at runtime from the sidebar "MCP Marketplace"
+# (official registry search, import of a Claude/ChatGPT ``mcpServers``
+# JSON block, or a manual URL/command); those are stored in
+# data/mcp_servers.json and survive restarts.
 # ------------------------------------------------------------
-mcp_servers: {}
+mcp_servers:
+  # Example: stdio server from the npm marketplace (needs node in the image)
+  # filesystem:
+  #   enabled: true
+  #   name: "Filesystem"
+  #   command: "npx"
+  #   args: ["-y", "@modelcontextprotocol/server-filesystem", "/app/data/uploads"]
+
+  # Example: SQLite database server (see examples/mcp-database-server)
+  database:
+    enabled: false
+    name: "Database"
+    description: "Query and manage a SQLite database"
+    url: "http://mcp-database:8100" # Docker service name
+    icon: "database"
+    timeout: 30
+
+  moose:
+    enabled: false
+    name: "MOOSE Simulator"
+    description: "Build, run, and post-process MOOSE framework simulations"
+    # Native mode: use host.docker.internal to reach the host from Docker
+    url: "http://host.docker.internal:8200"
+    # Docker mode: use the container name instead
+    # url: "http://mcp-moose:8200"
+    icon: "atom"
+    timeout: 120
+
+  statflow:
+    enabled: false
+    name: "StatFlow - Statistical Analysis"
+    url: "http://statflow-mcp:9000" # container name on nexus-net
+    icon: "chart-bar"
+    timeout: 120 # longer timeout for complex analyses
 
 # ------------------------------------------------------------
 # RAG (Retrieval-Augmented Generation)

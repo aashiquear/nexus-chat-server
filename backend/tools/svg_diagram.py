@@ -74,7 +74,7 @@ class SVGDiagramTool(BaseTool):
             )
 
         # Save to data/uploads so it's accessible via file reader too
-        output_dir = Path(
+        output_dir = Path(self.ctx.files_dir) if self.ctx.username is not None else Path(
             self.config.get("output_dir", "./data/uploads")
         )
         output_dir.mkdir(parents=True, exist_ok=True)

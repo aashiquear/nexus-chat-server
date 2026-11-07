@@ -7,8 +7,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import uuid
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,13 +22,14 @@ from fastapi import (
     File,
     HTTPException,
     Request,
+    Response,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # Load env vars before importing config
@@ -34,24 +38,27 @@ load_dotenv()
 # Ensure backend is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from backend.config import load_config, get_config
-from backend.orchestrator import ChatOrchestrator
-from backend import conversations
-import backend.auth as auth
-
 import backend.mcp  # noqa: F401 – MCP client module
-from backend.mcp.client import _load_user_mcp_servers, _save_user_mcp_servers
 
 # Import providers and tools to trigger registration
 import backend.providers.anthropic_provider
 import backend.providers.ollama_provider
 import backend.providers.openai_provider
 import backend.tools.builtin
+import backend.tools.code_executor
+import backend.tools.data_tools
 import backend.tools.example_tool
 import backend.tools.file_generator
 import backend.tools.graph_plotter
 import backend.tools.image_synthesizer
 import backend.tools.svg_diagram
+import backend.auth as auth
+from backend import conversations
+from backend.auth import user_dir
+from backend.config import get_config, load_config
+from backend.mcp.client import parse_mcp_config_import, search_registry
+from backend.orchestrator import ChatOrchestrator
+from backend.tools import ToolContext, set_default_context
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -60,9 +67,45 @@ logger = logging.getLogger(__name__)
 config = load_config()
 app_config = config.get("app", {})
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+    """Initialize auth, MCP connections, per-user registries and heavy models."""
+    await auth.init_admin_user()
+    await orchestrator.init_mcp()
+    # Per-user MCP servers (data/users/<u>/mcp_servers.json)
+    for username in auth._load_users():
+        if auth.USERNAME_RE.match(username):
+            await orchestrator.mcp.load_registry(
+                auth.user_root(username) / "mcp_servers.json",
+                defaults={"owner": username, "source": "user"},
+            )
+
+    # ── Pre-load diffusion model in background so first PNG generation is fast ──
+    file_gen_cfg = config.get("tools", {}).get("file_generator", {})
+    if file_gen_cfg.get("enabled", False) and file_gen_cfg.get("config", {}).get("preload_diffusion", False):
+        cache_dir = file_gen_cfg.get("config", {}).get("model_cache_dir")
+
+        async def _warmup_diffusion():
+            try:
+                from backend.tools.file_generator import _ensure_diffusion_loaded
+
+                logger.info("Pre-loading diffusion model in background …")
+                await asyncio.to_thread(_ensure_diffusion_loaded, cache_dir)
+                logger.info("Diffusion model pre-loaded successfully.")
+            except Exception as e:
+                logger.warning("Diffusion model pre-load failed (will retry on first use): %s", e)
+
+        asyncio.create_task(_warmup_diffusion())
+
+    yield
+    await orchestrator.mcp.shutdown()
+
+
 app = FastAPI(
     title=app_config.get("name", "Nexus Chat"),
     version=app_config.get("version", "0.1.0"),
+    lifespan=lifespan,
 )
 
 # CORS
@@ -86,36 +129,80 @@ sandbox_dir = Path("./data/sandbox")
 sandbox_dir.mkdir(parents=True, exist_ok=True)
 files_dir = Path("./data/files")
 files_dir.mkdir(parents=True, exist_ok=True)
+plots_dir = Path("./data")
+
+set_default_context(
+    ToolContext(upload_dir=upload_dir, files_dir=files_dir, downloads_dir=download_dir, plots_dir=plots_dir)
+)
 
 
-# ------ Startup event: initialize async services ------
+def safe_filename(name: str) -> str:
+    """Reduce a client-supplied file name to a single safe path component.
+
+    Rejects traversal attempts (``../etc/passwd``), hidden files and
+    control characters so no endpoint can read or write outside its
+    directory."""
+    base = Path(name or "").name
+    base = base.replace("\x00", "").strip()
+    if not base or base in (".", "..") or base.startswith("."):
+        raise HTTPException(400, "Invalid file name")
+    return base
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize auth, MCP connections, sync uploads, and pre-load heavy models."""
-    await auth.init_admin_user()
-    await orchestrator.init_mcp()
-    # Re-ingest any uploaded files missing from the vector store (e.g. after restart)
-    if orchestrator.rag_engine:
-        await orchestrator.rag_engine.sync_uploads(upload_dir)
+def _find_file(name: str, *dirs: Path) -> Path | None:
+    for base in dirs:
+        candidate = Path(base) / name
+        if candidate.is_file():
+            return candidate
+    return None
 
-    # ── Pre-load diffusion model in background so first PNG generation is fast ──
-    file_gen_cfg = config.get("tools", {}).get("file_generator", {})
-    if file_gen_cfg.get("enabled", False):
-        cache_dir = file_gen_cfg.get("config", {}).get("model_cache_dir")
 
-        async def _warmup_diffusion():
-            try:
-                from backend.tools.file_generator import _ensure_diffusion_loaded
+# ------ Per-user workspace helpers ------
 
-                logger.info("Pre-loading diffusion model in background …")
-                await asyncio.to_thread(_ensure_diffusion_loaded, cache_dir)
-                logger.info("Diffusion model pre-loaded successfully.")
-            except Exception as e:
-                logger.warning("Diffusion model pre-load failed (will retry on first use): %s", e)
 
-        asyncio.create_task(_warmup_diffusion())
+def ctx_for(user: dict) -> ToolContext:
+    """Tool context pointing every tool at the user's private directories."""
+    u = user["username"]
+    return ToolContext(
+        upload_dir=user_dir(u, "uploads"),
+        files_dir=user_dir(u, "files"),
+        downloads_dir=user_dir(u, "downloads"),
+        plots_dir=user_dir(u, "plots"),
+        username=u,
+    )
+
+
+def user_file_dirs(user: dict) -> tuple[Path, ...]:
+    u = user["username"]
+    return (user_dir(u, "files"), user_dir(u, "downloads"), user_dir(u, "plots"), user_dir(u, "uploads"))
+
+
+def rag_where(user: dict) -> dict:
+    return {"owner": user["username"]}
+
+
+def visible_mcp(user: dict) -> set[str]:
+    """Server ids this user may see: admin/global servers + their own."""
+    out = set()
+    for info in orchestrator.mcp.get_servers_info():
+        owner = info.get("owner")
+        if owner is None or owner == user["username"]:
+            out.add(info["id"])
+    return out
+
+
+def _filter_mcp_tools(tool_ids: list[str], user: dict) -> list[str]:
+    allowed = visible_mcp(user)
+    return [t for t in tool_ids if not t.startswith("mcp:") or t.split(":", 2)[1] in allowed]
+
+
+def _quota_check(user: dict, incoming_bytes: int) -> None:
+    quota_mb = int((config.get("auth") or {}).get("user_quota_mb", 0) or 0)
+    if quota_mb <= 0 or user.get("is_admin"):
+        return
+    used = auth.user_usage_bytes(user["username"])
+    if used + incoming_bytes > quota_mb * 1024 * 1024:
+        raise HTTPException(413, f"Storage quota exceeded ({quota_mb} MB per user). Delete some files first.")
 
 
 # ------ REST API Endpoints ------
@@ -123,36 +210,36 @@ async def startup_event():
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "name": app_config.get("name")}
+    return {"status": "ok", "name": app_config.get("name"), "version": app_config.get("version"), "edition": "server"}
 
 
 # ------ Auth Endpoints ------
 
+
 @app.post("/api/auth/login")
-async def login(request: Request):
+async def login(request: Request, response: Response):
     body = await request.json()
-    username = body.get("username", "").strip()
-    password = body.get("password", "")
+    username = (body.get("username") or "").strip()
+    password = body.get("password") or ""
     users = auth._load_users()
     user = users.get(username)
     if not user or not auth.verify_password(password, user["password_hash"]):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    auth.ensure_user_dirs(username)
     token = auth.create_access_token(username)
-    return {
-        "token": token,
-        "user": {
-            "username": user["username"],
-            "is_admin": user.get("is_admin", False),
-        },
-    }
+    auth.set_session_cookie(response, token, request)
+    return {"token": token, "user": {"username": user["username"], "is_admin": user.get("is_admin", False)}}
+
+
+@app.post("/api/auth/logout")
+async def logout(response: Response):
+    auth.clear_session_cookie(response)
+    return {"status": "ok"}
 
 
 @app.get("/api/auth/me")
 async def me(current_user: dict = Depends(auth.get_current_user)):
-    return {
-        "username": current_user["username"],
-        "is_admin": current_user.get("is_admin", False),
-    }
+    return {"username": current_user["username"], "is_admin": current_user.get("is_admin", False)}
 
 
 @app.post("/api/auth/change-password")
@@ -167,14 +254,39 @@ async def change_password(request: Request, current_user: dict = Depends(auth.ge
 
 
 @app.delete("/api/auth/account")
-async def delete_account(request: Request, current_user: dict = Depends(auth.get_current_user)):
+async def delete_account(request: Request, response: Response, current_user: dict = Depends(auth.get_current_user)):
     body = await request.json()
-    password = body.get("password", "")
-    await auth.delete_user_account(current_user["username"], password)
+    await auth.delete_user_account(current_user["username"], body.get("password", ""))
+    if orchestrator.rag_engine:
+        try:
+            orchestrator.rag_engine._get_collection().delete(where=rag_where(current_user))
+        except Exception as e:
+            logger.warning("Could not purge vectors for %s: %s", current_user["username"], e)
+    auth.clear_session_cookie(response)
     return {"deleted": current_user["username"]}
 
 
+# ------ User settings (generation defaults etc.) ------
+
+
+@app.get("/api/settings/user")
+async def get_user_settings(current_user: dict = Depends(auth.get_current_user)):
+    return {"settings": auth.load_user_settings(current_user["username"])}
+
+
+@app.put("/api/settings/user")
+async def put_user_settings(request: Request, current_user: dict = Depends(auth.get_current_user)):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Expected a JSON object")
+    current = auth.load_user_settings(current_user["username"])
+    current.update(body)
+    auth.save_user_settings(current_user["username"], current)
+    return {"settings": current}
+
+
 # ------ Admin Endpoints ------
+
 
 @app.get("/api/admin/users")
 async def admin_list_users(_admin: dict = Depends(auth.get_current_admin_user)):
@@ -184,35 +296,98 @@ async def admin_list_users(_admin: dict = Depends(auth.get_current_admin_user)):
 @app.post("/api/admin/users")
 async def admin_create_user(request: Request, _admin: dict = Depends(auth.get_current_admin_user)):
     body = await request.json()
-    username = body.get("username", "").strip()
-    password = body.get("password", "")
-    is_admin = bool(body.get("is_admin", False))
-    result = await auth.create_user(username, password, is_admin)
-    return result
+    return await auth.create_user(body.get("username", ""), body.get("password", ""), bool(body.get("is_admin", False)))
 
 
 @app.delete("/api/admin/users/{username}")
-async def admin_delete_user(username: str, _admin: dict = Depends(auth.get_current_admin_user)):
+async def admin_delete_user(username: str, admin: dict = Depends(auth.get_current_admin_user)):
+    if username == admin["username"]:
+        raise HTTPException(400, "Use the account menu to delete your own account")
     await auth.delete_user(username)
+    if orchestrator.rag_engine:
+        try:
+            orchestrator.rag_engine._get_collection().delete(where={"owner": username})
+        except Exception as e:
+            logger.warning("Could not purge vectors for %s: %s", username, e)
+    for sid in [i["id"] for i in orchestrator.mcp.get_servers_info() if i.get("owner") == username]:
+        await orchestrator.mcp.remove_server(sid)
     return {"deleted": username}
 
 
-@app.get("/api/models")
-async def list_models():
-    """Return all configured LLM models, annotated with whether each is
-    currently available on its provider's remote server (Ollama tags,
-    Anthropic ``/v1/models``, OpenAI ``/v1/models``).
+@app.post("/api/admin/users/{username}/password")
+async def admin_reset_password(username: str, request: Request, _admin: dict = Depends(auth.get_current_admin_user)):
+    body = await request.json()
+    await auth.admin_reset_password(username, body.get("new_password", ""))
+    return {"status": "ok"}
 
-    Probe results are cached briefly per-provider so this endpoint stays
-    cheap to call from the frontend on demand.
-    """
+
+@app.get("/api/models")
+async def list_models(current_user: dict = Depends(auth.get_current_user)):
+    """Return all configured LLM models, annotated with whether each is
+    currently available on its provider's remote server plus capability
+    metadata (vision / tools / thinking / context length / quantization)."""
     return {"models": await orchestrator.get_available_models_async()}
 
 
+@app.get("/api/models/{model_id:path}/info")
+async def model_info(model_id: str, current_user: dict = Depends(auth.get_current_user)):
+    """Capability details for one model (Ollama ``/api/show`` etc.)."""
+    resolved = orchestrator._resolve_provider(model_id)
+    if not resolved:
+        raise HTTPException(404, "Model not found")
+    _name, provider, cfg = resolved
+    caps = await provider.model_capabilities(model_id)
+    return {"id": model_id, "provider": _name, "config": cfg, "capabilities": caps}
+
+
+@app.post("/api/models/pull")
+async def pull_model(request: Request, _admin: dict = Depends(auth.get_current_admin_user)):
+    """Pull a model tag (e.g. a different quantization such as
+    ``llama3.2:3b-instruct-q8_0``) onto the connected Ollama server.
+    Streams Ollama's progress events as SSE."""
+    body = await request.json()
+    name = (body.get("model") or "").strip()
+    if not name or not re.fullmatch(r"[\w.\-/:]+", name):
+        raise HTTPException(400, "Invalid model name")
+    provider = orchestrator._providers.get("ollama")
+    if provider is None:
+        raise HTTPException(400, "Ollama provider is not enabled")
+
+    import httpx
+
+    async def stream():
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60, read=None)) as client:
+                async with client.stream(
+                    "POST", f"{provider.base_url}/api/pull",
+                    json={"model": name, "stream": True}, headers=provider._headers,
+                ) as resp:
+                    async for line in resp.aiter_lines():
+                        if line.strip():
+                            yield f"data: {line}\n\n"
+            # Invalidate the tag cache so the new model shows up immediately.
+            provider._remote_models_cache_ts = 0.0
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.get("/api/settings/generation")
+async def generation_settings(current_user: dict = Depends(auth.get_current_user)):
+    """Default generation / context settings for the prompt-box control,
+    plus this user's saved overrides."""
+    data = orchestrator.generation_defaults()
+    data["user_overrides"] = auth.load_user_settings(current_user["username"]).get("generation", {})
+    return data
+
+
 @app.get("/api/tools")
-async def list_tools():
-    """Return all available tools."""
-    return {"tools": orchestrator.get_available_tools()}
+async def list_tools(current_user: dict = Depends(auth.get_current_user)):
+    """Return all available tools (MCP tools limited to servers visible to the user)."""
+    allowed = visible_mcp(current_user)
+    tools = [t for t in orchestrator.get_available_tools() if t.get("source") != "mcp" or t.get("server") in allowed]
+    return {"tools": tools}
 
 
 UPLOAD_STREAM_CHUNK = 1024 * 1024  # 1 MiB per read — bounded memory
@@ -232,13 +407,15 @@ async def upload_file(file: UploadFile = File(...), current_user: dict = Depends
     max_size = upload_cfg.get("max_file_size_mb", 50) * 1024 * 1024
     allowed = upload_cfg.get("allowed_extensions", [])
 
-    # Check extension
-    ext = Path(file.filename).suffix.lower()
+    filename = safe_filename(file.filename)
+    ext = Path(filename).suffix.lower()
     if allowed and ext not in allowed:
         raise HTTPException(400, f"File type '{ext}' not allowed. Allowed: {allowed}")
 
     # Stream to disk in chunks; abort early if the size limit is exceeded.
-    filepath = upload_dir / file.filename
+    user_uploads = user_dir(current_user["username"], "uploads")
+    _quota_check(current_user, 0)
+    filepath = user_uploads / filename
     written = 0
     try:
         with open(filepath, "wb") as out:
@@ -258,6 +435,13 @@ async def upload_file(file: UploadFile = File(...), current_user: dict = Depends
                         f"File too large. Max: {max_size // (1024 * 1024)} MB",
                     )
                 out.write(chunk)
+        _quota_check(current_user, 0)
+    except HTTPException:
+        try:
+            filepath.unlink()
+        except FileNotFoundError:
+            pass
+        raise
     finally:
         await file.close()
 
@@ -266,36 +450,30 @@ async def upload_file(file: UploadFile = File(...), current_user: dict = Depends
     embedding_status = "skipped"
     if orchestrator.rag_engine:
         rag = orchestrator.rag_engine
-        rag._set_progress(file.filename, stage="queued", current=0, total=0, percent=0)
+        rag._set_progress(filename, stage="queued", current=0, total=0, percent=0)
+
+        owner_meta = rag_where(current_user)
 
         async def _ingest_in_background():
             try:
-                await rag.ingest_file(filepath)
+                await rag.ingest_file(filepath, metadata=owner_meta)
             except Exception as e:
-                logger.error("Background ingestion failed for %s: %s", file.filename, e)
-                rag._set_progress(file.filename, stage="error", percent=0)
-
-        import asyncio
+                logger.error("Background ingestion failed for %s: %s", filename, e)
+                rag._set_progress(filename, stage="error", percent=0)
 
         asyncio.create_task(_ingest_in_background())
         embedding_status = "started"
 
     return {
-        "filename": file.filename,
+        "filename": filename,
         "size": written,
         "embedding_status": embedding_status,
     }
 
 
 @app.get("/api/upload/progress/{filename}")
-async def upload_progress(filename: str):
-    """Poll the embedding progress for an uploaded file.
-
-    Returns ``{stage, percent, current, total}`` where ``stage`` is one
-    of: ``queued``, ``reading``, ``chunking``, ``embedding``,
-    ``complete``, ``error``. Returns ``stage: "unknown"`` if the
-    filename has no progress entry (e.g. completed long ago and cleared).
-    """
+async def upload_progress(filename: str, current_user: dict = Depends(auth.get_current_user)):
+    """Poll the embedding progress for an uploaded file."""
     if not orchestrator.rag_engine:
         return {"stage": "unknown", "percent": 0}
     progress = orchestrator.rag_engine.get_progress(filename)
@@ -306,14 +484,14 @@ async def upload_progress(filename: str):
 
 @app.get("/api/files")
 async def list_files(current_user: dict = Depends(auth.get_current_user)):
-    """List uploaded files and resync any new files into the RAG vector store."""
-    # Re-ingest any files placed directly in the uploads directory (not via upload API)
+    """List the user's uploaded files and resync any new files into the RAG vector store."""
+    user_uploads = user_dir(current_user["username"], "uploads")
     if orchestrator.rag_engine:
-        await orchestrator.rag_engine.sync_uploads(upload_dir)
+        await orchestrator.rag_engine.sync_uploads(user_uploads, metadata=rag_where(current_user))
 
     files = []
-    for f in upload_dir.iterdir():
-        if f.is_file():
+    for f in sorted(user_uploads.iterdir()):
+        if f.is_file() and not f.name.startswith("."):
             files.append(
                 {
                     "name": f.name,
@@ -326,8 +504,9 @@ async def list_files(current_user: dict = Depends(auth.get_current_user)):
 
 @app.delete("/api/files/{filename}")
 async def delete_file(filename: str, current_user: dict = Depends(auth.get_current_user)):
-    """Delete an uploaded file."""
-    filepath = upload_dir / filename
+    """Delete one of the user's uploaded files."""
+    filename = safe_filename(filename)
+    filepath = user_dir(current_user["username"], "uploads") / filename
     if not filepath.exists():
         raise HTTPException(404, "File not found")
 
@@ -335,7 +514,7 @@ async def delete_file(filename: str, current_user: dict = Depends(auth.get_curre
 
     # Remove from RAG
     if orchestrator.rag_engine:
-        await orchestrator.rag_engine.delete_file(filename)
+        await orchestrator.rag_engine.delete_file(filename, where=rag_where(current_user))
 
     return {"deleted": filename}
 
@@ -344,14 +523,11 @@ async def delete_file(filename: str, current_user: dict = Depends(auth.get_curre
 
 
 @app.get("/api/plots/{filename}")
-async def serve_plot_file(filename: str):
-    """Serve a generated plot image from the data directory."""
-    data_dir = Path("./data")
-    filepath = data_dir / filename
-    if not filepath.exists():
-        # Also check uploads directory
-        filepath = upload_dir / filename
-    if not filepath.exists():
+async def serve_plot_file(filename: str, current_user: dict = Depends(auth.get_current_user)):
+    """Serve a generated plot image from the user's workspace."""
+    filename = safe_filename(filename)
+    filepath = _find_file(filename, *user_file_dirs(current_user))
+    if filepath is None:
         raise HTTPException(404, "Plot file not found")
     return FileResponse(filepath, media_type="image/png")
 
@@ -360,12 +536,11 @@ async def serve_plot_file(filename: str):
 
 
 @app.get("/api/download/{filename}")
-async def download_file(filename: str):
-    """Serve a downloadable file from the downloads or files directory."""
-    filepath = download_dir / filename
-    if not filepath.exists():
-        filepath = files_dir / filename
-    if not filepath.exists():
+async def download_file(filename: str, current_user: dict = Depends(auth.get_current_user)):
+    """Serve a downloadable file from the user's workspace."""
+    filename = safe_filename(filename)
+    filepath = _find_file(filename, *user_file_dirs(current_user))
+    if filepath is None:
         raise HTTPException(404, "File not found")
     return FileResponse(filepath, media_type="application/octet-stream", filename=filename)
 
@@ -377,6 +552,7 @@ _EXT_MEDIA_TYPES = {
     ".jpeg": "image/jpeg",
     ".gif": "image/gif",
     ".webp": "image/webp",
+    ".bmp": "image/bmp",
     ".svg": "image/svg+xml",
     ".html": "text/html",
     ".htm": "text/html",
@@ -384,39 +560,69 @@ _EXT_MEDIA_TYPES = {
     ".md": "text/markdown",
     ".json": "application/json",
     ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
 }
+
+_TEXT_CONTENT_TYPES = {
+    ".md": "text/markdown",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".py": "text/x-python",
+    ".js": "text/javascript",
+    ".ts": "text/typescript",
+    ".jsx": "text/javascript",
+    ".tsx": "text/typescript",
+    ".css": "text/css",
+    ".json": "application/json",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
+    ".c": "text/x-c",
+    ".cpp": "text/x-c++",
+    ".h": "text/x-c",
+    ".java": "text/x-java",
+    ".go": "text/x-go",
+    ".rs": "text/x-rust",
+    ".sh": "text/x-shellscript",
+    ".yaml": "text/yaml",
+    ".yml": "text/yaml",
+    ".xml": "text/xml",
+    ".svg": "image/svg+xml",
+    ".log": "text/plain",
+    ".sql": "text/x-sql",
+}
+
+MAX_PREVIEW_TEXT_BYTES = 4 * 1024 * 1024
 
 
 @app.get("/api/files/{filename}")
-async def serve_generated_file(filename: str):
-    """Serve a generated file from the files/downloads directory.
-
-    Picks an inline-friendly media type for previewable formats (PDF,
-    PNG, etc.) so the browser can render them in an iframe / <img>
-    rather than forcing a download.
-    """
-    for base in (files_dir, download_dir, Path("./data")):
-        filepath = base / filename
-        if filepath.exists():
-            media_type = _EXT_MEDIA_TYPES.get(filepath.suffix.lower(), "application/octet-stream")
-            return FileResponse(filepath, media_type=media_type)
-    raise HTTPException(404, "File not found")
+async def serve_generated_file(filename: str, current_user: dict = Depends(auth.get_current_user)):
+    """Serve a generated or uploaded file inline with a previewable media type."""
+    filename = safe_filename(filename)
+    filepath = _find_file(filename, *user_file_dirs(current_user))
+    if filepath is None:
+        raise HTTPException(404, "File not found")
+    media_type = _EXT_MEDIA_TYPES.get(filepath.suffix.lower(), "application/octet-stream")
+    headers = {"Content-Disposition": f'inline; filename="{filename}"'}
+    return FileResponse(filepath, media_type=media_type, headers=headers)
 
 
 @app.get("/api/preview/{filename}")
-async def preview_file(filename: str):
+async def preview_file(filename: str, current_user: dict = Depends(auth.get_current_user)):
     """Return file content for canvas preview.
 
-    Looks in the downloads, files, and data directories. Binary formats
-    (pdf, png, jpg) are returned as a reference URL instead of inline
-    text, so the frontend can embed them via ``<iframe>`` or ``<img>``.
+    Looks in the downloads, files, data and uploads directories. Binary
+    formats (pdf, images, office docs, media) are returned as a reference
+    URL instead of inline text so the frontend can embed them. Text-like
+    formats (code, markdown, csv, json, svg …) are returned inline.
     """
-    for base in (download_dir, files_dir, Path("./data")):
-        candidate = base / filename
-        if candidate.exists():
-            filepath = candidate
-            break
-    else:
+    filename = safe_filename(filename)
+    filepath = _find_file(filename, *user_file_dirs(current_user))
+    if filepath is None:
         raise HTTPException(404, "File not found")
 
     ext = filepath.suffix.lower()
@@ -427,6 +633,11 @@ async def preview_file(filename: str):
         ".jpeg": ("image/jpeg", "image"),
         ".gif": ("image/gif", "image"),
         ".webp": ("image/webp", "image"),
+        ".bmp": ("image/bmp", "image"),
+        ".mp4": ("video/mp4", "video"),
+        ".webm": ("video/webm", "video"),
+        ".mp3": ("audio/mpeg", "audio"),
+        ".wav": ("audio/wav", "audio"),
         ".docx": (
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "binary",
@@ -435,41 +646,112 @@ async def preview_file(filename: str):
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             "binary",
         ),
+        ".xlsx": (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "binary",
+        ),
     }
+    size = filepath.stat().st_size
     if ext in binary_types:
         mime, kind = binary_types[ext]
-        # /api/files/{filename} now searches files_dir, download_dir,
-        # and ./data, and serves inline with the correct MIME type —
-        # perfect for canvas embeds (iframe for PDF, <img> for images).
-        url = f"/api/files/{filename}"
         return {
             "filename": filename,
             "content_type": mime,
             "kind": kind,
-            "url": url,
+            "size": size,
+            "url": f"/api/files/{filename}",
         }
 
-    content_type = {
-        ".md": "text/markdown",
-        ".html": "text/html",
-        ".htm": "text/html",
-        ".py": "text/x-python",
-        ".js": "text/javascript",
-        ".css": "text/css",
-        ".json": "application/json",
-        ".txt": "text/plain",
-        ".csv": "text/csv",
-        ".c": "text/x-c",
-        ".cpp": "text/x-c++",
-        ".h": "text/x-c",
-    }.get(ext, "text/plain")
-    content = filepath.read_text(encoding="utf-8", errors="replace")
+    content_type = _TEXT_CONTENT_TYPES.get(ext, "text/plain")
+    truncated = size > MAX_PREVIEW_TEXT_BYTES
+    with open(filepath, "rb") as fh:
+        raw = fh.read(MAX_PREVIEW_TEXT_BYTES)
+    content = raw.decode("utf-8", errors="replace")
     return {
         "content": content,
         "content_type": content_type,
         "kind": "text",
         "filename": filename,
+        "size": size,
+        "truncated": truncated,
+        "url": f"/api/files/{filename}",
     }
+
+
+# ------ Sandbox: direct run (code-block "Run" button) ------
+
+
+@app.get("/api/sandbox/languages")
+async def sandbox_languages(current_user: dict = Depends(auth.get_current_user)):
+    """Which languages the sandbox container can execute right now."""
+    tool = orchestrator._tools.get("code_executor")
+    if tool is None:
+        return {"languages": [], "sandbox": False}
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(tool.sandbox_url.rstrip("/") + "/languages")
+            if resp.status_code == 200:
+                return {**resp.json(), "sandbox": True}
+    except Exception:
+        pass
+    # Local fallback availability.
+    import shutil
+
+    langs = [{"id": "python", "available": True, "ext": "py"}]
+    for lid, binary in (("javascript", "node"), ("typescript", "node"), ("bash", "bash")):
+        langs.append({"id": lid, "available": shutil.which(binary) is not None, "ext": lid[:2]})
+    langs.append({"id": "html", "available": True, "ext": "html"})
+    return {"languages": langs, "sandbox": False}
+
+
+@app.post("/api/sandbox/run")
+async def sandbox_run(request: Request, current_user: dict = Depends(auth.get_current_user)):
+    """Run a code block directly (without the model) and stream the
+    output as SSE. Used by the Run button on code blocks."""
+    body = await request.json()
+    code = body.get("code") or ""
+    if not code.strip():
+        raise HTTPException(400, "code is required")
+    tool = orchestrator._tools.get("code_executor")
+    if tool is None:
+        raise HTTPException(400, "code_executor tool is disabled")
+    kwargs = {
+        "code": code,
+        "language": body.get("language") or "python",
+        "packages": body.get("packages") or [],
+        "stdin": body.get("stdin"),
+        "timeout": body.get("timeout"),
+        "filename": body.get("filename"),
+        "input_files": body.get("input_files") or [],
+    }
+
+    from backend.tools import reset_context, set_context
+
+    async def stream():
+        chunks = []
+        token = set_context(ctx_for(current_user))
+        try:
+            async for chunk in tool.stream_execute(**kwargs):
+                chunks.append(chunk)
+                yield f"data: {json.dumps({'type': 'chunk', 'data': chunk})}\n\n"
+            result = {
+                "type": "result",
+                "output": "\n".join(chunks).strip(),
+                "return_code": tool._last_return_code,
+                "language": tool._last_language,
+                "artifacts": tool._last_artifacts or [],
+            }
+            if tool._last_preview:
+                result["downloadable"] = tool._last_preview
+            yield f"data: {json.dumps(result)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        finally:
+            reset_context(token)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 # ------ Sandbox Interactive Session Proxy ------
@@ -488,10 +770,16 @@ async def sandbox_interact(websocket: WebSocket, session_id: str):
 
     from backend.sandbox_sessions import peek_session
 
+    try:
+        user = auth.get_ws_user(websocket.query_params.get("token"), websocket.headers.get("cookie"))
+    except Exception as e:
+        await websocket.close(code=1008, reason=str(e))
+        return
+
     await websocket.accept()
 
     session = peek_session(session_id)
-    if not session:
+    if not session or (session.owner and session.owner != user["username"]):
         await websocket.send_text(
             json.dumps({"type": "stderr", "data": "Unknown or expired session"})
         )
@@ -503,8 +791,8 @@ async def sandbox_interact(websocket: WebSocket, session_id: str):
     target = f"{base}/interact"
 
     try:
-        async with websockets.connect(target, ping_interval=None) as sandbox_ws:
-            await sandbox_ws.send(json.dumps({"code": session.code}))
+        async with websockets.connect(target, ping_interval=None, max_size=None) as sandbox_ws:
+            await sandbox_ws.send(json.dumps(session.initial_message()))
 
             async def browser_to_sandbox():
                 try:
@@ -542,7 +830,7 @@ MAX_PLOTLY_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
 @app.post("/api/plots/from-json")
-async def plotly_json_to_png(request: Request):
+async def plotly_json_to_png(request: Request, current_user: dict = Depends(auth.get_current_user)):
     """Convert Plotly figure JSON to a PNG file and return the filename."""
     try:
         import plotly.io as pio
@@ -562,12 +850,12 @@ async def plotly_json_to_png(request: Request):
             json.dumps(figure_json) if isinstance(figure_json, dict) else figure_json
         )
         filename = f"plotly-{uuid.uuid4().hex[:8]}.png"
-        data_dir = Path("./data")
-        data_dir.mkdir(exist_ok=True)
-        filepath = data_dir / filename
-        fig.write_image(str(filepath), width=1200, height=700, scale=2)
+        filepath = user_dir(current_user["username"], "plots") / filename
+        await asyncio.to_thread(fig.write_image, str(filepath), width=1200, height=700, scale=2)
 
         return JSONResponse({"filename": filename})
+    except HTTPException:
+        raise
     except ImportError:
         raise HTTPException(500, "plotly or kaleido not installed")
     except Exception as e:
@@ -578,83 +866,184 @@ async def plotly_json_to_png(request: Request):
 
 
 @app.get("/api/mcp/servers")
-async def list_mcp_servers():
-    """Return all configured MCP servers and their status."""
-    return {"servers": orchestrator.get_mcp_servers()}
+async def list_mcp_servers(current_user: dict = Depends(auth.get_current_user)):
+    """Return the MCP servers visible to this user (global + their own)."""
+    servers = orchestrator.mcp.get_servers_info(visible_mcp(current_user))
+    for s_ in servers:
+        s_["scope"] = "user" if s_.get("owner") else "global"
+        s_["removable"] = bool(s_.get("owner") == current_user["username"] or (current_user.get("is_admin") and s_.get("source") != "config"))
+    return {"servers": servers}
+
+
+def _mcp_scope(payload: dict, user: dict) -> tuple[str, Path | None, str]:
+    """Decide where a new MCP server goes: ``global`` (admins) or ``user``.
+    Returns (scope, registry_path, id_prefix)."""
+    acfg = config.get("auth") or {}
+    scope = (payload.get("scope") or ("global" if user.get("is_admin") else "user")).lower()
+    if scope == "global":
+        if not user.get("is_admin"):
+            raise HTTPException(403, "Only admins can add server-wide MCP servers")
+        return "global", None, ""
+    if not user.get("is_admin") and not acfg.get("users_can_add_mcp", True):
+        raise HTTPException(403, "Adding MCP servers is disabled for users")
+    if payload.get("command") and not user.get("is_admin") and not acfg.get("users_can_run_stdio_mcp", False):
+        raise HTTPException(403, "Stdio (command) MCP servers are limited to admins on this server; use a remote URL")
+    return "user", auth.user_root(user["username"]) / "mcp_servers.json", f"u-{user['username']}-"
 
 
 @app.post("/api/mcp/servers/{server_id}/reconnect")
-async def reconnect_mcp_server(server_id: str):
+async def reconnect_mcp_server(server_id: str, current_user: dict = Depends(auth.get_current_user)):
     """Attempt to reconnect to an MCP server."""
+    if server_id not in visible_mcp(current_user):
+        raise HTTPException(404, "MCP server not found")
     ok = await orchestrator.reconnect_mcp(server_id)
     if not ok:
-        raise HTTPException(404, f"MCP server '{server_id}' not found or unreachable")
+        client = orchestrator.mcp.get_client(server_id)
+        detail = client.last_error if client else "not found"
+        raise HTTPException(404, f"MCP server '{server_id}' not reachable: {detail}")
     return {"status": "connected", "server": server_id}
 
 
+def _server_id_from_payload(payload: dict) -> str:
+    sid = payload.get("id") or payload.get("name") or payload.get("url") or payload.get("command") or "server"
+    sid = re.sub(r"[^a-zA-Z0-9_\-]+", "-", str(sid)).strip("-").lower()
+    return sid[:60] or f"server-{uuid.uuid4().hex[:6]}"
+
+
 @app.post("/api/mcp/servers/discover")
-async def discover_mcp_server(payload: dict):
-    """Probe an MCP server URL without persisting it."""
-    url = payload.get("url", "").strip().rstrip("/")
-    if not url:
-        raise HTTPException(400, "URL is required")
+async def discover_mcp_server(payload: dict, current_user: dict = Depends(auth.get_current_user)):
+    """Probe an MCP server (URL or command) without persisting it."""
     from backend.mcp.client import MCPClient
-    temp_id = "discover_" + url.replace("://", "_").replace("/", "_").replace(":", "_")
-    client = MCPClient(temp_id, {"url": url, "timeout": payload.get("timeout", 30)})
+
+    if not (payload.get("url") or payload.get("command")):
+        raise HTTPException(400, "url or command is required")
+    _mcp_scope(payload, current_user)  # permission check only
+    temp_id = "discover-" + uuid.uuid4().hex[:6]
+    try:
+        client = MCPClient(temp_id, {**payload, "timeout": payload.get("timeout", 60)})
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     connected = await client.connect()
-    if not connected:
-        raise HTTPException(502, f"Could not connect to MCP server at {url}")
+    info = client.info()
     tools = client.tools
-    return {
-        "server": {
-            "id": temp_id,
-            "name": client.name,
-            "description": client.description,
-            "url": client.url,
-            "icon": client.icon,
-            "connected": True,
-            "tools": [t["name"] for t in tools],
-        },
-        "tools": tools,
-    }
+    await client.close()
+    if not connected:
+        raise HTTPException(502, f"Could not connect to MCP server: {client.last_error}")
+    return {"server": info, "tools": tools, "resources": client.resources}
 
 
 @app.post("/api/mcp/servers")
-async def add_mcp_server(payload: dict):
-    """Add a new MCP server by URL and persist it."""
-    url = payload.get("url", "").strip().rstrip("/")
-    if not url:
-        raise HTTPException(400, "URL is required")
-    # Generate a stable server_id from the URL
-    server_id = payload.get("id") or url.replace("://", "_").replace("/", "_").replace(":", "_")
-    cfg = {
-        "url": url,
-        "name": payload.get("name", server_id),
-        "description": payload.get("description", ""),
-        "icon": payload.get("icon", "server"),
-        "timeout": payload.get("timeout", 30),
-        "enabled": True,
-    }
-    info = await orchestrator.add_mcp_server(server_id, cfg)
+async def add_mcp_server(payload: dict, current_user: dict = Depends(auth.get_current_user)):
+    """Add a new MCP server (URL or stdio command) and persist it — server-wide
+    for admins (``scope: global``) or in the user's own workspace."""
+    if not (payload.get("url") or payload.get("command")):
+        raise HTTPException(400, "url or command is required")
+    scope, registry_path, prefix = _mcp_scope(payload, current_user)
+    server_id = prefix + _server_id_from_payload(payload)
+    cfg = {k: v for k, v in payload.items() if k not in ("id", "scope")}
+    cfg.setdefault("source", "user")
+    if scope == "user":
+        cfg["owner"] = current_user["username"]
+    try:
+        info = await orchestrator.mcp.add_server(server_id, cfg, registry_path=registry_path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     if not info:
-        raise HTTPException(502, f"Could not connect to MCP server at {url}")
-    # Persist
-    user_servers = _load_user_mcp_servers()
-    user_servers[server_id] = cfg
-    _save_user_mcp_servers(user_servers)
+        client = orchestrator.mcp.get_client(server_id)
+        raise HTTPException(502, f"Could not connect to MCP server: {client.last_error if client else 'unknown error'}")
     return {"status": "added", "server": info}
 
 
 @app.delete("/api/mcp/servers/{server_id}")
-async def remove_mcp_server(server_id: str):
-    """Remove a persisted MCP server."""
-    ok = orchestrator.remove_mcp_server(server_id)
+async def remove_mcp_server(server_id: str, current_user: dict = Depends(auth.get_current_user)):
+    """Remove a persisted MCP server (own servers, or any user-added one for admins)."""
+    info = next((i for i in orchestrator.mcp.get_servers_info() if i["id"] == server_id), None)
+    if not info:
+        raise HTTPException(404, f"MCP server '{server_id}' not found")
+    owner = info.get("owner")
+    if owner != current_user["username"] and not current_user.get("is_admin"):
+        raise HTTPException(403, "You can only remove your own MCP servers")
+    if info.get("source") == "config":
+        raise HTTPException(400, "Servers defined in settings.yaml must be removed from the config file")
+    ok = await orchestrator.remove_mcp_server(server_id)
     if not ok:
         raise HTTPException(404, f"MCP server '{server_id}' not found")
-    user_servers = _load_user_mcp_servers()
-    user_servers.pop(server_id, None)
-    _save_user_mcp_servers(user_servers)
     return {"status": "removed", "server": server_id}
+
+
+@app.get("/api/mcp/registry/search")
+async def mcp_registry_search(q: str = "", limit: int = 30, cursor: str | None = None, current_user: dict = Depends(auth.get_current_user)):
+    """Search the official MCP Registry (GitHub / Claude / ChatGPT
+    marketplace catalog) for installable servers."""
+    try:
+        return await search_registry(q, limit=limit, cursor=cursor)
+    except Exception as e:
+        raise HTTPException(502, f"Registry search failed: {e}")
+
+
+@app.post("/api/mcp/import")
+async def mcp_import(payload: dict, current_user: dict = Depends(auth.get_current_user)):
+    """Import an ``mcpServers`` JSON block (Claude Desktop / ChatGPT /
+    Cursor / VS Code format) and connect every server in it."""
+    raw = payload.get("config") if "config" in payload else payload
+    try:
+        servers = parse_mcp_config_import(raw)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise HTTPException(400, f"Invalid config: {e}")
+    if not servers:
+        raise HTTPException(400, "No MCP servers found in config")
+    results = []
+    for raw_sid, cfg in servers.items():
+        scope, registry_path, prefix = _mcp_scope({**cfg, "scope": payload.get("scope")}, current_user)
+        sid = prefix + raw_sid
+        if scope == "user":
+            cfg["owner"] = current_user["username"]
+        info = await orchestrator.mcp.add_server(sid, cfg, registry_path=registry_path)
+        client = orchestrator.mcp.get_client(sid)
+        results.append({
+            "id": sid,
+            "connected": bool(info),
+            "tools": info["tools"] if info else [],
+            "error": None if info else (client.last_error if client else "unknown"),
+        })
+    return {"imported": results}
+
+
+@app.get("/api/mcp/servers/{server_id}/resources")
+async def mcp_resources(server_id: str, current_user: dict = Depends(auth.get_current_user)):
+    if server_id not in visible_mcp(current_user):
+        raise HTTPException(404, "MCP server not found")
+    return {"resources": await orchestrator.mcp.list_resources(server_id)}
+
+
+@app.post("/api/mcp/servers/{server_id}/resources/ingest")
+async def mcp_ingest_resource(server_id: str, payload: dict, current_user: dict = Depends(auth.get_current_user)):
+    """Read an MCP resource and index it into the user's RAG space so it
+    can be used as context like an uploaded file."""
+    if server_id not in visible_mcp(current_user):
+        raise HTTPException(404, "MCP server not found")
+    uri = payload.get("uri")
+    if not uri:
+        raise HTTPException(400, "uri is required")
+    try:
+        data = await orchestrator.mcp.read_resource(server_id, uri)
+    except Exception as e:
+        raise HTTPException(502, f"Could not read resource: {e}")
+    text = data.get("text") or ""
+    if not text.strip():
+        raise HTTPException(400, "Resource has no text content to index")
+    name = payload.get("filename") or re.sub(r"[^\w.\-]+", "_", uri.split("/")[-1] or "resource")[:80]
+    if "." not in name:
+        name += ".md"
+    name = safe_filename(f"mcp-{server_id}-{name}")
+    target = user_dir(current_user["username"], "uploads") / name
+    target.write_text(text, encoding="utf-8")
+    result = {"filename": name, "size": len(text)}
+    if orchestrator.rag_engine:
+        result["ingest"] = await orchestrator.rag_engine.ingest_file(
+            target, metadata={"mcp_server": server_id, "mcp_uri": uri, **rag_where(current_user)}
+        )
+    return result
 
 
 # ------ Conversation Endpoints ------
@@ -664,13 +1053,13 @@ from starlette.requests import Request as StarletteRequest
 
 @app.get("/api/conversations")
 async def list_conversations_endpoint(current_user: dict = Depends(auth.get_current_user)):
-    """List all saved conversations for the current user."""
+    """List the current user's saved conversations."""
     return {"conversations": conversations.list_conversations(current_user["username"])}
 
 
 @app.get("/api/conversations/{conversation_id}")
 async def get_conversation_endpoint(conversation_id: str, current_user: dict = Depends(auth.get_current_user)):
-    """Load a specific conversation for the current user."""
+    """Load one of the current user's conversations."""
     data = conversations.get_conversation(conversation_id, current_user["username"])
     if not data:
         raise HTTPException(404, "Conversation not found")
@@ -686,6 +1075,10 @@ async def save_conversation_post(request: StarletteRequest, current_user: dict =
         messages=body.get("messages", []),
         model=body.get("model", ""),
         token_usage=body.get("token_usage"),
+        extra={
+            k: body[k] for k in ("compaction_state", "generation", "selected_tools", "selected_files")
+            if k in body
+        },
         username=current_user["username"],
     )
     return result
@@ -693,7 +1086,7 @@ async def save_conversation_post(request: StarletteRequest, current_user: dict =
 
 @app.delete("/api/conversations/{conversation_id}")
 async def delete_conversation_endpoint(conversation_id: str, current_user: dict = Depends(auth.get_current_user)):
-    """Delete a conversation for the current user."""
+    """Delete one of the current user's conversations."""
     ok = conversations.delete_conversation(conversation_id, current_user["username"])
     if not ok:
         raise HTTPException(404, "Conversation not found")
@@ -705,15 +1098,16 @@ async def delete_conversation_endpoint(conversation_id: str, current_user: dict 
 
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
-    """WebSocket endpoint for streaming chat. Authenticates via ?token=..."""
-    token = websocket.query_params.get("token")
+    """WebSocket endpoint for streaming chat. Authenticates via ``?token=``
+    or the session cookie and scopes tools / files / RAG to the user."""
     try:
-        user = auth.get_ws_user(token)
+        user = auth.get_ws_user(websocket.query_params.get("token"), websocket.headers.get("cookie"))
     except Exception as e:
         await websocket.close(code=1008, reason=str(e))
         return
 
     await websocket.accept()
+    tool_ctx = ctx_for(user)
 
     try:
         while True:
@@ -722,9 +1116,11 @@ async def websocket_chat(websocket: WebSocket):
 
             messages = request.get("messages", [])
             model = request.get("model", "")
-            tools = request.get("tools", [])
+            tools = _filter_mcp_tools(request.get("tools", []), user)
             files = request.get("files", [])
             system = request.get("system_prompt", "")
+            generation = request.get("generation") or None
+            compaction_state = request.get("compaction_state") or None
 
             async for event in orchestrator.chat_stream(
                 messages=messages,
@@ -732,6 +1128,10 @@ async def websocket_chat(websocket: WebSocket):
                 selected_tools=tools,
                 selected_files=files,
                 system_prompt=system,
+                generation=generation,
+                compaction_state=compaction_state,
+                tool_context=tool_ctx,
+                rag_where=rag_where(user),
             ):
                 await websocket.send_text(json.dumps(event))
 
@@ -751,12 +1151,18 @@ frontend_dir = Path(__file__).parent.parent / "frontend" / "dist"
 if frontend_dir.exists():
     app.mount("/assets", StaticFiles(directory=frontend_dir / "assets"), name="assets")
 
+    _frontend_root = frontend_dir.resolve()
+
     @app.get("/{path:path}")
     async def serve_frontend(path: str):
-        file_path = frontend_dir / path
-        if file_path.is_file():
+        try:
+            file_path = (_frontend_root / path).resolve()
+        except (OSError, ValueError):
+            file_path = _frontend_root / "index.html"
+        # Never serve anything outside the built frontend directory.
+        if _frontend_root in file_path.parents and file_path.is_file():
             return FileResponse(file_path)
-        return FileResponse(frontend_dir / "index.html")
+        return FileResponse(_frontend_root / "index.html")
 
 
 def main():

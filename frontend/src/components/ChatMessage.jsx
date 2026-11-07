@@ -25,8 +25,16 @@ import {
   FileType2 as FileType2Icon,
   Terminal as TerminalIcon,
   ExternalLink as ExternalLinkIcon,
+  Play as PlayIcon,
+  Loader2 as LoaderIcon,
+  Table as TableIcon,
+  WrapText as WrapIcon,
+  Info as InfoIcon,
 } from "lucide-react";
 import LazyPlot from "./LazyPlot";
+import CsvTable from "./CsvTable";
+import { highlightCode, runnableLanguage } from "./codeHighlight";
+import { fileUrl } from "../hooks/api";
 
 // Compute a suitable inline height for Plotly charts based on
 // subplot grid rows and trace count so multiplots don't get cropped.
@@ -267,10 +275,16 @@ function getFileTypeMeta(filename, contentType) {
   return { icon, className, previewable, ext, isImg, isPdf };
 }
 
-// Copy-to-clipboard code block wrapper with language-aware download & canvas preview
-function CodeBlock({ code, lang, onOpenCanvas }) {
+// Copy-to-clipboard code block wrapper with language-aware download,
+// canvas preview, syntax highlighting and a Run button for languages the
+// sandbox can execute. ``streaming`` marks a block whose closing fence
+// has not arrived yet (we still render it as code instead of flashing
+// raw backticks).
+function CodeBlock({ code, lang, onOpenCanvas, onRunCode, streaming }) {
   const [copied, setCopied] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  const [wrap, setWrap] = useState(false);
+  const [running, setRunning] = useState(false);
 
   const handleCopy = useCallback(() => {
     navigator.clipboard.writeText(code).then(() => {
@@ -292,6 +306,14 @@ function CodeBlock({ code, lang, onOpenCanvas }) {
   const { ext, contentType } = getLangInfo(lang);
   const isKnownLang = !!(
     lang && LANG_EXT_MAP[(lang || "").toLowerCase().trim()]
+  );
+  const runLang = runnableLanguage(lang);
+
+  // Highlighting is skipped while the block is still streaming (it would
+  // re-tokenise on every token) and for very large blocks.
+  const highlighted = React.useMemo(
+    () => (streaming ? null : highlightCode(displayCode, lang)),
+    [displayCode, lang, streaming],
   );
 
   // Show download/preview for:
@@ -315,17 +337,47 @@ function CodeBlock({ code, lang, onOpenCanvas }) {
     if (onOpenCanvas) {
       onOpenCanvas({
         content: code,
-        contentType: contentType,
+        contentType: contentType === "text" ? "code" : contentType,
+        lang,
         title: `${lang || "Snippet"}.${ext}`,
       });
     }
   }, [onOpenCanvas, code, contentType, lang, ext]);
 
+  const handleRun = useCallback(async () => {
+    if (!onRunCode || running) return;
+    setRunning(true);
+    try {
+      await onRunCode({ code, language: runLang });
+    } finally {
+      setRunning(false);
+    }
+  }, [onRunCode, code, runLang, running]);
+
   return (
-    <div className="code-block-wrapper">
+    <div className={`code-block-wrapper ${streaming ? "streaming" : ""}`}>
       <div className="code-block-header">
         {lang && <span className="code-block-lang">{lang}</span>}
+        {streaming && <span className="code-block-streaming">writing…</span>}
         <div className="code-block-actions">
+          {runLang && onRunCode && !streaming && (
+            <button
+              className="code-block-action code-block-run"
+              onClick={handleRun}
+              disabled={running}
+              title={runLang === "html" ? "Open in preview" : `Run ${runLang} in the sandbox`}
+            >
+              {running ? <LoaderIcon size={12} className="spin" /> : <PlayIcon size={12} />}
+              {running ? "Running" : runLang === "html" ? "Preview" : "Run"}
+            </button>
+          )}
+          <button
+            className={`code-block-action ${wrap ? "active" : ""}`}
+            onClick={() => setWrap((v) => !v)}
+            title={wrap ? "Disable line wrap" : "Wrap long lines"}
+          >
+            <WrapIcon size={12} />
+          </button>
           {showFileActions && (
             <>
               <button
@@ -367,11 +419,19 @@ function CodeBlock({ code, lang, onOpenCanvas }) {
           </button>
         </div>
       </div>
-      <pre
-        className={`code-block-pre ${isLarge && !expanded ? "truncated" : ""}`}
-      >
-        <code>{displayCode}</code>
-      </pre>
+      {highlighted ? (
+        <pre
+          className={`code-block-pre hljs ${isLarge && !expanded ? "truncated" : ""} ${wrap ? "wrap" : ""}`}
+        >
+          <code dangerouslySetInnerHTML={{ __html: highlighted }} />
+        </pre>
+      ) : (
+        <pre
+          className={`code-block-pre ${isLarge && !expanded ? "truncated" : ""} ${wrap ? "wrap" : ""}`}
+        >
+          <code>{displayCode}</code>
+        </pre>
+      )}
     </div>
   );
 }
@@ -527,25 +587,30 @@ function renderLinesList(lines, keyPrefix = "") {
 }
 
 // Markdown-like renderer with tables & rich code blocks
-function renderContent(text, onOpenCanvas) {
+function renderContent(text, onOpenCanvas, onRunCode) {
   if (!text) return null;
 
-  // Split into code blocks and text
-  const parts = text.split(/(```[\s\S]*?```)/g);
+  // Split into code blocks and text. A trailing fence without its
+  // closing ``` (still streaming) is treated as an open code block so
+  // the UI renders code — not raw backticks — while the model types.
+  const parts = text.split(/(```[\s\S]*?```|```[\s\S]*$)/g);
 
   return parts.map((part, i) => {
     // Code block
     if (part.startsWith("```")) {
-      const lines = part.slice(3, -3);
+      const closed = part.length >= 6 && part.endsWith("```");
+      const lines = closed ? part.slice(3, -3) : part.slice(3);
       const firstNewline = lines.indexOf("\n");
-      const lang = firstNewline > 0 ? lines.slice(0, firstNewline).trim() : "";
-      const code = firstNewline > 0 ? lines.slice(firstNewline + 1) : lines;
+      const lang = firstNewline > 0 ? lines.slice(0, firstNewline).trim() : (closed ? "" : lines.trim());
+      const code = firstNewline > 0 ? lines.slice(firstNewline + 1) : (closed ? lines : "");
       return (
         <CodeBlock
           key={i}
-          code={code}
-          lang={lang}
+          code={code.replace(/\n$/, "")}
+          lang={lang.split(/\s+/)[0]}
           onOpenCanvas={onOpenCanvas}
+          onRunCode={onRunCode}
+          streaming={!closed}
         />
       );
     }
@@ -754,6 +819,12 @@ function renderContent(text, onOpenCanvas) {
 // artifact, otherwise an object suitable for handing to onOpenCanvas.
 function buildCanvasDataForResult(toolName, parsedResult) {
   if (!parsedResult) return null;
+  if (parsedResult.csv_preview) {
+    return {
+      csvPreview: parsedResult.csv_preview,
+      title: parsedResult.title || parsedResult.csv_preview.filename,
+    };
+  }
   if (parsedResult.figure_json) {
     let fig = parsedResult.figure_json;
     if (typeof fig === "string") {
@@ -793,12 +864,91 @@ function buildCanvasDataForResult(toolName, parsedResult) {
   }
   if (toolName === "code_executor" && parsedResult.output != null) {
     return {
-      title: "Code Output",
+      title: `Code Output${parsedResult.language ? ` (${parsedResult.language})` : ""}`,
       contentType: "terminal",
       chunks: parsedResult.output.split("\n"),
+      artifacts: parsedResult.artifacts || [],
     };
   }
   return null;
+}
+
+// Interactive table card for csv_viewer results.
+function CsvPreviewCard({ preview, title, onOpenCanvas }) {
+  const [showStats, setShowStats] = useState(false);
+  const statCols = preview.stats && typeof preview.stats === "object" ? Object.keys(preview.stats) : [];
+  return (
+    <div className="plot-result-card csv-card">
+      <div className="plot-result-header">
+        <TableIcon size={14} />
+        <span>{title || preview.filename}</span>
+        <div className="plot-result-actions">
+          {statCols.length > 0 && (
+            <button
+              className={`plot-result-action ${showStats ? "copied" : ""}`}
+              onClick={() => setShowStats((v) => !v)}
+              title="Toggle column statistics"
+            >
+              <InfoIcon size={12} />
+            </button>
+          )}
+          <button
+            className="plot-result-action"
+            onClick={() => onOpenCanvas && onOpenCanvas({ csvPreview: preview, title: title || preview.filename })}
+            title="Open in canvas"
+          >
+            <EyeIcon size={12} />
+          </button>
+        </div>
+      </div>
+      <CsvTable columns={preview.columns} rows={preview.rows} pageSize={10} compact />
+      {showStats && (
+        <div className="csv-stats">
+          <table>
+            <thead>
+              <tr>
+                <th>column</th>
+                <th>type</th>
+                <th>nulls</th>
+                <th>unique</th>
+                <th>mean</th>
+                <th>std</th>
+                <th>min</th>
+                <th>max</th>
+                <th>top</th>
+              </tr>
+            </thead>
+            <tbody>
+              {preview.columns.map((c) => {
+                const st = (preview.stats && preview.stats[c.name]) || {};
+                const fmt = (v) => (v == null ? "" : typeof v === "number" ? Number(v.toFixed ? v.toFixed(4) : v) : String(v));
+                return (
+                  <tr key={c.name}>
+                    <td>{c.name}</td>
+                    <td>{c.dtype}</td>
+                    <td>{c.nulls}</td>
+                    <td>{c.unique}</td>
+                    <td>{fmt(st.mean)}</td>
+                    <td>{fmt(st.std)}</td>
+                    <td>{fmt(st.min)}</td>
+                    <td>{fmt(st.max)}</td>
+                    <td>{fmt(st.top)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div className="plot-result-footer">
+        <span className="plot-result-meta">
+          {preview.total_rows.toLocaleString()} rows · {preview.columns.length} columns
+          {preview.filtered_rows !== preview.total_rows ? ` · ${preview.filtered_rows.toLocaleString()} match filter` : ""}
+          {preview.returned_rows < preview.filtered_rows ? ` · showing ${preview.returned_rows}` : ""}
+        </span>
+      </div>
+    </div>
+  );
 }
 
 function ToolCallDropdown({ toolCall, toolResult, onOpenCanvas }) {
@@ -1093,7 +1243,7 @@ function PlotlyChartCard({
 // Terminal output card: compact inline preview of code execution
 // results with preview / download / copy actions, mirroring the
 // plot-result cards.
-function TerminalOutputCard({ output, title, onOpenCanvas }) {
+function TerminalOutputCard({ output, title, onOpenCanvas, artifacts, returnCode }) {
   const [copied, setCopied] = useState(false);
   const chunks = (output || "").split("\n");
 
@@ -1130,6 +1280,7 @@ function TerminalOutputCard({ output, title, onOpenCanvas }) {
                 title: title || "Code Output",
                 contentType: "terminal",
                 chunks,
+                artifacts,
               })
             }
             title="Open in canvas"
@@ -1166,8 +1317,18 @@ function TerminalOutputCard({ output, title, onOpenCanvas }) {
           </div>
         ))}
       </div>
+      {artifacts && artifacts.length > 0 && (
+        <div className="code-artifacts">
+          {artifacts.map((a) => (
+            <DownloadableFileCard key={a.filename} file={a} onOpenCanvas={onOpenCanvas} compact />
+          ))}
+        </div>
+      )}
       <div className="plot-result-footer">
-        <span className="plot-result-meta">{chunks.length} lines</span>
+        <span className="plot-result-meta">
+          {chunks.length} lines
+          {returnCode != null ? ` · exit ${returnCode}` : ""}
+        </span>
       </div>
     </div>
   );
@@ -1219,12 +1380,12 @@ function SandboxSessionCard({ sessionId, onOpenCanvas }) {
 // Generic downloadable-file card. Icon and colour change by file type;
 // Preview is only shown when the file is renderable in the canvas
 // (text, code, JSON, Markdown, HTML, PDF, PNG/JPG, etc.).
-function DownloadableFileCard({ file, onOpenCanvas }) {
+function DownloadableFileCard({ file, onOpenCanvas, compact }) {
   // Tools should send both URLs explicitly; fall back to sensible
   // defaults so older tool payloads keep working.
   const encodedName = encodeURIComponent(file.filename);
-  const downloadHref = file.download_url || `/api/download/${encodedName}`;
-  const previewHref = file.preview_url || `/api/files/${encodedName}`;
+  const downloadHref = fileUrl(file.download_url || `/api/download/${encodedName}`);
+  const previewHref = fileUrl(file.preview_url || `/api/files/${encodedName}`);
   const { icon, className, previewable, isImg } = getFileTypeMeta(
     file.filename,
     file.content_type,
@@ -1287,10 +1448,10 @@ function DownloadableFileCard({ file, onOpenCanvas }) {
   }, [isImg, previewHref, downloadHref]);
 
   return (
-    <div className="downloadable-card">
+    <div className={`downloadable-card ${compact ? "compact" : ""}`}>
       <div className="downloadable-header">
         <span className={`downloadable-icon ${className}`}>{icon}</span>
-        <span className="downloadable-filename">{file.filename}</span>
+        <span className="downloadable-filename">{file.original_name || file.filename}</span>
         <span className="downloadable-meta">
           {file.content_type}
           {sizeLabel ? ` — ${sizeLabel}` : ""}
@@ -1354,7 +1515,7 @@ function DownloadableFileCard({ file, onOpenCanvas }) {
   );
 }
 
-export default function ChatMessage({ message, onOpenCanvas }) {
+export default function ChatMessage({ message, onOpenCanvas, onRunCode }) {
   const isUser = message.role === "user";
 
   // Match tool calls with their results
@@ -1376,6 +1537,7 @@ export default function ChatMessage({ message, onOpenCanvas }) {
         (p && p.plot_image) ||
         (p && p.figure_json) ||
         (p && p.downloadable) ||
+        (p && p.csv_preview) ||
         (p && p.interactive_session) ||
         (p && p.output != null)
       );
@@ -1400,7 +1562,29 @@ export default function ChatMessage({ message, onOpenCanvas }) {
       </div>
       <div className="message-body">
         {isUser ? (
-          <p>{message.content}</p>
+          <>
+            {message.images && message.images.length > 0 && (
+              <div className="message-images">
+                {message.images.map((img, i) => (
+                  <img
+                    key={i}
+                    src={typeof img === "string" ? img : img.dataUrl}
+                    alt={`attachment ${i + 1}`}
+                    className="message-image"
+                    onClick={() =>
+                      onOpenCanvas &&
+                      onOpenCanvas({
+                        previewUrl: typeof img === "string" ? img : img.dataUrl,
+                        contentType: "image",
+                        title: (typeof img === "object" && img.name) || `Image ${i + 1}`,
+                      })
+                    }
+                  />
+                ))}
+              </div>
+            )}
+            {message.content && <p>{message.content}</p>}
+          </>
         ) : (
           segments.map((seg, i) => {
             if (seg.type === "thinking") {
@@ -1414,10 +1598,21 @@ export default function ChatMessage({ message, onOpenCanvas }) {
             }
             return (
               <React.Fragment key={`text-${i}`}>
-                {renderContent(seg.text, onOpenCanvas)}
+                {renderContent(seg.text, onOpenCanvas, onRunCode)}
               </React.Fragment>
             );
           })
+        )}
+
+        {/* Provider notices (tools disabled, images ignored, compaction…) */}
+        {!isUser && message.notices && message.notices.length > 0 && (
+          <div className="message-notices">
+            {message.notices.map((n, i) => (
+              <div key={i} className="message-notice">
+                <InfoIcon size={12} /> {n}
+              </div>
+            ))}
+          </div>
         )}
 
         {/* Collapsible tool reasoning */}
@@ -1468,7 +1663,7 @@ export default function ChatMessage({ message, onOpenCanvas }) {
           // renderer below picks it up instead; otherwise we render the
           // static PNG here with preview/download/copy actions.
           if (parsed.plot_image && !parsed.figure_json) {
-            const imgUrl = `/api/plots/${encodeURIComponent(parsed.plot_image)}`;
+            const imgUrl = fileUrl(parsed.plot_url || `/api/plots/${encodeURIComponent(parsed.plot_image)}`);
             return (
               <PlotImageCard
                 key={`plot-${i}`}
@@ -1547,13 +1742,26 @@ export default function ChatMessage({ message, onOpenCanvas }) {
             );
           }
 
-          // Downloadable file result
-          if (parsed.downloadable) {
+          // Downloadable file result (code_executor renders its own
+          // artifacts inside the terminal card)
+          if (parsed.downloadable && !(tr.name === "code_executor" && parsed.output != null)) {
             const d = parsed.downloadable;
             return (
               <DownloadableFileCard
                 key={`dl-${i}`}
                 file={d}
+                onOpenCanvas={onOpenCanvas}
+              />
+            );
+          }
+
+          // CSV viewer table
+          if (parsed.csv_preview) {
+            return (
+              <CsvPreviewCard
+                key={`csv-${i}`}
+                preview={parsed.csv_preview}
+                title={parsed.title}
                 onOpenCanvas={onOpenCanvas}
               />
             );
@@ -1565,8 +1773,10 @@ export default function ChatMessage({ message, onOpenCanvas }) {
               <TerminalOutputCard
                 key={`code-${i}`}
                 output={parsed.output}
-                title={parsed.title || "Code Output"}
+                title={parsed.title || `Code Output${parsed.language ? ` (${parsed.language})` : ""}`}
                 onOpenCanvas={onOpenCanvas}
+                artifacts={parsed.artifacts}
+                returnCode={parsed.return_code}
               />
             );
           }
