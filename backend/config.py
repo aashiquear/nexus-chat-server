@@ -45,7 +45,7 @@ def _substitute_env_vars(value: Any) -> Any:
 
 
 def load_config(config_path: Path | None = None) -> dict:
-    """Load and cache configuration from YAML file(s)."""
+    """Load and cache configuration from YAML file."""
     global _config
     if _config is not None:
         return _config
@@ -57,7 +57,8 @@ def load_config(config_path: Path | None = None) -> dict:
     with open(path) as f:
         raw = yaml.safe_load(f)
 
-    # Merge server override if present
+    # Server edition: deep-merge config/settings.server.yaml on top so the
+    # upstream settings.yaml can be updated without losing server tweaks.
     if SERVER_CONFIG_PATH.exists():
         with open(SERVER_CONFIG_PATH) as f:
             override = yaml.safe_load(f)
@@ -75,13 +76,31 @@ def get_config() -> dict:
     return _config
 
 
+def as_bool(value: Any, default: bool = False) -> bool:
+    """Interpret YAML/env values as booleans. Environment substitution
+    yields strings, so ``enabled: ${FLAG:-false}`` must not be truthy just
+    because ``"false"`` is a non-empty string."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on", "y", "t"):
+        return True
+    if text in ("0", "false", "no", "off", "n", "f", "", "none", "null"):
+        return False
+    return default
+
+
 def get_enabled_providers() -> dict:
     """Return only enabled LLM provider configs."""
     cfg = get_config()
     providers = cfg.get("providers", {})
     return {
         name: prov for name, prov in providers.items()
-        if prov.get("enabled", False)
+        if as_bool(prov.get("enabled", False))
     }
 
 
@@ -91,7 +110,7 @@ def get_enabled_tools() -> dict:
     tools = cfg.get("tools", {})
     return {
         name: tool for name, tool in tools.items()
-        if tool.get("enabled", False)
+        if as_bool(tool.get("enabled", False))
     }
 
 
@@ -101,5 +120,5 @@ def get_enabled_mcp_servers() -> dict:
     servers = cfg.get("mcp_servers", {})
     return {
         name: srv for name, srv in servers.items()
-        if srv.get("enabled", False)
+        if as_bool(srv.get("enabled", False))
     }

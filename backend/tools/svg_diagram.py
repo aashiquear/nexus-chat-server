@@ -66,6 +66,13 @@ class SVGDiagramTool(BaseTool):
             return json.dumps({"error": "Could not extract valid SVG element."})
 
         svg_clean = match.group(1)
+        # Strip active content: scripts, event handlers, javascript: URLs,
+        # foreignObject (can embed HTML). The UI renders SVG via <img>, but
+        # the file is also served from /api/files so keep it inert on disk.
+        svg_clean = re.sub(r"<script\b[\s\S]*?</script\s*>", "", svg_clean, flags=re.IGNORECASE)
+        svg_clean = re.sub(r"<foreignObject\b[\s\S]*?</foreignObject\s*>", "", svg_clean, flags=re.IGNORECASE)
+        svg_clean = re.sub(r"\s+on[a-zA-Z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", "", svg_clean)
+        svg_clean = re.sub(r"(href|xlink:href)\s*=\s*([\"'])\s*javascript:[^\"']*\2", r"\1=\2#\2", svg_clean, flags=re.IGNORECASE)
 
         # Ensure xmlns is present for standalone rendering
         if "xmlns" not in svg_clean:
@@ -74,7 +81,7 @@ class SVGDiagramTool(BaseTool):
             )
 
         # Save to data/uploads so it's accessible via file reader too
-        output_dir = Path(
+        output_dir = Path(self.ctx.files_dir) if self.ctx.username is not None else Path(
             self.config.get("output_dir", "./data/uploads")
         )
         output_dir.mkdir(parents=True, exist_ok=True)

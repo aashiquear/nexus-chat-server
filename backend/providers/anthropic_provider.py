@@ -1,12 +1,19 @@
-"""Anthropic Claude LLM provider."""
+"""Anthropic Claude LLM provider.
 
-import json
+Supports streaming text, extended thinking, native tool use (the tool
+name/id arrive on ``content_block_start`` and the JSON input is streamed
+as ``input_json_delta`` fragments) and image attachments (base64 image
+content blocks). Generation settings from the prompt-box control
+(``temperature``, ``top_p``, ``top_k``, ``max_tokens``, thinking budget)
+override the per-model defaults.
+"""
+
 import logging
 import time
 from typing import AsyncIterator
 
 from . import (
-    BaseLLMProvider, ChatRequest, StreamChunk, register_provider
+    BaseLLMProvider, ChatRequest, StreamChunk, parse_data_url, register_provider
 )
 
 logger = logging.getLogger(__name__)
@@ -16,6 +23,7 @@ _REMOTE_MODEL_CACHE_TTL_SECONDS = 60
 
 @register_provider("anthropic")
 class AnthropicProvider(BaseLLMProvider):
+    kind = "cloud"
 
     def __init__(self, config: dict):
         super().__init__(config)
@@ -30,7 +38,11 @@ class AnthropicProvider(BaseLLMProvider):
                 api_key = self.config.get("api_key", "")
                 if not api_key or api_key.startswith("${"):
                     return None
-                self._client = anthropic.AsyncAnthropic(api_key=api_key)
+                kwargs = {"api_key": api_key}
+                base_url = self.config.get("base_url")
+                if base_url and not str(base_url).startswith("${"):
+                    kwargs["base_url"] = base_url
+                self._client = anthropic.AsyncAnthropic(**kwargs)
             except ImportError:
                 logger.warning("anthropic package not installed")
                 return None
@@ -56,7 +68,8 @@ class AnthropicProvider(BaseLLMProvider):
         ):
             return self._remote_models_cache
         try:
-            resp = await client.models.list()
+            models: set[str] = set()
+            resp = await client.models.list(limit=1000)
             data = getattr(resp, "data", None) or []
             models = {m.id for m in data if getattr(m, "id", None)}
             self._remote_models_cache = models
@@ -66,45 +79,85 @@ class AnthropicProvider(BaseLLMProvider):
             logger.debug("Anthropic models.list probe failed: %s", e)
             return self._remote_models_cache
 
+    async def model_capabilities(self, model_id: str) -> dict | None:
+        # All current Claude models accept images and tools.
+        cfg = next((m for m in self.list_models() if m.get("id") == model_id), {})
+        return {
+            "vision": True,
+            "tools": True,
+            "thinking": bool(cfg.get("thinking") or cfg.get("thinking_budget_tokens")),
+            "context_length": cfg.get("context_length", 200000),
+            "quantization": None,
+            "family": "claude",
+            "parameter_size": None,
+        }
+
     def _convert_tools(self, tools) -> list[dict]:
         return [
             {
                 "name": t.name,
                 "description": t.description,
-                "input_schema": t.parameters,
+                "input_schema": t.parameters or {"type": "object", "properties": {}},
             }
             for t in tools
         ]
 
     def _build_messages(self, messages) -> list[dict]:
-        result = []
+        """Convert to Anthropic format, honouring the API constraints:
+        no system messages inline, no empty content, alternating roles."""
+        result: list[dict] = []
         for msg in messages:
             if msg.role == "system":
                 continue  # Handled separately
-            result.append({"role": msg.role, "content": msg.content})
+            role = "assistant" if msg.role == "assistant" else "user"
+            blocks: list[dict] = []
+            if msg.images and role == "user":
+                for img in msg.images:
+                    media_type, data = parse_data_url(img)
+                    blocks.append({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": data},
+                    })
+            text = msg.content or ""
+            if text.strip():
+                blocks.append({"type": "text", "text": text})
+            if not blocks:
+                if role == "assistant":
+                    continue
+                blocks.append({"type": "text", "text": "(empty)"})
+            if result and result[-1]["role"] == role:
+                # Merge consecutive same-role turns.
+                result[-1]["content"].extend(blocks)
+            else:
+                result.append({"role": role, "content": blocks})
+        # Conversation must start with a user turn.
+        while result and result[0]["role"] != "user":
+            result.pop(0)
         return result
 
-    def _build_thinking_kwarg(self, request: ChatRequest) -> dict | None:
+    def _build_thinking_kwarg(self, request: ChatRequest, max_tokens: int) -> dict | None:
         """Translate the generic thinking config into Anthropic's
         ``thinking`` parameter, or return None for non-thinking models."""
-        cfg = request.thinking
-        if not cfg or not cfg.get("enabled"):
+        override = request.gen("thinking")
+        cfg = request.thinking or {}
+        if override is False:
             return None
-        # Anthropic requires budget_tokens < max_tokens. Default to a
-        # sensible portion of the response budget if the user didn't pin one.
-        budget = cfg.get("budget_tokens") or max(1024, request.max_tokens // 2)
-        budget = min(budget, max(1024, request.max_tokens - 512))
+        if not (override or cfg.get("enabled")):
+            return None
+        # Anthropic requires budget_tokens < max_tokens (min 1024).
+        budget = (
+            request.gen("thinking_budget_tokens")
+            or cfg.get("budget_tokens")
+            or max(1024, max_tokens // 2)
+        )
+        budget = max(1024, min(int(budget), max(1024, max_tokens - 512)))
         return {"type": "enabled", "budget_tokens": int(budget)}
 
-    async def chat(self, request: ChatRequest) -> AsyncIterator[StreamChunk]:
-        client = self._get_client()
-        if not client:
-            yield StreamChunk(content="Anthropic provider not configured.", done=True)
-            return
-
+    def _build_kwargs(self, request: ChatRequest) -> dict:
+        max_tokens = int(request.gen("max_tokens", request.max_tokens))
         kwargs = {
             "model": request.model,
-            "max_tokens": request.max_tokens,
+            "max_tokens": max_tokens,
             "messages": self._build_messages(request.messages),
         }
         if request.system_prompt:
@@ -112,13 +165,35 @@ class AnthropicProvider(BaseLLMProvider):
         if request.tools:
             kwargs["tools"] = self._convert_tools(request.tools)
 
-        # Extended thinking, when configured for this model. Non-thinking
-        # models leave ``thinking`` unset so the request is unchanged.
-        thinking_kwarg = self._build_thinking_kwarg(request)
+        thinking_kwarg = self._build_thinking_kwarg(request, max_tokens)
         if thinking_kwarg:
             kwargs["thinking"] = thinking_kwarg
-            # API constraint: extended thinking forces temperature=1.
+            # Extended thinking must have a budget strictly below max_tokens.
+            if kwargs["thinking"]["budget_tokens"] >= max_tokens:
+                kwargs["max_tokens"] = kwargs["thinking"]["budget_tokens"] + 1024
+            # API constraint: extended thinking forces temperature=1 and
+            # forbids top_k / top_p tweaks.
             kwargs["temperature"] = 1.0
+        else:
+            kwargs["temperature"] = float(request.gen("temperature", request.temperature))
+            top_p = request.gen("top_p")
+            top_k = request.gen("top_k")
+            # Anthropic rejects temperature+top_p together on newer models;
+            # prefer temperature unless the user pinned only top_p.
+            if top_p not in (None, "") and request.gen("temperature") is None:
+                kwargs.pop("temperature", None)
+                kwargs["top_p"] = float(top_p)
+            if top_k not in (None, ""):
+                kwargs["top_k"] = int(top_k)
+        return kwargs
+
+    async def chat(self, request: ChatRequest) -> AsyncIterator[StreamChunk]:
+        client = self._get_client()
+        if not client:
+            yield StreamChunk(error="Anthropic provider not configured (missing API key).", done=True)
+            return
+
+        kwargs = self._build_kwargs(request)
 
         # Track whether the active content block is a "thinking" block so
         # we can bracket those deltas with <think>…</think> for the UI.
@@ -128,70 +203,74 @@ class AnthropicProvider(BaseLLMProvider):
             usage_data = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             async with client.messages.stream(**kwargs) as stream:
                 async for event in stream:
-                    if not hasattr(event, "type"):
+                    etype = getattr(event, "type", None)
+                    if not etype:
                         continue
-                    if event.type == "message_start" and hasattr(event, "message"):
+                    if etype == "message_start" and hasattr(event, "message"):
                         msg_usage = getattr(event.message, "usage", None)
                         if msg_usage:
-                            usage_data["prompt_tokens"] = getattr(msg_usage, "input_tokens", 0)
-                    elif event.type == "message_delta":
+                            usage_data["prompt_tokens"] = (
+                                (getattr(msg_usage, "input_tokens", 0) or 0)
+                                + (getattr(msg_usage, "cache_read_input_tokens", 0) or 0)
+                                + (getattr(msg_usage, "cache_creation_input_tokens", 0) or 0)
+                            )
+                    elif etype == "message_delta":
                         delta_usage = getattr(event, "usage", None)
                         if delta_usage:
-                            usage_data["completion_tokens"] = getattr(delta_usage, "output_tokens", 0)
+                            usage_data["completion_tokens"] = getattr(delta_usage, "output_tokens", 0) or 0
                         usage_data["total_tokens"] = usage_data["prompt_tokens"] + usage_data["completion_tokens"]
-                    elif event.type == "content_block_start":
+                    elif etype == "content_block_start":
                         block = getattr(event, "content_block", None)
                         block_type = getattr(block, "type", None) if block else None
                         if block_type == "thinking":
                             in_thinking_block = True
                             yield StreamChunk(content="<think>")
-                    elif event.type == "content_block_delta":
+                        elif block_type == "tool_use":
+                            yield StreamChunk(tool_call={
+                                "id": getattr(block, "id", None),
+                                "name": getattr(block, "name", None),
+                                "arguments": "",
+                            })
+                    elif etype == "content_block_delta":
                         delta = event.delta
-                        # Extended-thinking deltas carry their text on a
-                        # ``thinking`` attribute (delta type
-                        # "thinking_delta"); regular text uses ``text``.
-                        thinking_text = getattr(delta, "thinking", None)
-                        if thinking_text:
+                        dtype = getattr(delta, "type", "")
+                        if dtype == "thinking_delta" or getattr(delta, "thinking", None):
                             if not in_thinking_block:
                                 in_thinking_block = True
                                 yield StreamChunk(content="<think>")
-                            yield StreamChunk(content=thinking_text)
-                        elif hasattr(delta, "text") and delta.text:
-                            yield StreamChunk(content=delta.text)
-                        elif hasattr(delta, "partial_json"):
+                            yield StreamChunk(content=getattr(delta, "thinking", "") or "")
+                        elif dtype == "text_delta" or getattr(delta, "text", None):
+                            yield StreamChunk(content=getattr(delta, "text", "") or "")
+                        elif dtype == "input_json_delta" or hasattr(delta, "partial_json"):
                             yield StreamChunk(
-                                tool_call={"partial": delta.partial_json}
+                                tool_call={"partial": getattr(delta, "partial_json", "") or ""}
                             )
-                    elif event.type == "content_block_stop":
+                    elif etype == "content_block_stop":
                         if in_thinking_block:
                             in_thinking_block = False
                             yield StreamChunk(content="</think>")
-                    elif event.type == "message_stop":
+                    elif etype == "message_stop":
                         if in_thinking_block:
                             in_thinking_block = False
                             yield StreamChunk(content="</think>")
                         yield StreamChunk(done=True, usage=usage_data if usage_data["total_tokens"] > 0 else None)
+                        return
+            if in_thinking_block:
+                yield StreamChunk(content="</think>")
+            yield StreamChunk(done=True, usage=usage_data if usage_data["total_tokens"] > 0 else None)
         except Exception as e:
             logger.error(f"Anthropic error: {e}")
             if in_thinking_block:
                 yield StreamChunk(content="</think>")
-            yield StreamChunk(content=f"Error: {e}", done=True)
+            yield StreamChunk(error=f"Anthropic error: {e}", done=True)
 
     async def chat_sync(self, request: ChatRequest) -> str:
         client = self._get_client()
         if not client:
             return "Anthropic provider not configured."
-
-        kwargs = {
-            "model": request.model,
-            "max_tokens": request.max_tokens,
-            "messages": self._build_messages(request.messages),
-        }
-        if request.system_prompt:
-            kwargs["system"] = request.system_prompt
-        if request.tools:
-            kwargs["tools"] = self._convert_tools(request.tools)
-
+        kwargs = self._build_kwargs(request)
+        kwargs.pop("thinking", None)
+        kwargs.pop("tools", None)
         try:
             response = await client.messages.create(**kwargs)
             return "".join(

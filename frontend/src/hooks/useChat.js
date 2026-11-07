@@ -1,4 +1,15 @@
 import { useRef, useCallback, useState } from 'react'
+import { authHeaders } from './api'
+
+// Build the WebSocket URL. The server edition appends its auth token as a
+// query parameter here (browsers cannot set headers on WebSockets).
+export function chatSocketUrl() {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const headers = authHeaders()
+  const token = headers.Authorization ? headers.Authorization.replace(/^Bearer\s+/i, '') : ''
+  const qs = token ? `?token=${encodeURIComponent(token)}` : ''
+  return `${protocol}//${window.location.host}/ws/chat${qs}`
+}
 
 export function useChat() {
   const wsRef = useRef(null)
@@ -8,14 +19,12 @@ export function useChat() {
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const token = localStorage.getItem('nexus_token') || ''
-    const wsUrl = `${protocol}//${window.location.host}/ws/chat?token=${encodeURIComponent(token)}`
-    const ws = new WebSocket(wsUrl)
+    const ws = new WebSocket(chatSocketUrl())
 
     ws.onopen = () => setIsConnected(true)
     ws.onclose = () => {
       setIsConnected(false)
+      setIsStreaming(false)
       // Auto-reconnect after 3s
       setTimeout(connect, 3000)
     }
@@ -26,7 +35,7 @@ export function useChat() {
   }, [])
 
   const sendMessage = useCallback(
-    ({ messages, model, tools, files, system_prompt }, onEvent) => {
+    ({ messages, model, tools, files, system_prompt, generation, compaction_state, tool_mode }, onEvent) => {
       const ws = wsRef.current
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         onEvent({ type: 'error', content: 'Not connected to server' })
@@ -48,7 +57,7 @@ export function useChat() {
       }
 
       ws.send(
-        JSON.stringify({ messages, model, tools, files, system_prompt })
+        JSON.stringify({ messages, model, tools, files, system_prompt, generation, compaction_state, tool_mode })
       )
     },
     []

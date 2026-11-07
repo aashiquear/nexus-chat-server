@@ -1,9 +1,7 @@
 import React from 'react'
-import { ArrowRight, LogIn, LogOut } from 'lucide-react'
+import { ArrowRight, LogOut } from 'lucide-react'
 
 export default function SplashScreen({ onStart, onLogout, user }) {
-  const isReturning = !!user
-
   return (
     <div className="splash-screen">
       <div className="splash-content">
@@ -93,7 +91,7 @@ export default function SplashScreen({ onStart, onLogout, user }) {
             {/* Divider */}
             <line className="logo-div" x1="290" y1="405" x2="390" y2="405" stroke="#5a8a7a" strokeWidth="1.5" strokeLinecap="round" opacity="0.3" />
 
-            {/* Tagline */}
+            {/* Tagline - each word bolds in sync with its paired bubble pop */}
             <text className="logo-tag" x="340" y="435" textAnchor="middle" fontFamily="'DM Sans', system-ui, -apple-system, sans-serif" fontSize="15" fontWeight="500" letterSpacing="5" fill="#6b9d8c">
               <tspan className="tag-word tag-word-1">AGENTIC</tspan>
               <tspan> · </tspan>
@@ -106,29 +104,23 @@ export default function SplashScreen({ onStart, onLogout, user }) {
           </svg>
         </div>
 
-        {isReturning ? (
-          <div style={{ textAlign: 'center', marginTop: 8 }}>
-            <div style={{ fontSize: 16, color: 'var(--text-secondary)', marginBottom: 16 }}>
-              Welcome back, <strong>{user.username}</strong>
-            </div>
-            <button className="splash-start-btn" onClick={onStart}>
-              <span>Start Chat</span>
-              <ArrowRight size={16} />
-            </button>
-            <button
-              className="splash-start-btn"
-              onClick={onLogout}
-              style={{ marginTop: 12, background: 'transparent', color: 'var(--error)', border: '1px solid var(--error)' }}
-            >
-              <LogOut size={16} />
-              <span>Log Out</span>
-            </button>
+        {user && (
+          <div style={{ fontSize: 16, color: 'var(--text-secondary)', marginBottom: 16, textAlign: 'center' }}>
+            Welcome back, <strong>{user.username}</strong>
           </div>
-        ) : (
-          <button className="splash-start-btn" onClick={onStart}>
-            <LogIn size={16} />
-            <span>Sign In</span>
-            <ArrowRight size={16} />
+        )}
+        <button className="splash-start-btn" onClick={onStart}>
+          <span>Start Chat</span>
+          <ArrowRight size={16} />
+        </button>
+        {user && onLogout && (
+          <button
+            className="splash-start-btn"
+            onClick={onLogout}
+            style={{ marginTop: 12, background: 'transparent', color: 'var(--error)', border: '1px solid var(--error)' }}
+          >
+            <LogOut size={16} />
+            <span>Log Out</span>
           </button>
         )}
       </div>

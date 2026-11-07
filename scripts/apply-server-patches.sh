@@ -9,6 +9,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PATCH_DIR="$ROOT_DIR/scripts/server-patches"
 PATCH_FILE="$PATCH_DIR/nexus-chat-server.patch"
+# Upstream ref to track (override with UPSTREAM_REF=upstream/<branch>)
+UPSTREAM_REF="${UPSTREAM_REF:-$UPSTREAM_REF}"
+UPSTREAM_BRANCH="${UPSTREAM_REF#upstream/}"
 
 cd "$ROOT_DIR"
 
@@ -23,18 +26,18 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
     echo "       Proceeding anyway — conflicts may be harder to resolve."
 fi
 
-echo "[INFO] Resetting tracked files to upstream/main baseline..."
+echo "[INFO] Resetting tracked files to $UPSTREAM_REF baseline..."
 if ! git remote get-url upstream >/dev/null 2>&1; then
     echo "[INFO] Adding upstream remote..."
     git remote add upstream https://github.com/aashiquear/nexus-chat.git
 fi
-git fetch upstream main --quiet
+git fetch upstream "$UPSTREAM_BRANCH" --quiet
 
 # Reset the patched files to their upstream versions first
 PATCHED_FILES=$(grep "^diff --git a/" "$PATCH_FILE" | sed 's|diff --git a/||' | sed 's| b/.*||')
 for file in $PATCHED_FILES; do
-    if git show upstream/main:"$file" >/dev/null 2>&1; then
-        git show upstream/main:"$file" > "$file"
+    if git show "$UPSTREAM_REF":"$file" >/dev/null 2>&1; then
+        git show "$UPSTREAM_REF":"$file" > "$file"
     else
         # New file — remove it so the patch can create it
         rm -f "$file"

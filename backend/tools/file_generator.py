@@ -150,7 +150,7 @@ class FileGeneratorTool(BaseTool):
         title = kwargs.get("title", "")
         suggested_filename = kwargs.get("filename", "")
 
-        output_dir = Path(self.config.get("output_dir", "./data/downloads"))
+        output_dir = Path(self.ctx.downloads_dir) if self.ctx.username is not None else Path(self.config.get("output_dir", "./data/downloads"))
         output_dir.mkdir(parents=True, exist_ok=True)
 
         if not content:
@@ -196,8 +196,8 @@ class FileGeneratorTool(BaseTool):
                     "filename": filename,
                     "content_type": content_type,
                     "size": size,
-                    "download_url": f"/api/download/{filename}",
-                    "preview_url": f"/api/files/{filename}",
+                    "download_url": f"/api/download/{filename}{self.ctx.url_prefix()}",
+                    "preview_url": f"/api/files/{filename}{self.ctx.url_prefix()}",
                 }
             }
         )

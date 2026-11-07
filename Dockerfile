@@ -15,10 +15,15 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies. Node.js (npx) and uv (uvx) let Nexus run
+# stdio MCP servers from the npm / PyPI marketplaces inside the container.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
+    build-essential curl ca-certificates gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && pip install --no-cache-dir uv \
     && rm -rf /var/lib/apt/lists/*
+ENV ANONYMIZED_TELEMETRY=False
 
 # Install Python dependencies
 COPY requirements.txt .
@@ -31,12 +36,11 @@ COPY config/ ./config/
 # Copy built frontend
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
-# Create data directories
-RUN mkdir -p data/uploads data/vector_store data/files data/downloads data/conversations
+# Create data directories (per-user workspaces live under data/users/)
+RUN mkdir -p data/uploads data/vector_store data/files data/downloads data/conversations data/sandbox data/users
 
-# Pre-download ONNX embedding model so it's available offline at runtime
-ENV ANONYMIZED_TELEMETRY=False
-RUN python -c "from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2; ONNXMiniLM_L6_V2()" || true
+# Pre-download the ONNX embedding model so RAG works offline at runtime
+RUN python -c "from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2; ONNXMiniLM_L6_V2()._download_model_if_not_exists()" || true
 
 # Expose port
 EXPOSE 8000

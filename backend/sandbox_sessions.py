@@ -14,7 +14,7 @@ codes don't accumulate.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict
 
 
@@ -23,6 +23,23 @@ class SandboxSession:
     code: str
     sandbox_url: str
     created_at: float
+    language: str = "python"
+    packages: list[str] = field(default_factory=list)
+    timeout: int = 120
+    owner: str | None = None
+    # Uploaded input files to materialise in the run directory: {name: base64}
+    files: dict = field(default_factory=dict)
+
+    def initial_message(self) -> dict:
+        msg = {
+            "code": self.code,
+            "language": self.language,
+            "packages": self.packages,
+            "timeout": self.timeout,
+        }
+        if self.files:
+            msg["files"] = self.files
+        return msg
 
 
 _SESSIONS: Dict[str, SandboxSession] = {}
@@ -36,12 +53,26 @@ def _purge_expired() -> None:
         _SESSIONS.pop(sid, None)
 
 
-def register_session(session_id: str, code: str, sandbox_url: str) -> None:
+def register_session(
+    session_id: str,
+    code: str,
+    sandbox_url: str,
+    language: str = "python",
+    packages: list[str] | None = None,
+    timeout: int = 120,
+    owner: str | None = None,
+    files: dict | None = None,
+) -> None:
     _purge_expired()
     _SESSIONS[session_id] = SandboxSession(
         code=code,
         sandbox_url=sandbox_url,
         created_at=time.time(),
+        language=language,
+        packages=list(packages or []),
+        timeout=timeout,
+        owner=owner,
+        files=dict(files or {}),
     )
 
 

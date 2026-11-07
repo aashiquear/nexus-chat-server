@@ -12,6 +12,16 @@ from typing import Any, Iterable, Iterator
 
 logger = logging.getLogger(__name__)
 
+# Binary formats that carry no extractable text. They are still stored in
+# the uploads directory (for vision models, viewers and tools) but are
+# skipped by the embedder instead of producing garbage chunks.
+NON_TEXT_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".heic",
+    ".mp3", ".wav", ".ogg", ".flac", ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".zip", ".gz", ".tar", ".7z", ".rar", ".bin", ".exe", ".dll", ".so",
+    ".parquet", ".pkl", ".pickle", ".npy", ".npz", ".h5", ".hdf5", ".pt", ".pth", ".onnx",
+}
+
 
 class RAGEngine:
     """Simple RAG engine using ChromaDB for vector storage."""
@@ -176,6 +186,28 @@ class RAGEngine:
             if para.text:
                 yield para.text + "\n"
 
+    def _stream_spreadsheet_rows(self, filepath: Path) -> Iterator[str]:
+        """Yield rows from an Excel workbook as tab-separated text."""
+        import openpyxl  # optional dependency
+
+        wb = openpyxl.load_workbook(str(filepath), read_only=True, data_only=True)
+        for ws in wb.worksheets:
+            yield f"# Sheet: {ws.title}\n"
+            for row in ws.iter_rows(values_only=True):
+                cells = ["" if c is None else str(c) for c in row]
+                if any(cells):
+                    yield "\t".join(cells) + "\n"
+
+    def _stream_pptx_text(self, filepath: Path) -> Iterator[str]:
+        from pptx import Presentation
+
+        prs = Presentation(str(filepath))
+        for i, slide in enumerate(prs.slides, 1):
+            yield f"# Slide {i}\n"
+            for shape in slide.shapes:
+                if getattr(shape, "has_text_frame", False) and shape.text_frame.text:
+                    yield shape.text_frame.text + "\n"
+
     def _document_stream(self, filepath: Path) -> Iterator[str]:
         """Pick the right streamer based on file extension."""
         ext = filepath.suffix.lower()
@@ -183,6 +215,12 @@ class RAGEngine:
             return self._stream_pdf_pages(filepath)
         if ext == ".docx":
             return self._stream_docx_paragraphs(filepath)
+        if ext in (".xlsx", ".xlsm"):
+            return self._stream_spreadsheet_rows(filepath)
+        if ext == ".pptx":
+            return self._stream_pptx_text(filepath)
+        if ext in NON_TEXT_EXTENSIONS:
+            return iter(())
         return self._stream_text_file(filepath)
 
     # ------------------------------------------------------------------
@@ -239,7 +277,8 @@ class RAGEngine:
             else 0
         )
 
-        file_id = hashlib.md5(str(filepath).encode()).hexdigest()[:12]
+        owner_key = (metadata or {}).get("owner", "")
+        file_id = hashlib.md5(f"{owner_key}:{filepath}".encode()).hexdigest()[:12]
         meta = metadata or {}
         batch_size = max(1, int(self.embed_batch_size))
 
@@ -293,6 +332,10 @@ class RAGEngine:
             return {"error": f"Failed to ingest file: {e}"}
 
         if processed == 0:
+            if filepath.suffix.lower() in NON_TEXT_EXTENSIONS:
+                # Nothing to embed, but the upload itself succeeded.
+                self._set_progress(filename, stage="complete", current=0, total=0, percent=100)
+                return {"filename": filename, "chunks": 0, "file_id": file_id, "skipped": "binary"}
             self._set_progress(filename, stage="error", percent=0)
             return {"error": "No content extracted from file"}
 
@@ -306,13 +349,22 @@ class RAGEngine:
             "file_id": file_id,
         }
 
-    async def query(self, query_text: str, top_k: int | None = None, filenames: list[str] | None = None) -> list[dict]:
+    async def query(
+        self,
+        query_text: str,
+        top_k: int | None = None,
+        filenames: list[str] | None = None,
+        where: dict | None = None,
+    ) -> list[dict]:
         """Query the vector store and return relevant chunks.
 
         Args:
             query_text: The search query.
             top_k: Max results to return.
             filenames: If provided, restrict results to these source files.
+            where: Extra metadata filter (e.g. ``{"owner": "alice"}``) that is
+                AND-ed with the filename filter. Used by the multi-user
+                server edition to keep each user's documents private.
         """
         collection = self._get_collection()
         if collection is None:
@@ -324,11 +376,18 @@ class RAGEngine:
                 "query_texts": [query_text],
                 "n_results": k,
             }
+            clauses = []
             if filenames:
                 if len(filenames) == 1:
-                    query_params["where"] = {"source": filenames[0]}
+                    clauses.append({"source": filenames[0]})
                 else:
-                    query_params["where"] = {"source": {"$in": filenames}}
+                    clauses.append({"source": {"$in": filenames}})
+            if where:
+                clauses.append(where)
+            if len(clauses) == 1:
+                query_params["where"] = clauses[0]
+            elif clauses:
+                query_params["where"] = {"$and": clauses}
 
             results = collection.query(**query_params)
 
@@ -348,25 +407,31 @@ class RAGEngine:
             logger.error(f"RAG query error: {e}")
             return []
 
-    async def delete_file(self, filename: str) -> dict:
+    async def delete_file(self, filename: str, where: dict | None = None) -> dict:
         """Remove all chunks for a given file from the vector store."""
         collection = self._get_collection()
         if collection is None:
             return {"error": "Vector store not available"}
 
         try:
-            collection.delete(where={"source": filename})
+            cond = {"source": filename}
+            if where:
+                cond = {"$and": [cond, where]}
+            collection.delete(where=cond)
             return {"deleted": filename}
         except Exception as e:
             return {"error": str(e)}
 
-    async def list_files(self) -> list[str]:
+    async def list_files(self, where: dict | None = None) -> list[str]:
         """List all unique source files in the vector store."""
         collection = self._get_collection()
         if collection is None:
             return []
         try:
-            all_data = collection.get(include=["metadatas"])
+            kwargs = {"include": ["metadatas"]}
+            if where:
+                kwargs["where"] = where
+            all_data = collection.get(**kwargs)
             sources = set()
             for meta in all_data.get("metadatas", []):
                 if meta and "source" in meta:
@@ -375,7 +440,7 @@ class RAGEngine:
         except Exception:
             return []
 
-    async def sync_uploads(self, upload_dir: Path) -> dict:
+    async def sync_uploads(self, upload_dir: Path, metadata: dict | None = None) -> dict:
         """Re-ingest any uploaded files that are missing from the vector store.
 
         Called on startup so that files persisted on disk but absent from
@@ -385,12 +450,16 @@ class RAGEngine:
         if not upload_dir.is_dir():
             return {"synced": 0}
 
-        indexed = set(await self.list_files())
+        indexed = set(await self.list_files(where=metadata or None))
         synced = 0
         for filepath in upload_dir.iterdir():
-            if filepath.is_file() and filepath.name not in indexed:
+            if not filepath.is_file() or filepath.name.startswith("."):
+                continue
+            if filepath.suffix.lower() in NON_TEXT_EXTENSIONS:
+                continue
+            if filepath.name not in indexed:
                 logger.info("Re-ingesting uploaded file: %s", filepath.name)
-                await self.ingest_file(filepath)
+                await self.ingest_file(filepath, metadata=metadata)
                 synced += 1
 
         if synced:

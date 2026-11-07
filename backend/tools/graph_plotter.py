@@ -227,14 +227,14 @@ class GraphPlotterTool(BaseTool):
         csv_filename = kwargs.get("csv_filename")
         group_column = kwargs.get("group_column")
 
-        upload_dir = Path(self.config.get("upload_dir", "./data/uploads"))
+        upload_dir = self.upload_dir()
 
         # Dataframe for seaborn-based charts
         _df = None
 
         # Load from CSV if specified
         if csv_filename:
-            csv_path = upload_dir / csv_filename
+            csv_path = upload_dir / Path(csv_filename).name
             if not csv_path.exists():
                 return json.dumps({"error": f"CSV file not found: {csv_filename}"})
             try:
@@ -358,7 +358,7 @@ class GraphPlotterTool(BaseTool):
             plt.tight_layout()
 
             # Save
-            output_dir = Path(self.config.get("output_dir", "./data"))
+            output_dir = Path(self.ctx.plots_dir) if self.ctx.username is not None else Path(self.config.get("output_dir", "./data"))
             output_dir.mkdir(parents=True, exist_ok=True)
             filename = f"plot-{uuid.uuid4().hex[:8]}.png"
             filepath = output_dir / filename
@@ -380,6 +380,7 @@ class GraphPlotterTool(BaseTool):
                 "filename": filename,
                 "path": str(filepath),
                 "plot_image": filename,
+                "plot_url": f"/api/plots/{filename}{self.ctx.url_prefix()}",
             }
             if figure_json is not None:
                 payload["figure_json"] = figure_json
