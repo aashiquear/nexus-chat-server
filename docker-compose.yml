@@ -9,20 +9,26 @@ networks:
 services:
   nexus-chat:
     build: .
-    container_name: nexus-chat
+    container_name: nexus-chat-server
     networks:
       - nexus-net
     ports:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      - NEXUS_ADMIN_PASSWORD=${NEXUS_ADMIN_PASSWORD:?Set NEXUS_ADMIN_PASSWORD in .env}
+      - NEXUS_JWT_SECRET=${NEXUS_JWT_SECRET:-change-me-in-production}
+      - NEXUS_SANDBOX_URL=http://nexus-sandbox:8500
+      - ANONYMIZED_TELEMETRY=False
     volumes:
       # Mount config for easy editing without rebuild
       - ./config:/app/config:ro
-      # Persist uploaded files and vector store
-      - ./data:/app/data
-    environment:
-      - NEXUS_SANDBOX_URL=http://nexus-sandbox:8500
+      # Persist per-user workspaces, users.json and the vector store in a
+      # named volume (avoids host permission problems with bind mounts).
+      # To use a host directory instead: - ./data:/app/data  (make sure it
+      # is writable by the container user).
+      - nexus-data:/app/data
     extra_hosts:
       # Allow container to reach Ollama on the host machine
       - "host.docker.internal:host-gateway"
@@ -81,6 +87,7 @@ services:
       retries: 3
 
 volumes:
+  nexus-data:
   mcp-db-data:
   sandbox-pylib:
   sandbox-npm-cache:

@@ -5,7 +5,7 @@ import {
   Database, Server, RefreshCw, ChevronDown, ChevronRight, Image,
   MessageCircle, BarChart3, Eye, Globe, Table, Plus, Store, BookOpen,
   Brain, Cpu, Sparkles, Hand, Pin, Sigma, Ruler, Calendar, Coins, Type, Braces, FileSearch,
-  GraduationCap, GitCompare, ListChecks, Scale,
+  GraduationCap, GitCompare, ListChecks, Scale, Shield,
 } from 'lucide-react'
 import NexusLogoIcon from './NexusLogoIcon'
 
@@ -170,6 +170,8 @@ export default function Sidebar({
   toolMode,
   onToolModeChange,
   lastToolSelection,
+  user,
+  onOpenAdmin,
 }) {
   const fileInputRef = React.useRef(null)
 
@@ -323,6 +325,13 @@ export default function Sidebar({
           })()}
         </div>
 
+        {user?.is_admin && (
+          <button className="new-chat-btn" style={{ margin: '8px 16px 0' }} onClick={onOpenAdmin}>
+            <Shield size={14} />
+            Admin Panel
+          </button>
+        )}
+
         <div className="sidebar-body">
           {/* Built-in Tools */}
           <AccordionSection
@@ -449,7 +458,8 @@ export default function Sidebar({
                         {allSelected && <Check size={11} color="#fff" strokeWidth={3} />}
                         {someSelected && !allSelected && <span style={{ color: '#fff', fontSize: 10, fontWeight: 700 }}>–</span>}
                       </div>
-                      <Server size={13} style={{ opacity: 0.6 }} />
+                      <Server size={13} style={{ opacity: 0.6 }} title={srv.scope === 'user' ? 'Your server' : 'Server-wide'} />
+                      {srv.scope === 'user' && <span className="mcp-badge">mine</span>}
                       <span style={{ fontWeight: 500, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={`${srv.url || ''} (${srv.transport || ''})${srv.error ? `\n${srv.error}` : ''}`}>{srv.name}</span>
                       {srv.resources > 0 && (
                         <button
@@ -485,7 +495,7 @@ export default function Sidebar({
                           <RefreshCw size={12} />
                         </button>
                       )}
-                      {srv.source !== 'config' && onRemoveMCP && (
+                      {srv.removable && onRemoveMCP && (
                         <button
                           style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-tertiary)', padding: 2 }}
                           onClick={(e) => { e.stopPropagation(); onRemoveMCP(srv.id) }}

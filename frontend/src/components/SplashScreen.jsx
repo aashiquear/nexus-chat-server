@@ -1,7 +1,7 @@
 import React from 'react'
-import { ArrowRight } from 'lucide-react'
+import { ArrowRight, LogOut } from 'lucide-react'
 
-export default function SplashScreen({ onStart }) {
+export default function SplashScreen({ onStart, onLogout, user }) {
   return (
     <div className="splash-screen">
       <div className="splash-content">
@@ -104,10 +104,25 @@ export default function SplashScreen({ onStart }) {
           </svg>
         </div>
 
+        {user && (
+          <div style={{ fontSize: 16, color: 'var(--text-secondary)', marginBottom: 16, textAlign: 'center' }}>
+            Welcome back, <strong>{user.username}</strong>
+          </div>
+        )}
         <button className="splash-start-btn" onClick={onStart}>
           <span>Start Chat</span>
           <ArrowRight size={16} />
         </button>
+        {user && onLogout && (
+          <button
+            className="splash-start-btn"
+            onClick={onLogout}
+            style={{ marginTop: 12, background: 'transparent', color: 'var(--error)', border: '1px solid var(--error)' }}
+          >
+            <LogOut size={16} />
+            <span>Log Out</span>
+          </button>
+        )}
       </div>
     </div>
   )

@@ -12,6 +12,18 @@ from typing import Any
 _config: dict | None = None
 
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.yaml"
+SERVER_CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.server.yaml"
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base. Lists are replaced."""
+    result = dict(base)
+    for key, val in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = _deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
 
 
 def _substitute_env_vars(value: Any) -> Any:
@@ -44,6 +56,14 @@ def load_config(config_path: Path | None = None) -> dict:
 
     with open(path) as f:
         raw = yaml.safe_load(f)
+
+    # Server edition: deep-merge config/settings.server.yaml on top so the
+    # upstream settings.yaml can be updated without losing server tweaks.
+    if SERVER_CONFIG_PATH.exists():
+        with open(SERVER_CONFIG_PATH) as f:
+            override = yaml.safe_load(f)
+        if override:
+            raw = _deep_merge(raw or {}, override)
 
     _config = _substitute_env_vars(raw)
     return _config

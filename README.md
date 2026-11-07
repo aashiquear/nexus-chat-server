@@ -1,24 +1,84 @@
-# Nexus Chat
+# Nexus Chat Server
 
-A modular, agentic chatbot with RAG support and multi-LLM provider integration. Built with Python (FastAPI) and React, deployable via Docker.
+Multi-user edition of [Nexus Chat](https://github.com/aashiquear/nexus-chat): the same agentic chatbot (Ollama / Claude / GPT, vision, multi-language sandbox, MCP marketplace, RAG, viewers, generation & context controls) wrapped in a server layer with an **admin account**, **per-user accounts** and **private per-user workspaces**.
 
-## Features
+This repository tracks `nexus-chat` as its upstream. Everything that is not server-specific lives upstream; the server layer is kept as a small, regenerable patch (`scripts/server-patches/`) so upstream updates can be pulled in with one script.
 
-- **Multi-LLM Support** — Anthropic Claude, OpenAI GPT, and Ollama (local / Ollama Cloud) out of the box, including the latest open models (Gemma 4, Llama 4, Qwen 3.x, DeepSeek-R1, GPT-OSS, …). Models pulled onto the Ollama server are discovered automatically.
-- **Vision** — Attach, paste or drop images into the prompt box; they are sent to vision-capable models (Gemma 4, Llama 4, Qwen-VL, LLaVA, Claude, GPT-4o/5). Capabilities (vision / tools / thinking / context length / quantization) are probed live via Ollama's `/api/show` and shown as badges.
-- **Generation & context control** — A settings control next to the prompt box sets context size (`num_ctx`), max tokens, temperature, top-p/top-k, keep-alive, thinking mode/effort, and lets you switch or pull quantization variants. Separate defaults for *local* and *cloud* models, user-editable.
-- **Context compaction** — Long conversations are automatically truncated or summarised to stay inside the model's context window (threshold and retained tail configurable); summaries persist with the conversation.
-- **Agentic Tool System with dynamic discovery** — 25 built-in tools (sandbox code executor, web search & browser, academic search, CSV viewer, SQL over uploads, document search, graph plotter, decision matrix, statistics, symbolic math, unit & currency conversion, date arithmetic, text/JSON utilities, memory, tasks, change tracker, file generator, diagrams, image analysis…). In **Auto** mode a router attaches only the tools relevant to each message (keyword + embedding ranking) and the model can pull in more with `discover_tools`; tool modules load lazily so a big catalog costs nothing at startup. **Manual** mode keeps classic tick-boxes. See [docs/TOOLSET.md](docs/TOOLSET.md).
-- **Sandbox** — Runs Python, JavaScript/TypeScript, Bash, Java, C/C++, Go, Rust, R and HTML in an isolated container, installs missing pip/npm packages on the fly, streams output live, and returns every file the program writes (plots, CSVs, PDFs, HTML) as previewable downloads. Code blocks in chat have a **Run** button.
-- **MCP Marketplace** — Install MCP servers from the official MCP Registry (the catalog behind the GitHub / Claude / ChatGPT marketplaces), import a Claude Desktop / ChatGPT `mcpServers` JSON block, or add a server by URL or stdio command. All MCP transports are supported: streamable HTTP, SSE, stdio and the legacy Nexus `/rpc`. MCP resources can be indexed into RAG.
-- **RAG Integration** — Upload files (text, PDF, DOCX, XLSX, PPTX, CSV …) and get context-aware responses using ChromaDB vector storage
-- **Viewers** — Canvas panel renders Plotly/PNG charts, CSV tables (sort / filter / page), PDF, images, SVG, HTML, Markdown, JSON and syntax-highlighted code
-- **Streaming Chat** — Real-time WebSocket streaming with live thinking blocks
-- **Docker Ready** — Single-command deployment with Docker Compose
-- **Config-Driven** — YAML configuration for providers, tools, generation defaults and RAG settings
-- **Open Source** — MIT licensed, designed for extension and contribution
+## What the server edition adds
 
-> Looking for multi-user hosting with an admin account and per-user workspaces? See [nexus-chat-server](https://github.com/aashiquear/nexus-chat-server), which tracks this repository and adds the server layer on top.
+| Area | Base `nexus-chat` | `nexus-chat-server` |
+|---|---|---|
+| Accounts | none (single user) | admin bootstrap from `NEXUS_ADMIN_PASSWORD`, users managed in the Admin Panel, bcrypt + JWT (bearer **and** HttpOnly cookie so previews work) |
+| Files | `data/uploads`, `data/files`, … shared | `data/users/<user>/{uploads,files,downloads,plots,conversations}` — every tool, preview and download is scoped to the signed-in user |
+| RAG | one shared index | one index, every chunk tagged with its `owner`; queries/deletes are filtered per user |
+| Conversations | `data/conversations/` | per user, including compaction state and tool/file selection |
+| Generation settings | per browser (localStorage) | per user on the server (`settings.json`), follow the account across devices |
+| MCP servers | one registry | admin-managed **server-wide** servers + **personal** servers per user (`users_can_add_mcp`, `users_can_run_stdio_mcp` policies) |
+| Sandbox | shared | runs with the user's workspace; interactive consoles are bound to their owner |
+| Quotas | — | optional per-user storage quota (`auth.user_quota_mb`) |
+
+## Quick Start
+
+```bash
+git clone https://github.com/aashiquear/nexus-chat-server.git
+cd nexus-chat-server
+cp .env.example .env            # set NEXUS_ADMIN_PASSWORD and NEXUS_JWT_SECRET
+docker compose up --build       # http://localhost:8000 → sign in as "admin"
+```
+
+Then open the **Admin Panel** (sidebar) to create user accounts. Each user signs in with their own credentials and only sees their own conversations, uploads, generated files and personal MCP servers.
+
+### Configuration
+
+`config/settings.yaml` is the upstream file (do not edit it — it is replaced on updates). Server-specific settings live in `config/settings.server.yaml`, which is deep-merged on top:
+
+```yaml
+auth:
+  jwt_secret: "${NEXUS_JWT_SECRET:-change-me-in-production}"
+  token_expire_days: 7
+  user_quota_mb: 0                # 0 = unlimited
+  users_can_add_mcp: true         # personal (remote URL) MCP servers
+  users_can_run_stdio_mcp: false  # stdio servers spawn processes → admins only
+providers:
+  anthropic: { enabled: ${NEXUS_ENABLE_ANTHROPIC:-false} }
+  openai:    { enabled: ${NEXUS_ENABLE_OPENAI:-false} }
+```
+
+Cloud providers are off by default on a shared server; enable them in `.env` with `NEXUS_ENABLE_ANTHROPIC=true` / `NEXUS_ENABLE_OPENAI=true` plus the API keys.
+
+### Data layout & host filesystem notes
+
+```
+data/
+├── users.json                  # accounts (bcrypt hashes)
+├── users/<username>/
+│   ├── uploads/  files/  downloads/  plots/  sandbox/
+│   ├── conversations/*.json
+│   ├── mcp_servers.json        # personal MCP servers
+│   └── settings.json           # generation defaults etc.
+├── mcp_servers.json            # admin-added server-wide MCP servers
+└── vector_store/               # ChromaDB (chunks tagged with owner)
+```
+
+- `docker-compose.yml` stores `data/` in a **named volume** (`nexus-data`). If you switch to a bind mount (`./data:/app/data`), the host directory must be writable by the container user; the server checks this at startup and fails with an explicit message instead of producing blank screens later.
+- Usernames are limited to `[A-Za-z0-9._-]` (max 32) so they are always safe directory names.
+- Workspaces are created on user creation **and** on every login, so a restored backup or recreated volume heals itself.
+- Older layouts are migrated automatically on startup: `data/conversations/<user>/` moves into the user's workspace and files left in the shared `data/uploads/` are assigned to the first admin.
+- Deleting a user (admin panel or self-service) removes their workspace, vectors and personal MCP servers.
+
+### Updating from upstream
+
+```bash
+scripts/update-from-upstream.sh      # fetch upstream, merge, re-apply server patch
+scripts/regenerate-server-patch.sh   # after editing server-only code: refresh the patch
+docker compose build && docker compose up -d
+```
+
+The scripts default to `upstream/main`; set `UPSTREAM_REF=upstream/<branch>` to track another branch.
+
+---
+
+Below is the upstream feature documentation (shared with `nexus-chat`).
 
 ## Quick Start
 
@@ -432,7 +492,10 @@ nexus-chat/
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/health` | GET | Health check |
+| `/api/health` | GET | Health check (`edition: server`) |
+| `/api/auth/login` · `logout` · `me` · `change-password` · `account` | POST / GET / DELETE | Session management (JWT + cookie) |
+| `/api/admin/users[/{name}[/password]]` | GET / POST / DELETE | Admin: list, create, delete users, reset passwords |
+| `/api/settings/user` | GET / PUT | Per-user settings (generation defaults) |
 | `/api/models` | GET | List available LLM models |
 | `/api/tools` | GET | List available tools |
 | `/api/files` | GET | List uploaded files |

@@ -5,13 +5,16 @@ import React, {
   useCallback,
   useMemo,
 } from "react";
-import { Menu, MessageCircle, Wifi, WifiOff, Scissors, BookOpen, X, Loader2, Plus } from "lucide-react";
+import { Menu, MessageCircle, Wifi, WifiOff, Scissors, BookOpen, X, Loader2, Plus, UserCircle, LogOut } from "lucide-react";
 import Sidebar, { ModelBadges } from "./components/Sidebar";
 import ChatMessage, { TypingIndicator } from "./components/ChatMessage";
 import ChatInput from "./components/ChatInput";
 import CanvasPanel from "./components/CanvasPanel";
 import SplashScreen from "./components/SplashScreen";
 import MCPMarketplacePanel from "./components/MCPMarketplacePanel";
+import SignInScreen from "./components/SignInScreen";
+import AccountPopup from "./components/AccountPopup";
+import AdminPanel from "./components/AdminPanel";
 import { useChat } from "./hooks/useChat";
 import {
   fetchModels,
@@ -32,11 +35,16 @@ import {
   deleteConversation,
   fetchGenerationSettings,
   runCode,
+  fetchAuthMe,
+  logout as apiLogout,
+  fetchUserSettings,
+  saveUserSettings,
 } from "./hooks/api";
 
 // ---------------------------------------------------------------------
-// Generation settings persistence (per browser). The server edition
-// swaps these two helpers for per-user storage.
+// Generation settings persistence — server edition: stored per user on
+// the server (data/users/<u>/settings.json) so they follow the account
+// across browsers. localStorage is only a warm cache for first paint.
 // ---------------------------------------------------------------------
 const GEN_STORAGE_KEY = "nexus:generation";
 
@@ -48,10 +56,15 @@ export function loadStoredGeneration() {
   }
 }
 
+let _saveTimer = null;
 export function storeGeneration(value) {
   try {
     localStorage.setItem(GEN_STORAGE_KEY, JSON.stringify(value));
   } catch {}
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => {
+    saveUserSettings({ generation: value }).catch((e) => console.error("Settings save failed:", e));
+  }, 400);
 }
 
 // Small modal listing an MCP server's resources with an "add to RAG" action.
@@ -112,6 +125,12 @@ function MCPResourcesDialog({ server, onClose, onIngested }) {
 }
 
 export default function App() {
+  // Auth state (server edition)
+  const [user, setUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [showAccount, setShowAccount] = useState(false);
+  const [showAdmin, setShowAdmin] = useState(false);
+
   // Splash / title screen - dismissed after user clicks "Start Chat"
   const [showSplash, setShowSplash] = useState(() => {
     try {
@@ -188,11 +207,39 @@ export default function App() {
   const userScrolledRef = useRef(false);
   const { connect, sendMessage, isConnected, isStreaming } = useChat();
 
-  // Initialize
+  // Validate the stored session, then connect + load data.
   useEffect(() => {
+    const init = async () => {
+      try {
+        const me = await fetchAuthMe();
+        if (me) {
+          setUser(me);
+          connect();
+          loadData();
+        }
+      } catch (err) {
+        console.error("Auth check failed:", err);
+      } finally {
+        setAuthChecked(true);
+      }
+    };
+    init();
+  }, [connect]);
+
+  const handleSignIn = (u) => {
+    setUser(u);
     connect();
     loadData();
-  }, [connect]);
+  };
+
+  const handleLogout = async () => {
+    await apiLogout();
+    try {
+      sessionStorage.removeItem("nexus:splashDismissed");
+      localStorage.removeItem(GEN_STORAGE_KEY);
+    } catch {}
+    window.location.reload();
+  };
 
   const refreshModels = useCallback(async () => {
     const m = await fetchModels();
@@ -217,7 +264,17 @@ export default function App() {
       setFiles(f);
       setMcpServers(mcp);
       setConversations(convos);
-      if (gen) setGenDefaults(gen);
+      if (gen) {
+        setGenDefaults(gen);
+        // Server-stored per-user overrides win over the browser cache.
+        const stored = gen.user_overrides && Object.keys(gen.user_overrides).length ? gen.user_overrides : null;
+        if (stored) {
+          setGenOverrides(stored);
+          try {
+            localStorage.setItem(GEN_STORAGE_KEY, JSON.stringify(stored));
+          } catch {}
+        }
+      }
 
       // Default-select a model that is both provider-configured *and*
       // confirmed on the remote (when probe info is available).
@@ -861,9 +918,23 @@ export default function App() {
       }
     : null;
 
+  if (!authChecked) {
+    return (
+      <div className="splash-screen">
+        <div className="splash-content">
+          <div style={{ fontSize: 14, color: "var(--text-secondary)" }}>Loading…</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <SignInScreen onSignIn={handleSignIn} />;
+  }
+
   return (
     <div className="app-layout">
-      {showSplash && <SplashScreen onStart={dismissSplash} />}
+      {showSplash && <SplashScreen onStart={dismissSplash} onLogout={handleLogout} user={user} />}
       <Sidebar
         models={models}
         selectedModel={selectedModel}
@@ -893,11 +964,14 @@ export default function App() {
         toolMode={toolMode}
         onToolModeChange={handleToolModeChange}
         lastToolSelection={lastToolSelection}
+        user={user}
+        onOpenAdmin={() => setShowAdmin(true)}
       />
 
       {showMarketplace && (
-        <MCPMarketplacePanel onClose={() => setShowMarketplace(false)} onAdded={refreshToolsAndMcp} />
+        <MCPMarketplacePanel onClose={() => setShowMarketplace(false)} onAdded={refreshToolsAndMcp} user={user} />
       )}
+      {showAdmin && <AdminPanel onClose={() => setShowAdmin(false)} currentUser={user} />}
       {resourcesServer && (
         <MCPResourcesDialog
           server={resourcesServer}
@@ -926,11 +1000,21 @@ export default function App() {
               </span>
             )}
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 6, color: isConnected ? "var(--success)" : "var(--error)", fontSize: 12 }}>
-            {isConnected ? <Wifi size={14} /> : <WifiOff size={14} />}
-            {isConnected ? "Connected" : "Disconnected"}
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, color: isConnected ? "var(--success)" : "var(--error)", fontSize: 12 }}>
+              {isConnected ? <Wifi size={14} /> : <WifiOff size={14} />}
+              {isConnected ? "Connected" : "Disconnected"}
+            </div>
+            <button className="sidebar-toggle" onClick={() => setShowAccount((v) => !v)} title={`Account: ${user.username}`} style={{ display: "flex" }}>
+              <UserCircle size={18} />
+            </button>
+            <button className="sidebar-toggle" onClick={handleLogout} title="Log out" style={{ display: "flex" }}>
+              <LogOut size={18} />
+            </button>
           </div>
         </div>
+
+        {showAccount && <AccountPopup user={user} onClose={() => setShowAccount(false)} onLogout={handleLogout} />}
 
         {/* Chat Area */}
         <div className="chat-area" ref={chatAreaRef}>

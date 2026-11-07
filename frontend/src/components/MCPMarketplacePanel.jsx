@@ -25,8 +25,10 @@ const EXAMPLE_IMPORT = `{
 //                 JSON block (the de-facto plugin format).
 //   • Manual    — connect by URL (streamable-http / sse / legacy) or a
 //                 stdio command.
-export default function MCPMarketplacePanel({ onClose, onAdded }) {
+export default function MCPMarketplacePanel({ onClose, onAdded, user }) {
   const [tab, setTab] = useState('registry')
+  // Server edition: admins choose whether a server is server-wide or personal.
+  const [scope, setScope] = useState(user?.is_admin ? 'global' : 'user')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -82,6 +84,7 @@ export default function MCPMarketplacePanel({ onClose, onAdded }) {
       if (cfg.env) cfg.env = { ...cfg.env, ...envValues }
       await addMCPServer({
         ...cfg,
+        scope,
         id: candidate.id.split('/').pop(),
         name: candidate.name,
         description: candidate.description,
@@ -134,7 +137,7 @@ export default function MCPMarketplacePanel({ onClose, onAdded }) {
     setBusy(true)
     setError('')
     try {
-      await addMCPServer({ ...manualPayload(), name: manualName.trim() || discovered?.server?.name, source: 'user' })
+      await addMCPServer({ ...manualPayload(), scope, name: manualName.trim() || discovered?.server?.name, source: 'user' })
       onAdded && onAdded()
       onClose()
     } catch (err) {
@@ -149,7 +152,7 @@ export default function MCPMarketplacePanel({ onClose, onAdded }) {
     setError('')
     setImportResult(null)
     try {
-      const data = await importMCPConfig(importText)
+      const data = await importMCPConfig(importText, scope)
       setImportResult(data.imported)
       onAdded && onAdded()
     } catch (err) {
@@ -181,6 +184,14 @@ export default function MCPMarketplacePanel({ onClose, onAdded }) {
             <Globe size={13} /> URL / command
           </button>
         </div>
+
+        {user?.is_admin && (
+          <div className="mcp-scope-row">
+            <span>Install for</span>
+            <label><input type="radio" checked={scope === 'global'} onChange={() => setScope('global')} /> everyone (server-wide)</label>
+            <label><input type="radio" checked={scope === 'user'} onChange={() => setScope('user')} /> only me</label>
+          </div>
+        )}
 
         {error && (
           <div className="mcp-error">
